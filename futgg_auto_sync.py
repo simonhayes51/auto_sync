@@ -61,7 +61,7 @@ async def fetch_player_page(session, page):
 
                 players.append({
                     "name": name,
-                    "rating": rating,
+                    "rating": int(rating) if rating.isdigit() else None,
                     "version": version,
                     "image_url": img_url,
                     "created_at": datetime.utcnow()
@@ -117,6 +117,7 @@ async def auto_sync():
 # ---------- RUN ----------
 if __name__ == "__main__":
     asyncio.run(auto_sync())
+
 
 
 
