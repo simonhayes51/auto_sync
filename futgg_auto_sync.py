@@ -5,22 +5,14 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# FUT.GG player pages
 FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
-
-# Railway DB URL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
 print(f"🔌 DEBUG: Using DATABASE_URL = {DATABASE_URL}")
 
-
 def parse_alt_text(alt_text):
-    """
-    Extract player name, rating, and version from FUT.GG <img alt="...">
-    Example: "Konaté - 98 - Shapeshifters"
-    """
     try:
         parts = [p.strip() for p in alt_text.split("-")]
         if len(parts) >= 3:
@@ -32,16 +24,11 @@ def parse_alt_text(alt_text):
     except:
         return alt_text, None, "N/A"
 
-
 def extract_player_details(card):
-    """Extract slug, player_url, and card_id from the href + image URL."""
     try:
         href = card.get("href", "")
-        # Example href: /players/158023-lionel-messi/25-167930183/
         slug = href.split("/")[2] if "/players/" in href else None
         player_url = f"https://www.fut.gg{href}" if slug else None
-
-        # Card ID is inside image_url path: ...futgg-player-item-card/25-100855415...
         img_tag = card.select_one("img")
         img_url = img_tag.get("src", "") if img_tag else ""
         card_id = None
@@ -50,16 +37,13 @@ def extract_player_details(card):
                 card_id = img_url.split("futgg-player-item-card/")[1].split('"')[0]
             except:
                 card_id = None
-
         return slug, player_url, card_id
     except:
         return None, None, None
 
-
 def fetch_players_from_page(page_number):
-    """Fetch FUT.GG players from a single page."""
     url = FUTGG_BASE_URL.format(page_number)
-    print(f"🌐 Fetching: {url}")
+    print(f"🌐 Fetching page {page_number}...")
 
     response = requests.get(url, timeout=15)
     if response.status_code != 200:
@@ -75,15 +59,12 @@ def fetch_players_from_page(page_number):
             img_tag = card.select_one("img")
             if not img_tag:
                 continue
-
             alt_text = img_tag.get("alt", "").strip()
             img_url = img_tag.get("src", "")
             name, rating, version = parse_alt_text(alt_text)
             if not rating:
                 continue
-
             player_slug, player_url, card_id = extract_player_details(card)
-
             players.append({
                 "name": name,
                 "rating": rating,
@@ -94,24 +75,22 @@ def fetch_players_from_page(page_number):
                 "card_id": card_id,
                 "created_at": datetime.utcnow()
             })
-        except Exception as e:
-            print(f"⚠️ Failed to parse card: {e}")
+        except:
             continue
 
     return players
 
-
 async def sync_players():
-    """Sync FUT.GG player data into Railway PostgreSQL."""
     print(f"\n🚀 Starting auto-sync at {datetime.utcnow()} UTC")
-
     all_players = []
     page = 1
+    total_inserted = 0
+    total_failed = 0
 
     while True:
         players = fetch_players_from_page(page)
         if not players:
-            print(f"✅ No players found on page {page}, stopping pagination.")
+            print(f"✅ No players found on page {page}, stopping.")
             break
         all_players.extend(players)
         print(f"📦 Page {page}: {len(players)} players fetched.")
@@ -120,7 +99,6 @@ async def sync_players():
 
     print(f"🔍 Total players fetched: {len(all_players)}")
 
-    # Save players into DB
     try:
         conn = await asyncpg.connect(DATABASE_URL)
     except Exception as e:
@@ -144,20 +122,18 @@ async def sync_players():
                 p["name"], p["rating"], p["version"], p["image_url"], p["created_at"],
                 p["player_slug"], p["player_url"], p["card_id"]
             )
-        except Exception as e:
-            print(f"⚠️ Failed to save {p['name']}: {e}")
+            total_inserted += 1
+        except:
+            total_failed += 1
 
     await conn.close()
-    print("🎯 FUT.GG sync complete — database updated.")
-
+    print(f"🎯 FUT.GG sync complete — {total_inserted} saved, {total_failed} failed.")
 
 async def scheduler():
-    """Run full auto-sync once, then exit."""
     try:
         await sync_players()
     except Exception as e:
         print(f"❌ Sync error: {e}")
-
 
 if __name__ == "__main__":
     asyncio.run(scheduler())
