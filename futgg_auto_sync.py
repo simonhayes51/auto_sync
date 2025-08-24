@@ -65,7 +65,7 @@ def fetch_players_from_page(page_number):
                 "rating": rating,
                 "version": version,
                 "image_url": img_url,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now().replace(tzinfo=None)
             })
         except Exception as e:
             print(f"⚠️ Failed to parse card: {e}")
