@@ -1,74 +1,106 @@
 import os
 import asyncio
 import asyncpg
+import aiohttp
+import logging
 from datetime import datetime, timezone
-from playwright.async_api import async_playwright
 
+# ------------------ CONFIG ------------------ #
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not found. Set it in Railway → Variables.")
+API_BASE = "https://www.fut.gg/api/fut/player-prices/25/{}"
+BATCH_SIZE = 100   # DB updates per commit
+LOG_INTERVAL = 50  # Log every 50 players
 
-API_URL = "https://www.fut.gg/api/fut/player-prices/25/{}"
+# ------------------ LOGGING ------------------ #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("price_sync")
 
-async def fetch_price(playwright, card_id):
-    """Bypass Cloudflare & fetch prices from FUT.GG API."""
-    url = API_URL.format(card_id)
-
+# ------------------ DB CONNECTION ------------------ #
+async def get_db():
     try:
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        await page.goto(url, timeout=20000)
-        content = await page.content()
-
-        # FUT.GG returns JSON — we need to extract it
-        json_data = await page.evaluate("() => document.body.innerText")
-        await browser.close()
-
-        import json
-        data = json.loads(json_data)
-
-        ps_price = data.get("prices", {}).get("ps", {}).get("LCPrice")
-        xbox_price = data.get("prices", {}).get("xbox", {}).get("LCPrice")
-        return ps_price or xbox_price
-
+        return await asyncpg.connect(DATABASE_URL)
     except Exception as e:
-        print(f"⚠️ Error fetching {url}: {e}")
+        log.error(f"❌ DB connection failed: {e}")
+        raise
+
+# ------------------ PRICE FETCH ------------------ #
+async def fetch_price(session, player):
+    card_id = player.get("card_id")
+    if not card_id:
         return None
 
-async def sync_prices():
-    print(f"\n🚀 Starting price sync at {datetime.now(timezone.utc)} UTC")
-    conn = await asyncpg.connect(DATABASE_URL)
+    # Extract the numeric part from `card_id` e.g. 25-117667614 → 117667614
+    numeric_id = card_id.split("-")[1] if "-" in card_id else card_id
+    url = API_BASE.format(numeric_id)
 
-    players = await conn.fetch("SELECT id, name, card_id FROM fut_players WHERE card_id IS NOT NULL")
-    print(f"📦 Found {len(players)} players to update prices for.")
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 403:
+                return None
+            if resp.status != 200:
+                log.warning(f"⚠️ API failed [{resp.status}] for {numeric_id}")
+                return None
 
-    async with async_playwright() as p:
-        updated = 0
-        skipped = 0
+            data = await resp.json()
+            price = data.get("ps", {}).get("LCPrice") or data.get("xbox", {}).get("LCPrice")
+            return int(price) if price else None
+    except Exception:
+        return None
 
-        for player in players:
-            card_id = player["card_id"].split(".")[0]
-            price = await fetch_price(p, card_id)
+# ------------------ MAIN SYNC ------------------ #
+async def price_sync():
+    log.info("🚀 Starting price sync...")
+
+    conn = await get_db()
+    players = await conn.fetch("SELECT id, name, card_id, player_url FROM fut_players")
+    log.info(f"📦 Found {len(players)} players in DB.")
+
+    updated, skipped = 0, 0
+
+    async with aiohttp.ClientSession() as session:
+        batch = []
+        for i, player in enumerate(players, start=1):
+            price = await fetch_price(session, dict(player))
 
             if price is None:
                 skipped += 1
-                continue
-
-            try:
-                await conn.execute("""
-                    UPDATE fut_players
-                    SET price = $1, created_at = $2
-                    WHERE id = $3
-                """, price, datetime.now(timezone.utc), player["id"])
+            else:
                 updated += 1
-                print(f"✅ {player['name']} → {price} coins")
-            except Exception as e:
-                print(f"⚠️ Failed to update {player['name']}: {e}")
+                batch.append((price, datetime.now(timezone.utc), player["id"]))
+
+            # Commit batch updates
+            if len(batch) >= BATCH_SIZE:
+                await conn.executemany(
+                    "UPDATE fut_players SET price=$1, created_at=$2 WHERE id=$3",
+                    batch
+                )
+                batch.clear()
+
+            # Log progress every LOG_INTERVAL players
+            if i % LOG_INTERVAL == 0:
+                log.info(f"⏳ Processed {i}/{len(players)} players...")
+
+        # Final commit for remaining updates
+        if batch:
+            await conn.executemany(
+                "UPDATE fut_players SET price=$1, created_at=$2 WHERE id=$3",
+                batch
+            )
 
     await conn.close()
-    print(f"\n🎯 Sync complete → {updated} prices updated, {skipped} skipped.")
+    log.info(f"🎯 Price sync complete → ✅ {updated} updated | ⏭️ {skipped} skipped.")
+
+# ------------------ SCHEDULER ------------------ #
+async def scheduler():
+    while True:
+        try:
+            await price_sync()
+        except Exception as e:
+            log.error(f"❌ Sync failed: {e}")
+        await asyncio.sleep(300)  # Run every 5 minutes
 
 if __name__ == "__main__":
-    asyncio.run(sync_prices())
+    asyncio.run(scheduler())
