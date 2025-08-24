@@ -15,7 +15,7 @@ HEADERS = {
 }
 
 def fetch_price(player_url):
-    """Fetch the player's price from FUT.GG"""
+    """Fetches the player's price from FUT.GG"""
     try:
         response = requests.get(player_url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
@@ -23,35 +23,27 @@ def fetch_price(player_url):
             return None
 
         soup = BeautifulSoup(response.text, "html.parser")
+        span = soup.find("span", class_="price-coin")
 
-        # Find the span that contains the coin icon
-        coin_span = soup.find("span", class_="price-coin")
-        if not coin_span:
-            print(f"⚠️ No coin icon found for {player_url}")
+        if not span:
+            print(f"⚠️ No coin span found for {player_url}")
             return None
 
-        # Get the parent div that contains the actual price
-        parent_div = coin_span.find_parent("div")
-        if not parent_div:
-            print(f"⚠️ No price container found for {player_url}")
-            return None
+        # Grab the text node directly after the <span>
+        if span.next_sibling:
+            price_text = span.next_sibling.strip().replace(",", "")
+            if price_text.isdigit():
+                return int(price_text)
 
-        # Extract and clean the text
-        price_text = parent_div.get_text(strip=True)
-        price_text = price_text.replace(",", "").replace(".", "")
-
-        if not price_text.isdigit():
-            print(f"⚠️ Invalid price format for {player_url}: '{price_text}'")
-            return None
-
-        return int(price_text)
+        print(f"⚠️ No price found for {player_url}")
+        return None
 
     except Exception as e:
         print(f"❌ Error fetching price from {player_url}: {e}")
         return None
 
 async def update_prices():
-    """Update player prices in the database."""
+    """Updates player prices in the database."""
     print(f"\n⏳ Starting price sync at {datetime.now(timezone.utc)}")
 
     try:
