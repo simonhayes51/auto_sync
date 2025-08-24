@@ -79,7 +79,7 @@ def fetch_players_from_page(page_number):
                 "rating": rating,
                 "version": version,
                 "image_url": img_url,
-                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.utcnow(),
                 "player_slug": player_slug,
                 "player_url": player_url,
                 "card_id": card_id
