@@ -112,6 +112,9 @@ async def sync_new_players():
 # MAIN SCHEDULER
 # ---------------------------
 async def scheduler():
+    print("⏳ Running initial price sync...")
+    await update_prices()  # <-- Force one sync at startup
+
     while True:
         now = datetime.now(timezone.utc)
 
