@@ -4,7 +4,6 @@ import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-import re
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -16,48 +15,42 @@ HEADERS = {
                   "Chrome/115.0.0.0 Safari/537.36"
 }
 
-CONCURRENCY_LIMIT = 20
+CONCURRENCY_LIMIT = 15
 
 async def fetch_price(session, url: str):
-    """Scrape FUT.GG for the player's coin price with multiple fallbacks."""
+    """Scrape FUT.GG for player prices based on the coin span + sibling text."""
     try:
-        async with session.get(url, headers=HEADERS, timeout=12) as resp:
+        async with session.get(url, headers=HEADERS, timeout=15) as resp:
             if resp.status != 200:
+                print(f"⚠️ Failed to fetch {url} — status {resp.status}")
                 return None
 
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
 
-            # 1️⃣ First attempt: search within "font-bold text-2xl" container
-            price_div = soup.select_one("div.font-bold.text-2xl.flex.flex-row.items-center.gap-1.justify-self-end")
-            if price_div:
-                text = price_div.get_text(strip=True)
-                price = re.sub(r"[^\d]", "", text)
-                if price.isdigit():
-                    return int(price)
+            # Locate the price span
+            span = soup.find("span", class_=lambda c: c and "price-coin" in c)
+            if not span:
+                return None  # Could be SBC/untradeable/reward card
 
-            # 2️⃣ Second attempt: find first span.price-coin → grab parent div text
-            coin_span = soup.find("span", class_=lambda c: c and "price-coin" in c)
-            if coin_span:
-                parent_div = coin_span.find_parent("div")
-                if parent_div:
-                    text = parent_div.get_text(strip=True)
-                    price = re.sub(r"[^\d]", "", text)
+            # Get the parent <div> and the text right after the <span>
+            price_div = span.find_parent("div")
+            if not price_div:
+                return None
+
+            # Extract the price directly after </span>
+            siblings = list(price_div.children)
+            for i, sib in enumerate(siblings):
+                if sib == span and i + 1 < len(siblings):
+                    raw_price = siblings[i + 1]
+                    price = str(raw_price).strip().replace(",", "")
                     if price.isdigit():
                         return int(price)
+                    return None
 
-            # 3️⃣ Last fallback: scan entire HTML for first number next to "price-coin"
-            raw_html = soup.prettify()
-            match = re.search(r'price-coin[^<]*</span>\s*([\d,]+)', raw_html)
-            if match:
-                price = match.group(1).replace(",", "")
-                if price.isdigit():
-                    return int(price)
-
-            # If nothing found, likely SBC/untradable/reward
             return None
-
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Error scraping {url}: {e}")
         return None
 
 
@@ -81,10 +74,10 @@ async def process_player(semaphore, session, conn, player):
                 SET price = $1, created_at = $2
                 WHERE id = $3
             """, price, datetime.now(timezone.utc), player_id)
-            print(f"✅ {url} → {price:,} coins")
+            print(f"✅ Updated {url} → {price:,} coins")
             return True
         except Exception as e:
-            print(f"⚠️ Failed to update {url}: {e}")
+            print(f"⚠️ Failed to update DB for {url}: {e}")
             return False
 
 
