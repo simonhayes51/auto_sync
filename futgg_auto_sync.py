@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
 FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
+FUTGG_PRICE_API = "https://www.fut.gg/api/fut/player-prices/25/{}"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
@@ -13,8 +14,11 @@ if not DATABASE_URL:
 
 print(f"🔌 DEBUG: Using DATABASE_URL = {DATABASE_URL}")
 
+# -----------------------
+#  HELPERS
+# -----------------------
 def parse_alt_text(alt_text):
-    """Extract player name, rating, and version."""
+    """Extract player name, rating, and version from FUT.GG <img alt="...">"""
     try:
         parts = [p.strip() for p in alt_text.split("-")]
         if len(parts) >= 3:
@@ -27,20 +31,19 @@ def parse_alt_text(alt_text):
         return alt_text, None, "N/A"
 
 def extract_card_id(img_url: str) -> str:
-    """Extract the numeric player ID from the image URL."""
+    """Extract numeric FUT.GG player ID from the image URL"""
     try:
-        # Example:
-        # https://game-assets.fut.gg/.../25-117667614.somehash.webp
+        # Example: https://game-assets.fut.gg/.../25-117667614.something.webp
         filename = img_url.split("/")[-1]
         parts = filename.split("-")
         if len(parts) >= 2:
-            return parts[1].split(".")[0]  # Get just the numeric ID
+            return parts[1].split(".")[0]  # Extract numeric ID only
         return None
     except:
         return None
 
 def fetch_players_from_page(page_number):
-    """Fetch FUT.GG players from a single page."""
+    """Fetch FUT.GG players from a single page"""
     url = FUTGG_BASE_URL.format(page_number)
     print(f"🌐 Fetching: {url}")
 
@@ -67,12 +70,15 @@ def fetch_players_from_page(page_number):
             if not rating or not card_id:
                 continue
 
+            player_url = "https://www.fut.gg" + card.get("href", "")
+
             players.append({
                 "name": name,
                 "rating": rating,
                 "version": version,
                 "image_url": img_url,
-                "card_id": card_id,  # Store just the numeric ID
+                "card_id": card_id,  # Numeric ID for API lookups
+                "player_url": player_url,
                 "updated_at": datetime.now(timezone.utc)
             })
         except Exception as e:
@@ -81,13 +87,17 @@ def fetch_players_from_page(page_number):
 
     return players
 
-async def sync_players():
-    """Sync FUT.GG player data into Railway PostgreSQL."""
-    print(f"\n🚀 Starting full player data sync at {datetime.now(timezone.utc)} UTC")
+# -----------------------
+#  MAIN SYNC LOGIC
+# -----------------------
+async def sync_players_and_prices():
+    """Sync FUT.GG player data + prices into Railway PostgreSQL"""
+    print(f"\n🚀 Starting full sync at {datetime.now(timezone.utc)} UTC")
 
     all_players = []
     page = 1
 
+    # STEP 1: FETCH ALL PLAYERS
     while True:
         players = fetch_players_from_page(page)
         if not players:
@@ -100,29 +110,63 @@ async def sync_players():
 
     print(f"🔍 Total players fetched: {len(all_players)}")
 
+    # STEP 2: CONNECT TO DB
     try:
         conn = await asyncpg.connect(DATABASE_URL)
     except Exception as e:
         print(f"❌ DB connection failed: {e}")
         return
 
+    # STEP 3: SAVE PLAYER DATA + FETCH PRICES
     for p in all_players:
         try:
+            # Insert or update player info
             await conn.execute("""
-                INSERT INTO fut_players (name, rating, version, image_url, card_id, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO fut_players (name, rating, version, image_url, card_id, player_url, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (name, rating)
-                DO UPDATE SET version=$3, image_url=$4, card_id=$5, created_at=$6
-            """, p["name"], p["rating"], p["version"], p["image_url"], p["card_id"], p["updated_at"])
+                DO UPDATE SET version=$3, image_url=$4, card_id=$5, player_url=$6, created_at=$7
+            """, p["name"], p["rating"], p["version"], p["image_url"], p["card_id"], p["player_url"], p["updated_at"])
+
+            # STEP 4: FETCH PRICE FROM FUT.GG API
+            api_url = FUTGG_PRICE_API.format(p["card_id"])
+            resp = requests.get(api_url, timeout=10)
+
+            if resp.status_code == 403:
+                print(f"⚠️ Forbidden: API blocked for {p['name']} ({p['card_id']})")
+                continue
+
+            if resp.status_code != 200:
+                print(f"⚠️ API error {resp.status_code} for {p['name']} ({p['card_id']})")
+                continue
+
+            data = resp.json()
+
+            # Check if we have a console price
+            price = data.get("ps", {}).get("LCPrice") or data.get("xbox", {}).get("LCPrice")
+            if price is None:
+                print(f"ℹ️ No price for card_id {p['card_id']} ({p['name']}) — likely SBC/Reward")
+                continue
+
+            # STEP 5: UPDATE PRICE IN DB
+            await conn.execute("""
+                UPDATE fut_players
+                SET price = $1, created_at = $2
+                WHERE card_id = $3
+            """, price, p["updated_at"], p["card_id"])
+
+            print(f"✅ Updated {p['name']} → {price} coins")
+
+            await asyncio.sleep(0.15)  # Prevent hammering the API
+
         except Exception as e:
-            print(f"⚠️ Failed to save {p['name']}: {e}")
+            print(f"⚠️ Failed to sync {p['name']}: {e}")
 
     await conn.close()
-    print("🎯 Player data sync complete — database updated.")
+    print("🎯 Full sync complete — DB fully updated with prices.")
 
-async def scheduler():
-    """Run auto-sync once at startup."""
-    await sync_players()
-
+# -----------------------
+#  EXECUTION
+# -----------------------
 if __name__ == "__main__":
-    asyncio.run(scheduler())
+    asyncio.run(sync_players_and_prices())
