@@ -1,169 +1,138 @@
 import os
-import re
-import json
 import asyncio
-import aiohttp
 import asyncpg
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# FUT.GG player pages
+FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
+
+# Railway DB URL
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
-BASE_URL = "https://www.fut.gg/players/?page={}"
+print(f"🔌 DEBUG: Using DATABASE_URL = {DATABASE_URL}")
 
-# --------------------------
-# Extract card_id from image_url
-# --------------------------
-def extract_card_id(image_url: str) -> str:
-    match = re.search(r'/(25-\d+)/', image_url)
-    return match.group(1) if match else None
 
-# --------------------------
-# Fetch a single FUT.GG page
-# --------------------------
-async def fetch_page(session, page_number: int):
-    url = BASE_URL.format(page_number)
+def parse_alt_text(alt_text):
+    """
+    Extract player name, rating, and version from FUT.GG <img alt="...">
+    Example: "Konaté - 98 - Shapeshifters"
+    """
     try:
-        async with session.get(url) as response:
-            if response.status != 200:
-                print(f"⚠️ Failed to fetch page {page_number} — status {response.status}")
-                return None
-            return await response.text()
-    except Exception as e:
-        print(f"⚠️ Error fetching page {page_number}: {e}")
+        parts = [p.strip() for p in alt_text.split("-")]
+        if len(parts) >= 3:
+            name = parts[0]
+            rating = int(parts[1]) if parts[1].isdigit() else None
+            version = "-".join(parts[2:])
+            return name, rating, version
+        return alt_text, None, "N/A"
+    except:
+        return alt_text, None, "N/A"
+
+
+def extract_card_id(image_url: str):
+    """Extract card_id from FUT.GG image URL"""
+    try:
+        # Example: https://game-assets.fut.gg/.../futgg-player-item-card/"25-100855415"
+        return image_url.split("/")[-1].replace('"', '').replace('25-', '')
+    except:
         return None
 
-# --------------------------
-# Parse players from HTML
-# --------------------------
-def parse_players(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    player_cards = soup.select("a.player-card")
+
+def fetch_players_from_page(page_number):
+    """Fetch FUT.GG players from a single page."""
+    url = FUTGG_BASE_URL.format(page_number)
+    print(f"🌐 Fetching: {url}")
+
+    response = requests.get(url, timeout=15)
+    if response.status_code != 200:
+        print(f"⚠️ Failed to fetch page {page_number}: {response.status_code}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    cards = soup.select("a.group\\/player")
+
     players = []
-
-    for card in player_cards:
+    for card in cards:
         try:
-            player_url = card.get("href")
-            if not player_url or not player_url.startswith("/players/"):
+            img_tag = card.select_one("img")
+            if not img_tag:
                 continue
 
-            # Extract slug from URL
-            player_slug = player_url.split("/")[2] if len(player_url.split("/")) > 2 else None
-            if not player_slug:
+            alt_text = img_tag.get("alt", "").strip()
+            img_url = img_tag.get("src", "")
+            name, rating, version = parse_alt_text(alt_text)
+
+            if not rating:
                 continue
 
-            # Extract player id from slug
-            player_id = player_slug.split("-")[0] if "-" in player_slug else None
-            if not player_id:
-                continue
+            # Player slug + URL
+            player_url = "https://www.fut.gg" + card.get("href")
+            player_slug = card.get("href").split("/")[2] if card.get("href") else None
+            card_id = extract_card_id(img_url)
 
-            # Extract name & rating
-            name_tag = card.select_one(".name")
-            rating_tag = card.select_one(".rating")
-            version_tag = card.select_one(".card-variant")
-
-            name = name_tag.text.strip() if name_tag else "Unknown"
-            rating = int(rating_tag.text.strip()) if rating_tag else 0
-            version = version_tag.text.strip() if version_tag else "Base"
-
-            # Extract image URL
-            image_tag = card.select_one("img")
-            image_url = image_tag.get("src") if image_tag else None
-
-            # Get card_id from image_url
-            card_id = extract_card_id(image_url) if image_url else None
-
-            # Build player dict
             players.append({
-                "id": int(player_id),
                 "name": name,
                 "rating": rating,
                 "version": version,
-                "image_url": image_url,
+                "image_url": img_url,
+                "updated_at": datetime.now(timezone.utc),
                 "player_slug": player_slug,
-                "player_url": f"https://www.fut.gg{player_url}",
-                "card_id": card_id,
-                "created_at": datetime.now(timezone.utc)
+                "player_url": player_url,
+                "card_id": card_id
             })
-
         except Exception as e:
-            print(f"⚠️ Failed to parse player card: {e}")
+            print(f"⚠️ Failed to parse card: {e}")
             continue
 
     return players
 
-# --------------------------
-# Save players into database
-# --------------------------
-async def save_players_to_db(conn, players):
-    query = """
-        INSERT INTO fut_players
-        (id, name, rating, version, image_url, player_slug, player_url, card_id, created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        ON CONFLICT (id) DO UPDATE SET
-            name = EXCLUDED.name,
-            rating = EXCLUDED.rating,
-            version = EXCLUDED.version,
-            image_url = EXCLUDED.image_url,
-            player_slug = EXCLUDED.player_slug,
-            player_url = EXCLUDED.player_url,
-            card_id = EXCLUDED.card_id,
-            created_at = EXCLUDED.created_at
-    """
 
-    for player in players:
-        try:
-            await conn.execute(
-                query,
-                player["id"],
-                player["name"],
-                player["rating"],
-                player["version"],
-                player["image_url"],
-                player["player_slug"],
-                player["player_url"],
-                player["card_id"],
-                player["created_at"]
-            )
-            print(f"✅ Saved {player['name']} ({player['rating']})")
-        except Exception as e:
-            print(f"⚠️ Failed to save {player['name']}: {e}")
-
-# --------------------------
-# Main Auto-Sync Function
-# --------------------------
 async def sync_players():
-    print(f"🚀 Starting full auto-sync at {datetime.now(timezone.utc)} UTC")
-    conn = await asyncpg.connect(DATABASE_URL)
+    """Sync FUT.GG player data into Railway PostgreSQL."""
+    print(f"\n🚀 Starting FULL RESYNC at {datetime.now(timezone.utc)} UTC")
 
-    async with aiohttp.ClientSession() as session:
-        page = 1
-        total_players = 0
+    all_players = []
+    page = 1
 
-        while True:
-            html = await fetch_page(session, page)
-            if not html:
-                break
+    # Loop until no more players are found
+    while True:
+        players = fetch_players_from_page(page)
+        if not players:
+            print(f"✅ No players found on page {page}, stopping pagination.")
+            break
+        all_players.extend(players)
+        print(f"📦 Page {page}: {len(players)} players fetched.")
+        page += 1
+        await asyncio.sleep(0.5)  # Be nice to FUT.GG servers
 
-            players = parse_players(html)
-            if not players:
-                print(f"✅ No more players found — stopping at page {page}")
-                break
+    print(f"🔍 Total players fetched: {len(all_players)}")
 
-            await save_players_to_db(conn, players)
-            total_players += len(players)
-            print(f"✅ Synced page {page} ({len(players)} players)")
-            page += 1
+    # Save players into DB
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+    except Exception as e:
+        print(f"❌ DB connection failed: {e}")
+        return
 
-        print(f"\n🎯 Full sync complete — {total_players} players updated ✅")
+    for p in all_players:
+        try:
+            await conn.execute("""
+                INSERT INTO fut_players (name, rating, version, image_url, updated_at, player_slug, player_url, card_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (name, rating)
+                DO UPDATE SET version=$3, image_url=$4, updated_at=$5, player_slug=$6, player_url=$7, card_id=$8
+            """, p["name"], p["rating"], p["version"], p["image_url"], p["updated_at"],
+                 p["player_slug"], p["player_url"], p["card_id"])
+        except Exception as e:
+            print(f"⚠️ Failed to save {p['name']}: {e}")
 
     await conn.close()
+    print("🎯 FUT.GG full resync complete — database updated.")
 
-# --------------------------
-# Run script manually
-# --------------------------
+
 if __name__ == "__main__":
     asyncio.run(sync_players())
