@@ -1,115 +1,135 @@
 import os
-import asyncio
+import re
 import aiohttp
+import asyncio
 import asyncpg
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-FUTGG_BASE_URL = "https://www.fut.gg/players/"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL is not set!")
 
-# ─────────────────────────────
-# Connect to PostgreSQL
-# ─────────────────────────────
-async def get_db():
+FUTGG_BASE_URL = "https://www.fut.gg/players"
+CARD_ID_REGEX = re.compile(r"/(\d{2}-\d+)/?$")
+
+# ---------------------------
+# DB CONNECTION
+# ---------------------------
+async def get_db_connection():
     return await asyncpg.connect(DATABASE_URL)
 
-# ─────────────────────────────
-# Fetch price from FUT.GG
-# ─────────────────────────────
-async def fetch_price(session, slug, card_id):
+# ---------------------------
+# FETCH PAGE HTML
+# ---------------------------
+async def fetch_html(session, url):
     try:
-        # Correct URL building
-        if card_id:
-            url = f"{FUTGG_BASE_URL}{slug}/25-{card_id}/"
-        else:
-            url = f"{FUTGG_BASE_URL}{slug}/"
-
-        async with session.get(url, headers=HEADERS) as resp:
-            if resp.status != 200:
-                print(f"⚠️ Failed to fetch {url} — status {resp.status}")
+        async with session.get(url) as response:
+            if response.status == 200:
+                return await response.text()
+            else:
+                print(f"⚠️ Failed to fetch {url} — status {response.status}")
                 return None
-
-            html = await resp.text()
-            soup = BeautifulSoup(html, "html.parser")
-
-            # Correct price selector
-            price_el = soup.select_one(
-                "div.font-bold.text-2xl.flex.flex-row.items-center.gap-1.justify-self-end"
-            )
-            if price_el:
-                return int(price_el.text.strip().replace(",", "").replace(" Coins", ""))
-
-            return None
     except Exception as e:
-        print(f"❌ Error fetching price for {slug}: {e}")
+        print(f"⚠️ Error fetching {url}: {e}")
         return None
 
-# ─────────────────────────────
-# Update prices for all players
-# ─────────────────────────────
+# ---------------------------
+# EXTRACT CARD ID FROM IMAGE URL
+# ---------------------------
+def extract_card_id(image_url):
+    match = CARD_ID_REGEX.search(image_url)
+    return match.group(1) if match else None
+
+# ---------------------------
+# UPDATE PRICES
+# ---------------------------
 async def update_prices():
-    print(f"⏳ Starting price sync at {datetime.now(timezone.utc)} UTC")
-    conn = await get_db()
-    players = await conn.fetch("SELECT id, slug, card_id FROM fut_players")
+    conn = await get_db_connection()
+    players = await conn.fetch("SELECT id, player_slug, card_id, image_url FROM fut_players")
+    print(f"🔄 Updating prices for {len(players)} players...")
 
     async with aiohttp.ClientSession() as session:
-        tasks = [
-            fetch_price(session, row["slug"], row["card_id"])
-            for row in players
-        ]
-        prices = await asyncio.gather(*tasks)
+        for player in players:
+            slug = player["player_slug"]
+            card_id = player["card_id"]
 
-        for row, price in zip(players, prices):
-            if price:
-                await conn.execute(
-                    """
-                    UPDATE fut_players
-                    SET price = $1, updated_at = NOW()
+            # If no card_id stored, extract it from image_url
+            if not card_id:
+                card_id = extract_card_id(player["image_url"])
+                if card_id:
+                    await conn.execute(
+                        "UPDATE fut_players SET card_id = $1 WHERE id = $2",
+                        card_id, player["id"]
+                    )
+
+            # Build proper FUT.GG URL
+            if card_id:
+                url = f"{FUTGG_BASE_URL}/{slug}/{card_id}/"
+            else:
+                url = f"{FUTGG_BASE_URL}/{slug}"
+
+            html = await fetch_html(session, url)
+            if not html:
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Find console prices (PS + Xbox)
+            price_box = soup.find("div", class_="price-box-console")
+            if not price_box:
+                print(f"⚠️ No console price found for {slug}")
+                continue
+
+            try:
+                price = int(price_box.get_text(strip=True).replace(",", "").replace("Coins", "").strip())
+                await conn.execute("""
+                    UPDATE fut_players 
+                    SET price = $1 
                     WHERE id = $2
-                    """,
-                    price, row["id"]
-                )
-                print(f"💰 Updated {row['slug']} → {price} coins")
+                """, price, player["id"])
+                print(f"✅ {slug} → {price} coins")
+            except Exception as e:
+                print(f"⚠️ Failed to parse price for {slug}: {e}")
 
     await conn.close()
     print("🎯 Price sync complete — database updated.")
 
-# ─────────────────────────────
-# Sync new players daily at 18:02
-# ─────────────────────────────
+# ---------------------------
+# SYNC NEW PLAYERS (DAILY AT 18:02 LONDON)
+# ---------------------------
 async def sync_new_players():
-    print(f"🚀 Running NEW PLAYER sync at {datetime.now(timezone.utc)} UTC")
-    # You can reuse your working player fetch + insert logic here.
-    # We'll keep your existing new player parsing code.
-    # After inserting → commit to fut_players.
-    print("✅ New players sync complete.")
+    print("⏳ Checking for new players...")
+    # We'll hook your FUT.GG scraping logic here.
+    # This will fetch any new FUT cards released at 6PM.
+    # It will INSERT them into fut_players.
+    pass
 
-# ─────────────────────────────
-# Scheduler: Prices every 5 mins, New players daily 18:02
-# ─────────────────────────────
+# ---------------------------
+# MAIN SCHEDULER
+# ---------------------------
 async def scheduler():
-    london_tz = timezone(timedelta(hours=1))  # UK is UTC+1 during BST
-
     while True:
-        now = datetime.now(london_tz)
+        now = datetime.now(timezone.utc)
 
-        # Always run price sync every 5 mins
-        await update_prices()
+        # Run price sync every 5 minutes
+        if now.minute % 5 == 0:
+            print(f"\n⏳ Starting price sync at {now}")
+            await update_prices()
 
-        # If it's 18:02 London → Run new player sync
-        if now.hour == 18 and now.minute == 2:
+        # Run new-player sync at 18:02 London (17:02 UTC)
+        if now.hour == 17 and now.minute == 2:
+            print(f"\n⏳ Running new-player sync at {now}")
             await sync_new_players()
 
-        await asyncio.sleep(300)  # Check every 5 mins
+        await asyncio.sleep(60)
 
-# ─────────────────────────────
-# Main entrypoint
-# ─────────────────────────────
+# ---------------------------
+# ENTRYPOINT
+# ---------------------------
 if __name__ == "__main__":
     print(f"🚀 Starting combined auto-sync at {datetime.now(timezone.utc)} UTC")
     asyncio.run(scheduler())
