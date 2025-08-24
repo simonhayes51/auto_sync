@@ -65,7 +65,7 @@ def fetch_players_from_page(page_number):
                 "rating": rating,
                 "version": version,
                 "image_url": img_url,
-                "updated_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc)
             })
         except Exception as e:
             print(f"⚠️ Failed to parse card: {e}")
@@ -104,11 +104,11 @@ async def sync_players():
     for p in all_players:
         try:
             await conn.execute("""
-                INSERT INTO fut_players (name, rating, version, image_url, updated_at)
+                INSERT INTO fut_players (name, rating, version, image_url, created_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (name, rating)
-                DO UPDATE SET version=$3, image_url=$4, updated_at=$5
-            """, p["name"], p["rating"], p["version"], p["image_url"], p["updated_at"])
+                DO UPDATE SET version=$3, image_url=$4, created_at=$5
+            """, p["name"], p["rating"], p["version"], p["image_url"], p["created_at"])
         except Exception as e:
             print(f"⚠️ Failed to save {p['name']}: {e}")
 
@@ -128,3 +128,4 @@ async def scheduler():
 
 if __name__ == "__main__":
     asyncio.run(scheduler())
+
