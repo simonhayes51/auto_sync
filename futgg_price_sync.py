@@ -16,7 +16,7 @@ HEADERS = {
 }
 
 def fetch_price(player_url: str):
-    """Fetch price from a FUT.GG player page."""
+    """Fetch price from FUT.GG player page."""
     try:
         response = requests.get(player_url, headers=HEADERS, timeout=12)
         if response.status_code != 200:
@@ -25,26 +25,28 @@ def fetch_price(player_url: str):
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Locate price container exactly
-        price_container = soup.find(
-            "div",
-            class_="font-bold text-2xl flex flex-row items-center gap-1 justify-self-end"
-        )
-        if not price_container:
-            return None  # SBC/Reward cards have no market price
+        # Find ALL possible price containers that match FUT.GG patterns
+        containers = soup.find_all("div", class_="font-bold text-2xl flex flex-row items-center gap-1 justify-self-end")
 
-        # Get <span> and extract the text immediately after it → price
-        coin_span = price_container.find("span", class_="price-coin")
-        if not coin_span:
-            return None
+        price_text = None
+        for container in containers:
+            coin_span = container.find("span", class_="price-coin")
+            if coin_span:
+                # First text node after <span>
+                text = coin_span.next_sibling
+                if text and text.strip().replace(",", "").isdigit():
+                    price_text = text.strip().replace(",", "")
+                    break
 
-        price_text = coin_span.next_sibling
+        # Fallback → scan entire HTML for first price-coin span
         if not price_text:
-            return None
+            coin_span = soup.find("span", class_="price-coin")
+            if coin_span and coin_span.next_sibling:
+                text = coin_span.next_sibling.strip().replace(",", "")
+                if text.isdigit():
+                    price_text = text
 
-        # Clean up commas and spaces
-        price_text = price_text.strip().replace(",", "")
-        return int(price_text) if price_text.isdigit() else None
+        return int(price_text) if price_text and price_text.isdigit() else None
 
     except Exception as e:
         print(f"❌ Error scraping {player_url}: {e}")
@@ -54,23 +56,12 @@ async def populate_prices():
     """One-time bulk price fetcher — fills missing prices."""
     print(f"\n🚀 Starting bulk price population at {datetime.now(timezone.utc)} UTC")
 
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-    except Exception as e:
-        print(f"❌ DB connection failed: {e}")
-        return
-
-    try:
-        # Grab all players where price is NULL
-        players = await conn.fetch("""
-            SELECT id, player_url
-            FROM fut_players
-            WHERE price IS NULL OR price = 0
-        """)
-    except Exception as e:
-        print(f"❌ Failed to fetch players: {e}")
-        await conn.close()
-        return
+    conn = await asyncpg.connect(DATABASE_URL)
+    players = await conn.fetch("""
+        SELECT id, player_url
+        FROM fut_players
+        WHERE price IS NULL OR price = 0
+    """)
 
     print(f"📦 Found {len(players)} players missing prices.")
     updated, skipped = 0, 0
@@ -85,7 +76,7 @@ async def populate_prices():
 
         price = fetch_price(url)
         if price is None:
-            print(f"ℹ️ Skipping (SBC/Reward or unavailable): {url}")
+            print(f"⚠️ No price found: {url}")
             skipped += 1
             continue
 
@@ -104,7 +95,7 @@ async def populate_prices():
         except Exception as e:
             print(f"⚠️ Failed to update {url}: {e}")
 
-        await asyncio.sleep(0.4)  # Gentle rate-limit protection
+        await asyncio.sleep(0.3)
 
     await conn.close()
     print(f"\n🎯 Bulk price population complete — {updated} prices added, {skipped} skipped.")
