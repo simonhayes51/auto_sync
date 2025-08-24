@@ -1,87 +1,119 @@
-import os
-import time
-import requests
+import asyncio
+import asyncpg
+import aiohttp
 from bs4 import BeautifulSoup
-import psycopg2
-from psycopg2.extras import execute_values
 from datetime import datetime
+import os
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-BASE_URL = "https://www.fut.gg/players/?page="
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/futtrader")
+FUTGG_URL = "https://www.fut.gg/players/"
 
-def create_table():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("""
+# ---------- DB INITIALISATION ----------
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            id BIGINT PRIMARY KEY,
-            name TEXT,
-            rating INT,
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            rating TEXT,
             version TEXT,
             image_url TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
+            updated_at TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT unique_player UNIQUE (name, rating)
+        )
     """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    await conn.close()
 
-def fetch_page(page):
-    url = f"{BASE_URL}{page}"
-    response = requests.get(url, timeout=15)
-    if response.status_code != 200:
-        print(f"⚠️ Failed to fetch page {page} — Status: {response.status_code}")
-        return []
-    soup = BeautifulSoup(response.text, "html.parser")
-    
-    # Check new FUT.GG structure — updated selectors
-    players = []
-    for card in soup.select("a.player-item"):  # FUT.GG uses <a> for each card
+# ---------- PARSE PLAYER NAME / RATING / VERSION ----------
+def parse_alt_text(alt_text):
+    try:
+        parts = [p.strip() for p in alt_text.split("-")]
+        if len(parts) >= 3:
+            name = parts[0]
+            rating = parts[1]
+            version = "-".join(parts[2:])
+            return name, rating, version
+        return alt_text, "N/A", "N/A"
+    except:
+        return alt_text, "N/A", "N/A"
+
+# ---------- FETCH & PARSE FUT.GG PLAYER DATA ----------
+async def fetch_player_page(session, page):
+    url = f"{FUTGG_URL}?page={page}"
+    async with session.get(url) as resp:
+        if resp.status != 200:
+            print(f"⚠️ Failed to fetch page {page} → Status {resp.status}")
+            return []
+        html = await resp.text()
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("a.group\\/player")  # Escape the "/" in class
+        players = []
+
+        for card in cards:
+            try:
+                img_tag = card.select_one("img")
+                if not img_tag:
+                    continue
+
+                alt_text = img_tag.get("alt", "").strip()
+                img_url = img_tag.get("src", "")
+                name, rating, version = parse_alt_text(alt_text)
+
+                players.append({
+                    "name": name,
+                    "rating": rating,
+                    "version": version,
+                    "image_url": img_url,
+                    "updated_at": datetime.utcnow()
+                })
+            except Exception as e:
+                print(f"⚠️ Parse error on page {page}: {e}")
+                continue
+        return players
+
+# ---------- SAVE TO DATABASE ----------
+async def save_players(players):
+    conn = await asyncpg.connect(DATABASE_URL)
+    for p in players:
         try:
-            player_id = int(card["href"].split("/")[-1])
-            name = card.select_one("div.player-name").text.strip()
-            rating = int(card.select_one("div.player-rating").text.strip())
-            version = card.select_one("div.player-card-variant").text.strip()
-            img_tag = card.select_one("img")
-            image_url = img_tag["src"] if img_tag else None
-            players.append((player_id, name, rating, version, image_url))
+            await conn.execute("""
+                INSERT INTO players (name, rating, version, image_url, updated_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (name, rating)
+                DO UPDATE SET version=$3, image_url=$4, updated_at=$5
+            """, p["name"], p["rating"], p["version"], p["image_url"], p["updated_at"])
         except Exception as e:
-            continue
-    return players
+            print(f"⚠️ Failed to save {p['name']}: {e}")
+    await conn.close()
 
-def save_players(players):
-    if not players:
-        return 0
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    query = """
-        INSERT INTO players (id, name, rating, version, image_url)
-        VALUES %s
-        ON CONFLICT (id) DO NOTHING
-    """
-    execute_values(cur, query, players)
-    inserted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    return inserted
+# ---------- MAIN AUTO-SYNC LOOP ----------
+async def auto_sync():
+    await init_db()
 
-def run_sync():
-    create_table()
-    page = 1
     while True:
-        players = fetch_page(page)
-        if not players:
-            break
-        inserted = save_players(players)
-        print(f"✅ Page {page}: Found {len(players)} | Inserted {inserted} | Skipped {len(players) - inserted}")
-        page += 1
-        time.sleep(0.5)
-    print("🎯 Sync complete!")
+        print(f"🚀 Starting auto-sync at {datetime.utcnow()} UTC")
+        all_players = []
+        page = 1
 
-if __name__ == "__main__":
-    while True:
-        print(f"\n🚀 Starting auto-sync at {datetime.utcnow()} UTC")
-        run_sync()
+        async with aiohttp.ClientSession() as session:
+            while True:
+                players = await fetch_player_page(session, page)
+                if not players:
+                    break
+                print(f"✅ Synced page {page} ({len(players)} players)")
+                all_players.extend(players)
+                page += 1
+
+        if all_players:
+            print(f"💾 Saving {len(all_players)} players to database...")
+            await save_players(all_players)
+            print(f"🎯 Sync complete — {len(all_players)} total players updated.\n")
+        else:
+            print("⚠️ No players found — FUT.GG layout might have changed!")
+
         print("⏳ Waiting 10 minutes before next sync...\n")
-        time.sleep(600)
+        await asyncio.sleep(600)  # 10 minutes
+
+# ---------- RUN ----------
+if __name__ == "__main__":
+    asyncio.run(auto_sync())
