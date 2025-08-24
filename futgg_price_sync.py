@@ -3,12 +3,8 @@ import asyncio
 import asyncpg
 import requests
 from bs4 import BeautifulSoup
-import re
 from datetime import datetime, timezone
 
-# ==============================
-# CONFIGURATION
-# ==============================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
@@ -19,11 +15,8 @@ HEADERS = {
                   "Chrome/115.0.0.0 Safari/537.36"
 }
 
-# ==============================
-# FETCH PRICE FUNCTION
-# ==============================
 def fetch_price(player_url: str):
-    """Fetch the player's current price from FUT.GG."""
+    """Fetch the player's price from FUT.GG."""
     try:
         response = requests.get(player_url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
@@ -32,32 +25,35 @@ def fetch_price(player_url: str):
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Target the price container
+        # Find the price container exactly
         price_container = soup.find(
             "div",
             class_="font-bold text-2xl flex flex-row items-center gap-1 justify-self-end"
         )
-
         if not price_container:
-            # Likely SBC/Objective/Reward card with no market price
-            print(f"ℹ️ No price available (SBC/Reward): {player_url}")
+            return None  # SBC or Reward card, skip it
+
+        # Find the span first
+        coin_span = price_container.find("span", class_="price-coin")
+        if not coin_span:
+            return None  # No price span = no market price
+
+        # Get the **next sibling text** after the span → that's the price
+        price_text = coin_span.next_sibling
+        if not price_text:
             return None
 
-        # Extract number only — e.g. "30,750" → 30750
-        text = price_container.get_text(strip=True)
-        price = re.sub(r"[^\d]", "", text)
+        # Clean formatting: remove commas, spaces, etc.
+        price_text = price_text.strip().replace(",", "")
 
-        return int(price) if price.isdigit() else None
+        return int(price_text) if price_text.isdigit() else None
 
     except Exception as e:
         print(f"❌ Error fetching price from {player_url}: {e}")
         return None
 
-# ==============================
-# MAIN PRICE SYNC FUNCTION
-# ==============================
 async def update_prices():
-    """Fetch prices from FUT.GG and update the Railway DB."""
+    """Fetch prices and update the DB."""
     print(f"\n⏳ Starting price sync at {datetime.now(timezone.utc)} UTC")
 
     try:
@@ -73,8 +69,7 @@ async def update_prices():
         await conn.close()
         return
 
-    updated = 0
-    skipped = 0
+    updated, skipped = 0, 0
 
     for player in players:
         player_id = player["id"]
@@ -86,6 +81,7 @@ async def update_prices():
 
         price = fetch_price(url)
         if price is None:
+            print(f"ℹ️ No price available (SBC/Reward): {url}")
             skipped += 1
             continue
 
@@ -104,15 +100,11 @@ async def update_prices():
         except Exception as e:
             print(f"⚠️ Failed to update DB for {url}: {e}")
 
-        # Respect FUT.GG rate limits
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)  # Rate-limit friendly
 
     await conn.close()
     print(f"🎯 Price sync complete — {updated} updated, {skipped} skipped.")
 
-# ==============================
-# SCHEDULER — RUN EVERY 5 MINUTES
-# ==============================
 async def scheduler():
     """Run the price sync every 5 minutes."""
     while True:
@@ -120,10 +112,7 @@ async def scheduler():
             await update_prices()
         except Exception as e:
             print(f"❌ Sync error: {e}")
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(300)
 
-# ==============================
-# ENTRY POINT
-# ==============================
 if __name__ == "__main__":
     asyncio.run(scheduler())
