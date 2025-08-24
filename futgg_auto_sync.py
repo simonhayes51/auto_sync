@@ -77,7 +77,7 @@ async def save_players(players):
     for p in players:
         try:
             await conn.execute("""
-                INSERT INTO players (name, rating, version, image_url, updated_at)
+                INSERT INTO fut_players (name, rating, version, image_url, updated_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (name, rating)
                 DO UPDATE SET version=$3, image_url=$4, updated_at=$5
@@ -117,3 +117,4 @@ async def auto_sync():
 # ---------- RUN ----------
 if __name__ == "__main__":
     asyncio.run(auto_sync())
+
