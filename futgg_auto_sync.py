@@ -1,131 +1,80 @@
-import os
 import asyncio
 import asyncpg
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import os
 
-# FUT.GG player pages
-FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
-
-# Railway DB URL
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
+FUTGG_URL = "https://www.fut.gg/players/"
 
-print(f"🔌 DEBUG: Using DATABASE_URL = {DATABASE_URL}")
+# Scheduled run time (6:15 PM London / 17:15 UTC)
+LONDON_OFFSET = 1
+SYNC_HOUR_UTC = 17
+SYNC_MINUTE = 02
 
-
-def parse_alt_text(alt_text):
-    """
-    Extract player name, rating, and version from FUT.GG <img alt="...">
-    Example: "Konaté - 98 - Shapeshifters"
-    """
-    try:
-        parts = [p.strip() for p in alt_text.split("-")]
-        if len(parts) >= 3:
-            name = parts[0]
-            rating = int(parts[1]) if parts[1].isdigit() else None
-            version = "-".join(parts[2:])
-            return name, rating, version
-        return alt_text, None, "N/A"
-    except:
-        return alt_text, None, "N/A"
-
-
-def fetch_players_from_page(page_number):
-    """Fetch FUT.GG players from a single page."""
-    url = FUTGG_BASE_URL.format(page_number)
-    print(f"🌐 Fetching: {url}")
-
-    response = requests.get(url, timeout=15)
-    if response.status_code != 200:
-        print(f"⚠️ Failed to fetch page {page_number}: {response.status_code}")
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    cards = soup.select("a.group\\/player")
-
-    players = []
-    for card in cards:
-        try:
-            img_tag = card.select_one("img")
-            if not img_tag:
-                continue
-
-            alt_text = img_tag.get("alt", "").strip()
-            img_url = img_tag.get("src", "")
-            name, rating, version = parse_alt_text(alt_text)
-
-            if not rating:
-                continue
-
-            players.append({
-                "name": name,
-                "rating": rating,
-                "version": version,
-                "image_url": img_url,
-                "created_at": datetime.now().replace(tzinfo=None)
-            })
-        except Exception as e:
-            print(f"⚠️ Failed to parse card: {e}")
-            continue
-
-    return players
-
+async def fetch_html(session, url):
+    async with session.get(url) as resp:
+        return await resp.text()
 
 async def sync_players():
-    """Sync FUT.GG player data into Railway PostgreSQL."""
-    print(f"\n🚀 Starting auto-sync at {datetime.now(timezone.utc)} UTC")
+    conn = await asyncpg.connect(DATABASE_URL)
+    async with aiohttp.ClientSession() as session:
+        players_fetched = 0
+        page = 1
 
-    all_players = []
-    page = 1
+        while True:
+            url = f"{FUTGG_URL}?page={page}"
+            print(f"🌍 Fetching: {url}")
+            html = await fetch_html(session, url)
+            soup = BeautifulSoup(html, "html.parser")
+            cards = soup.select("a.group\\/player")
 
-    # Loop until no more players are found
-    while True:
-        players = fetch_players_from_page(page)
-        if not players:
-            print(f"✅ No players found on page {page}, stopping pagination.")
-            break
-        all_players.extend(players)
-        print(f"📦 Page {page}: {len(players)} players fetched.")
-        page += 1
-        await asyncio.sleep(0.5)  # Be nice to FUT.GG servers
+            if not cards:
+                print(f"✅ No players on page {page}, stopping pagination.")
+                break
 
-    print(f"🔍 Total players fetched: {len(all_players)}")
+            for card in cards:
+                try:
+                    img_tag = card.select_one("img")
+                    if not img_tag:
+                        continue
 
-    # Save players into DB
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-    except Exception as e:
-        print(f"❌ DB connection failed: {e}")
-        return
+                    alt_text = img_tag.get("alt", "").strip()
+                    img_url = img_tag.get("src", "")
 
-    for p in all_players:
-        try:
-            await conn.execute("""
-                INSERT INTO fut_players (name, rating, version, image_url, created_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (name, rating)
-                DO UPDATE SET version=$3, image_url=$4, created_at=$5
-            """, p["name"], p["rating"], p["version"], p["image_url"], p["created_at"])
-        except Exception as e:
-            print(f"⚠️ Failed to save {p['name']}: {e}")
+                    parts = [p.strip() for p in alt_text.split("-")]
+                    if len(parts) >= 3:
+                        name, rating, version = parts[0], int(parts[1]), "-".join(parts[2:])
+                    else:
+                        continue
 
-    await conn.close()
-    print("🎯 FUT.GG sync complete — database updated.")
+                    await conn.execute("""
+                        INSERT INTO fut_players (name, rating, version, image_url, updated_at)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (name, rating)
+                        DO UPDATE SET version=$3, image_url=$4, updated_at=$5
+                    """, name, rating, version, img_url, datetime.now(timezone.utc))
 
+                    players_fetched += 1
+                except Exception as e:
+                    print(f"⚠️ Failed to save player: {e}")
+                    continue
+
+            print(f"📦 Page {page}: {len(cards)} players fetched.")
+            page += 1
+
+        await conn.close()
+        print(f"🎯 Daily sync complete — Total players fetched: {players_fetched}")
 
 async def scheduler():
-    """Run auto-sync every 10 minutes."""
     while True:
-        try:
+        now = datetime.now(timezone.utc)
+        if now.hour == SYNC_HOUR_UTC and now.minute == SYNC_MINUTE:
+            print(f"🚀 Starting daily auto-sync at {now}")
             await sync_players()
-        except Exception as e:
-            print(f"❌ Sync error: {e}")
-        await asyncio.sleep(600)  # 10 minutes
-
+            await asyncio.sleep(60)  # Prevent multiple runs in the same minute
+        await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(scheduler())
-
