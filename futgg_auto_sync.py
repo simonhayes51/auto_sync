@@ -1,135 +1,79 @@
 import asyncio
 import asyncpg
+import aiohttp
 from bs4 import BeautifulSoup
-from discord.ext import commands, tasks
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-import time 
 
 FUTGG_URL = "https://www.fut.gg/players/"
+DATABASE_URL = "YOUR_DATABASE_URL"  # <- use your Railway DB URL here
 
-class DataSync(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.db = None
-        self.sync_data.start()
+async def fetch_html(session, page):
+    url = f"{FUTGG_URL}?page={page}"
+    async with session.get(url) as response:
+        return await response.text()
 
-    async def cog_load(self):
-        self.db = self.bot.db
+def parse_alt_text(alt_text):
+    try:
+        parts = [p.strip() for p in alt_text.split("-")]
+        if len(parts) >= 3:
+            name = parts[0]
+            rating = int(parts[1])
+            version = "-".join(parts[2:])
+            return name, rating, version
+        return alt_text, 0, "N/A"
+    except:
+        return alt_text, 0, "N/A"
 
-    def parse_alt_text(self, alt_text):
-        """
-        Extract player name, rating, and card type from <img alt="...">
-        Example: "Konaté - 98 - Shapeshifters"
-        """
-        try:
-            parts = [p.strip() for p in alt_text.split("-")]
-            if len(parts) >= 3:
-                name = parts[0]
-                rating = int(parts[1]) if parts[1].isdigit() else 0
-                version = "-".join(parts[2:])
-                return name, rating, version
-            return alt_text, 0, "N/A"
-        except:
-            return alt_text, 0, "N/A"
+async def sync_players():
+    print(f"🚀 Starting auto-sync at {datetime.utcnow()} UTC")
 
-    def fetch_player_data(self):
-        """Launch Selenium, scroll until all players load, and return HTML."""
-        try:
-            print("🌐 Launching headless browser...")
-
-            chrome_options = Options()
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--window-size=1920x1080")
-
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.get(FUTGG_URL)
-            time.sleep(2)
-
-            print("🔄 Scrolling to load all players...")
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            while True:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1.5)
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    print("✅ All players loaded.")
-                    break
-                last_height = new_height
-
-            html = driver.page_source
-            driver.quit()
-            return html
-
-        except Exception as e:
-            print(f"❌ Selenium fetch failed: {e}")
-            return None
-
-    @tasks.loop(minutes=10)
-    async def sync_data(self):
-        print("🔄 Fetching FUT.GG player data via Selenium...")
-
-        html = await asyncio.to_thread(self.fetch_player_data)
-        if not html:
-            print("❌ Failed to fetch FUT.GG HTML, skipping update.")
-            return
-
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select("a.group\\/player")
-
-        if not cards:
-            print("⚠️ No player cards found. FUT.GG layout may have changed.")
-            return
-
-        players = []
-        for card in cards:
+    conn = await asyncpg.connect(DATABASE_URL)
+    async with aiohttp.ClientSession() as session:
+        for page in range(1, 335):  # 334 total pages on FUT.GG
             try:
-                img_tag = card.select_one("img")
-                if not img_tag:
+                html = await fetch_html(session, page)
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("a.group\\/player")
+
+                if not cards:
+                    print(f"⚠️ Page {page}: No players found.")
                     continue
 
-                alt_text = img_tag.get("alt", "").strip()
-                img_url = img_tag.get("src", "")
-                name, rating, version = self.parse_alt_text(alt_text)
+                players = []
+                for card in cards:
+                    img_tag = card.select_one("img")
+                    if not img_tag:
+                        continue
 
-                players.append({
-                    "name": name,
-                    "rating": rating,
-                    "version": version,
-                    "image_url": img_url,
-                    "updated_at": datetime.utcnow()
-                })
+                    alt_text = img_tag.get("alt", "").strip()
+                    img_url = img_tag.get("src", "")
+                    name, rating, version = parse_alt_text(alt_text)
 
-            except Exception as e:
-                print(f"⚠️ Failed to parse player card: {e}")
-                continue
+                    players.append((name, rating, version, img_url, datetime.utcnow()))
 
-        print(f"✅ Parsed {len(players)} players. Saving to database...")
-
-        async with self.bot.db.acquire() as conn:
-            for p in players:
-                try:
+                # Save to DB
+                for p in players:
                     await conn.execute("""
                         INSERT INTO fut_players (name, rating, version, image_url, updated_at)
                         VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (name, rating)
                         DO UPDATE SET version=$3, image_url=$4, updated_at=$5
-                    """, p["name"], p["rating"], p["version"], p["image_url"], p["updated_at"])
-                except Exception as e:
-                    print(f"⚠️ Failed to save {p['name']}: {e}")
+                    """, *p)
 
-        print("🎯 FUT.GG sync complete — database updated.")
+                print(f"✅ Synced page {page} ({len(players)} players)")
 
-    def cog_unload(self):
-        self.sync_data.cancel()
+            except Exception as e:
+                print(f"❌ Failed on page {page}: {e}")
+                continue
 
-async def setup(bot):
-    await bot.add_cog(DataSync(bot))
+    await conn.close()
+    print("🎯 All players synced successfully!")
 
+async def scheduler():
+    while True:
+        await sync_players()
+        print("⏳ Waiting 10 minutes before next sync...")
+        await asyncio.sleep(600)
+
+if __name__ == "__main__":
+    asyncio.run(scheduler())
