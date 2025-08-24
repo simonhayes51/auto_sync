@@ -1,107 +1,107 @@
 import os
 import asyncio
 import asyncpg
-import aiohttp
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
-# Database connection from Railway environment variables
+# Get DB connection
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not set. Configure it in Railway → Variables.")
+    raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
-# Price fetch interval (5 minutes)
-SYNC_INTERVAL = 300
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+}
 
-async def fetch_price(session, player_url):
-    """
-    Fetch the player's price from FUT.GG player page.
-    """
+# -------------------------------
+# Fetch player price from FUT.GG
+# -------------------------------
+def fetch_price(player_url):
+    """Fetch the player's current price from their FUT.GG page."""
     try:
-        async with session.get(player_url) as resp:
-            if resp.status != 200:
-                print(f"⚠️ Failed to fetch {player_url} — status {resp.status}")
-                return None
+        response = requests.get(player_url, headers=HEADERS, timeout=10)
+        if response.status_code != 200:
+            print(f"⚠️ Failed to fetch {player_url} — status {response.status_code}")
+            return None
 
-            html = await resp.text()
-            soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(response.text, "html.parser")
 
-            # Locate the price container
-            price_container = soup.find(
-                "div",
-                class_="flex items-center justify-center"
-            )
+        # Find correct price container that includes the price-coin span
+        price_container = None
+        price_blocks = soup.find_all("div", class_="flex items-center justify-center")
 
-            if price_container:
-                # Extract numeric price only
-                price_text = price_container.get_text(strip=True).replace(",", "")
-                try:
-                    return int(price_text)
-                except ValueError:
-                    print(f"⚠️ Could not parse price for {player_url}: {price_text}")
-                    return None
-            else:
-                print(f"⚠️ No price found for {player_url}")
-                return None
+        for block in price_blocks:
+            if block.find("span", class_="price-coin"):
+                price_container = block
+                break
 
+        if not price_container:
+            print(f"⚠️ No price found for {player_url}")
+            return None
+
+        price_text = price_container.get_text(strip=True)
+        if not price_text:
+            print(f"⚠️ Empty price for {player_url}")
+            return None
+
+        # Remove commas, convert to integer
+        return int(price_text.replace(",", ""))
     except Exception as e:
-        print(f"❌ Error fetching price for {player_url}: {e}")
+        print(f"❌ Error fetching price from {player_url}: {e}")
         return None
 
-
+# -------------------------------
+# Update prices in the database
+# -------------------------------
 async def update_prices():
-    """
-    Fetches player prices and updates them in the DB.
-    """
-    print(f"⏳ Starting price sync at {datetime.now(timezone.utc)}")
+    """Fetch all players and update their prices in the database."""
+    print(f"\n⏳ Starting price sync at {datetime.now(timezone.utc)}")
 
     try:
         conn = await asyncpg.connect(DATABASE_URL)
-        async with aiohttp.ClientSession() as session:
-            # Get players that have a valid URL
-            players = await conn.fetch("SELECT id, player_url FROM fut_players WHERE player_url IS NOT NULL")
-            print(f"🔍 Found {len(players)} players to process.")
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+        return
 
-            updated_count = 0
+    try:
+        players = await conn.fetch("SELECT id, player_url FROM fut_players WHERE player_url IS NOT NULL")
+        print(f"📦 Found {len(players)} players to update.")
 
-            for player in players:
-                player_id = player["id"]
-                url = player["player_url"]
+        for player in players:
+            player_id = player["id"]
+            player_url = player["player_url"]
 
-                if not url or url.strip() == "":
-                    continue
+            if not player_url:
+                continue
 
-                price = await fetch_price(session, url)
-                if price is not None:
-                    try:
-                        await conn.execute("""
-                            UPDATE fut_players
-                            SET price = $1, created_at = $2
-                            WHERE id = $3
-                        """, price, datetime.now(timezone.utc), player_id)
-                        updated_count += 1
-                    except Exception as e:
-                        print(f"⚠️ Failed to update player {player_id}: {e}")
+            price = fetch_price(player_url)
+            if price is None:
+                continue
 
-                # Be nice to FUT.GG → small delay between requests
-                await asyncio.sleep(0.25)
+            try:
+                await conn.execute(
+                    "UPDATE fut_players SET price=$1, created_at=$2 WHERE id=$3",
+                    price,
+                    datetime.now(timezone.utc),
+                    player_id
+                )
+                print(f"✅ Updated player {player_id} → {price} coins")
+            except Exception as e:
+                print(f"⚠️ Failed to update player {player_id}: {e}")
 
-            print(f"🎯 Price sync complete — updated {updated_count} players.")
-
+        print("🎯 Price sync complete — database updated.")
+    finally:
         await conn.close()
 
-    except Exception as e:
-        print(f"❌ Price sync failed: {e}")
-
-
+# -------------------------------
+# Scheduler to run every 5 minutes
+# -------------------------------
 async def scheduler():
-    """
-    Runs price sync every 5 minutes.
-    """
     while True:
         await update_prices()
-        await asyncio.sleep(SYNC_INTERVAL)
-
+        await asyncio.sleep(300)  # 5 minutes
 
 if __name__ == "__main__":
     asyncio.run(scheduler())
