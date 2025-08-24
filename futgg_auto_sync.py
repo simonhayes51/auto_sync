@@ -8,7 +8,7 @@ import os
 DATABASE_URL = os.getenv("DATABASE_URL")
 FUTGG_URL = "https://www.fut.gg/players/"
 
-# Scheduled run time (6:15 PM London / 17:15 UTC)
+# Scheduled run time (6:15 PM London / 17:15 UTC) 
 LONDON_OFFSET = 1
 SYNC_HOUR_UTC = 17
 SYNC_MINUTE = 02
