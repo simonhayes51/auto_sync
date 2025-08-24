@@ -1,7 +1,7 @@
 import os
 import asyncio
+import aiohttp
 import asyncpg
-import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
@@ -15,46 +15,68 @@ HEADERS = {
                   "Chrome/115.0.0.0 Safari/537.36"
 }
 
-def fetch_price(player_url: str):
-    """Fetch price from FUT.GG player page."""
+CONCURRENCY_LIMIT = 20  # Fetch 20 player prices at once
+
+async def fetch_price(session, player_url: str):
+    """Scrape FUT.GG for the player's coin price."""
     try:
-        response = requests.get(player_url, headers=HEADERS, timeout=12)
-        if response.status_code != 200:
-            print(f"⚠️ Failed to fetch {player_url} — status {response.status_code}")
-            return None
+        async with session.get(player_url, headers=HEADERS, timeout=12) as resp:
+            if resp.status != 200:
+                return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
 
-        # Find ALL possible price containers that match FUT.GG patterns
-        containers = soup.find_all("div", class_="font-bold text-2xl flex flex-row items-center gap-1 justify-self-end")
-
-        price_text = None
-        for container in containers:
-            coin_span = container.find("span", class_="price-coin")
-            if coin_span:
-                # First text node after <span>
-                text = coin_span.next_sibling
-                if text and text.strip().replace(",", "").isdigit():
-                    price_text = text.strip().replace(",", "")
-                    break
-
-        # Fallback → scan entire HTML for first price-coin span
-        if not price_text:
+            # Find the coin span
             coin_span = soup.find("span", class_="price-coin")
-            if coin_span and coin_span.next_sibling:
-                text = coin_span.next_sibling.strip().replace(",", "")
-                if text.isdigit():
-                    price_text = text
+            if not coin_span:
+                return None
 
-        return int(price_text) if price_text and price_text.isdigit() else None
+            # Grab the parent div containing the price text
+            parent_div = coin_span.find_parent("div")
+            if not parent_div:
+                return None
 
-    except Exception as e:
-        print(f"❌ Error scraping {player_url}: {e}")
+            # Extract the raw number from inside the div
+            raw_text = parent_div.get_text(strip=True)
+            price = "".join([c for c in raw_text if c.isdigit()])
+
+            return int(price) if price.isdigit() else None
+
+    except Exception:
         return None
 
+
+async def process_player(semaphore, session, conn, player):
+    """Fetch and update a single player's price in the database."""
+    async with semaphore:
+        player_id = player["id"]
+        url = player["player_url"]
+
+        if not url:
+            return False
+
+        price = await fetch_price(session, url)
+        if price is None:
+            print(f"⚠️ No price found: {url}")
+            return False
+
+        try:
+            await conn.execute("""
+                UPDATE fut_players
+                SET price = $1, created_at = $2
+                WHERE id = $3
+            """, price, datetime.now(timezone.utc), player_id)
+            print(f"✅ {url} → {price:,} coins")
+            return True
+        except Exception as e:
+            print(f"⚠️ Failed to update {url}: {e}")
+            return False
+
+
 async def populate_prices():
-    """One-time bulk price fetcher — fills missing prices."""
-    print(f"\n🚀 Starting bulk price population at {datetime.now(timezone.utc)} UTC")
+    """Bulk price fetcher with parallel scraping."""
+    print(f"\n🚀 Starting price population at {datetime.now(timezone.utc)} UTC")
 
     conn = await asyncpg.connect(DATABASE_URL)
     players = await conn.fetch("""
@@ -63,42 +85,25 @@ async def populate_prices():
         WHERE price IS NULL OR price = 0
     """)
 
-    print(f"📦 Found {len(players)} players missing prices.")
-    updated, skipped = 0, 0
+    total_players = len(players)
+    print(f"📦 Found {total_players} players missing prices.")
 
-    for player in players:
-        player_id = player["id"]
-        url = player["player_url"]
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-        if not url:
-            skipped += 1
-            continue
-
-        price = fetch_price(url)
-        if price is None:
-            print(f"⚠️ No price found: {url}")
-            skipped += 1
-            continue
-
-        try:
-            await conn.execute(
-                """
-                UPDATE fut_players
-                SET price = $1, created_at = $2
-                WHERE id = $3
-                """,
-                price, datetime.now(timezone.utc), player_id
-            )
-            updated += 1
-            print(f"✅ {url} → {price:,} coins")
-
-        except Exception as e:
-            print(f"⚠️ Failed to update {url}: {e}")
-
-        await asyncio.sleep(0.3)
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            process_player(semaphore, session, conn, player)
+            for player in players
+        ]
+        results = await asyncio.gather(*tasks)
 
     await conn.close()
-    print(f"\n🎯 Bulk price population complete — {updated} prices added, {skipped} skipped.")
+
+    updated = sum(1 for r in results if r)
+    skipped = total_players - updated
+
+    print(f"\n🎯 Price sync complete — {updated} prices updated, {skipped} skipped.")
+
 
 if __name__ == "__main__":
     asyncio.run(populate_prices())
