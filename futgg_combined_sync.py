@@ -145,7 +145,7 @@ async def scheduler():
         now = datetime.now(LONDON_TZ)
 
         # Run daily sync at 18:15 London time
-        if now.hour == 18 and now.minute == 02:
+        if now.hour == 18 and now.minute == 2:
             print("🌍 Running daily player sync...")
             players = await scrape_players()
             await save_players(players)
