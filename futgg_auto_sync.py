@@ -7,7 +7,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
-import time
+import time 
 
 FUTGG_URL = "https://www.fut.gg/players/"
 
@@ -132,3 +132,4 @@ class DataSync(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(DataSync(bot))
+
