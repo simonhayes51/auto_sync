@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 
 FUTGG_URL = "https://www.fut.gg/players/"
-DATABASE_URL = "YOUR_DATABASE_URL"  # <- use your Railway DB URL here
+DATABASE_URL = "DATABASE_URL"  # <- use your Railway DB URL here
 
 async def fetch_html(session, page):
     url = f"{FUTGG_URL}?page={page}"
@@ -77,3 +77,4 @@ async def scheduler():
 
 if __name__ == "__main__":
     asyncio.run(scheduler())
+
