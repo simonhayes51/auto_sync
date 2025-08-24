@@ -75,7 +75,7 @@ def fetch_players_from_page(page_number):
                 "player_url": player_url,
                 "player_slug": player_slug,
                 "card_id": card_id,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.utcnow()
             })
         except Exception as e:
             print(f"⚠️ Failed to parse card: {e}")
@@ -86,7 +86,7 @@ def fetch_players_from_page(page_number):
 
 async def sync_players():
     """Sync FUT.GG player data into Railway PostgreSQL."""
-    print(f"\n🚀 Starting full FUT.GG sync at {datetime.now(timezone.utc)} UTC")
+    print(f"\n🚀 Starting full FUT.GG sync at {datetime.utcnow()} UTC")
 
     all_players = []
     page = 1
