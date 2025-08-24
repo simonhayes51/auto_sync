@@ -18,7 +18,7 @@ async def init_db():
             rating TEXT,
             version TEXT,
             image_url TEXT,
-            updated_at TIMESTAMP DEFAULT NOW(),
+            created_at TIMESTAMP DEFAULT NOW(),
             CONSTRAINT unique_player UNIQUE (name, rating)
         )
     """)
@@ -117,4 +117,5 @@ async def auto_sync():
 # ---------- RUN ----------
 if __name__ == "__main__":
     asyncio.run(auto_sync())
+
 
