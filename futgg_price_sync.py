@@ -50,7 +50,7 @@ async def fetch_price(session, player_url):
 
 async def update_prices():
     """Fetch all player URLs from DB and update their prices in parallel."""
-    print(f"\n⏳ Starting price sync at {datetime.now(timezone.utc)}")
+    print(f"\n⏳ Starting price sync at {datetime.utcnow()}")
     try:
         conn = await asyncpg.connect(DATABASE_URL)
     except Exception as e:
@@ -77,7 +77,7 @@ async def update_prices():
                     try:
                         await conn.execute(
                             "UPDATE fut_players SET price=$1, created_at=$2 WHERE id=$3",
-                            price, datetime.now(timezone.utc), player_id
+                            price, datetime.utcnow(), player_id
                         )
                         print(f"✅ Updated {player_id} → {price} coins")
                     except Exception as e:
