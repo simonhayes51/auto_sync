@@ -1,4 +1,4 @@
 aiohttp==3.9.5
 asyncpg==0.29.0
 beautifulsoup4==4.12.3
-request
+requests
