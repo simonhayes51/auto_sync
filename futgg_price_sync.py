@@ -26,21 +26,18 @@ def fetch_price(player_url):
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Find the price coin icon first
-        coin_span = soup.find("span", class_="price-coin")
-        if not coin_span:
-            print(f"⚠️ No coin span found for {player_url}")
+        # Locate the full price container
+        container = soup.find("div", class_="flex items-center justify-center")
+        if not container:
+            print(f"⚠️ No price container found for {player_url}")
             return None
 
-        # Grab the number immediately after the span
-        if coin_span.next_sibling:
-            raw_text = str(coin_span.next_sibling).strip()
-            price_text = raw_text.replace(",", "").replace(" ", "")
+        # Extract all text, remove commas, verify it's numeric
+        text = container.get_text(strip=True).replace(",", "")
+        if text.isdigit():
+            return int(text)
 
-            if price_text.isdigit():
-                return int(price_text)
-
-        print(f"⚠️ No numeric price found for {player_url}")
+        print(f"⚠️ No price found for {player_url}")
         return None
 
     except Exception as e:
@@ -74,7 +71,7 @@ async def update_prices():
                         WHERE id = $3
                         """,
                         price,
-                        datetime.now(timezone.utc),
+                        datetime.now(timezone.utc).replace(tzinfo=None),  # FIXED
                         player_id,
                     )
                     print(f"✅ Updated price for {player_url} → {price}")
@@ -83,7 +80,7 @@ async def update_prices():
             else:
                 print(f"⚠️ No price found for {player_url}")
 
-            await asyncio.sleep(0.3)  # Gentle delay to avoid hammering FUT.GG
+            await asyncio.sleep(0.3)  # Be gentle with FUT.GG
 
         await conn.close()
         print("🎯 Price sync complete — database updated.")
