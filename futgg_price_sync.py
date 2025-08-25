@@ -309,8 +309,8 @@ if __name__ == "__main__":
         # Uncomment ONE of these lines to run different tests:
 
         # asyncio.run(test_database_connection())
-        asyncio.run(test_api_with_sample_cards())
-        # asyncio.run(main())
+        # asyncio.run(test_api_with_sample_cards())
+        asyncio.run(main())
         
     except KeyboardInterrupt:
         logger.info("🛑 Process interrupted by user")
