@@ -1,111 +1,96 @@
-import os
 import asyncio
+import aiohttp
 import asyncpg
-import requests
+import os
+import logging
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-# === CONFIG ===
+load_dotenv()
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not found. Set it in Railway.")
+API_URL = "https://www.fut.gg/api/fut/player-prices/25"
 
-FUTGG_API_URL = "https://www.fut.gg/api/fut/player-prices/25/{}"
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("price_sync")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.fut.gg/",
-    "Origin": "https://www.fut.gg"
-}
+# Limit concurrent requests to avoid bans / 403s
+MAX_CONCURRENT_REQUESTS = 8
+SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+async def fetch_price(session, card_id):
+    """Fetch player price from FUT.GG API."""
+    url = f"{API_URL}/{card_id}/"
+    async with SEM:
+        try:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status == 403:
+                    logger.warning(f"⚠️ Forbidden for {card_id} — blocked by FUT.GG")
+                    return None
+                if resp.status == 404:
+                    logger.info(f"ℹ️ No price for {card_id} — SBC/Reward likely")
+                    return None
+                if resp.status != 200:
+                    logger.error(f"❌ Failed API call for {card_id} → {resp.status}")
+                    return None
 
-async def fetch_price(card_id: str):
-    """
-    Fetch player price from FUT.GG API using the card_id directly.
-    """
-    url = FUTGG_API_URL.format(card_id)
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-
-        if response.status_code == 403:
-            print(f"⚠️ Forbidden for {card_id} → API blocked")
+                data = await resp.json()
+                price = data.get("data", {}).get("currentPrice", {}).get("price")
+                return price
+        except Exception as e:
+            logger.error(f"⚠️ Error fetching price for {card_id}: {e}")
             return None
 
-        if response.status_code != 200:
-            print(f"⚠️ API failed for {card_id} → {response.status_code}")
-            return None
-
-        data = response.json()
-        price = data.get("data", {}).get("currentPrice", {}).get("price")
-
-        if price is None:
-            print(f"ℹ️ No price for card_id {card_id} → Likely SBC/Reward card")
-            return None
-
-        return price
-    except Exception as e:
-        print(f"❌ Exception fetching price for {card_id}: {e}")
-        return None
-
-
-async def run_price_sync_once():
-    """
-    Fetch all players and update prices one time only.
-    """
-    print("\n🚀 Starting one-time FUT.GG price sync...")
-
+async def update_price(conn, player_id, price):
+    """Update price in DB."""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute("""
+            UPDATE fut_players
+            SET price = $1, created_at = $2
+            WHERE card_id = $3
+        """, price, datetime.now(timezone.utc), player_id)
     except Exception as e:
-        print(f"❌ DB connection failed: {e}")
-        return
+        logger.error(f"⚠️ Failed DB update for {player_id}: {e}")
 
-    try:
-        players = await conn.fetch("SELECT id, name, card_id FROM fut_players")
-    except Exception as e:
-        print(f"❌ Failed to fetch players: {e}")
-        await conn.close()
-        return
+async def sync_prices():
+    """Main price sync process."""
+    logger.info("⏳ Starting price sync...")
 
-    updated_count = 0
-    skipped_count = 0
+    conn = await asyncpg.connect(DATABASE_URL)
+    async with aiohttp.ClientSession() as session:
+        # Get all player IDs from DB
+        players = await conn.fetch("SELECT card_id FROM fut_players")
+        total = len(players)
+        updated = 0
+        skipped = 0
 
-    for idx, player in enumerate(players, start=1):
-        player_id = player["id"]
-        name = player["name"]
-        card_id = player["card_id"]
+        for idx, player in enumerate(players, start=1):
+            card_id = player["card_id"]
+            price = await fetch_price(session, card_id)
 
-        if not card_id:
-            skipped_count += 1
-            continue
+            if price:
+                await update_price(conn, card_id, price)
+                updated += 1
+            else:
+                skipped += 1
 
-        # Fetch price using card_id directly
-        price = await fetch_price(str(card_id))
+            # Log progress every 100 players
+            if idx % 100 == 0 or idx == total:
+                logger.info(f"⏳ Processed {idx}/{total} players...")
 
-        if price is not None:
-            try:
-                await conn.execute("""
-                    UPDATE fut_players
-                    SET price = $1, created_at = $2
-                    WHERE id = $3
-                """, price, datetime.now(timezone.utc), player_id)
-                updated_count += 1
-                print(f"✅ Updated {name} → {price:,} coins")
-            except Exception as e:
-                print(f"⚠️ Failed to update {name}: {e}")
-        else:
-            skipped_count += 1
-
-        # Sleep slightly to avoid rate-limiting issues
-        await asyncio.sleep(0.15)
-
-        if idx % 100 == 0:
-            print(f"⏳ Processed {idx}/{len(players)} players...")
-
+        logger.info(f"🎯 Price sync complete → ✅ {updated} updated | ⏭️ {skipped} skipped.")
     await conn.close()
-    print(f"\n🎯 One-time price sync complete → ✅ {updated_count} updated | ⏭️ {skipped_count} skipped.")
 
+async def main():
+    while True:
+        await sync_prices()
+        logger.info("⏲️ Waiting 5 minutes before next sync...")
+        await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    asyncio.run(run_price_sync_once())
+    asyncio.run(main())
