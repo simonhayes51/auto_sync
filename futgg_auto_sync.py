@@ -19,7 +19,7 @@ logging.basicConfig(
 log = logging.getLogger("price_sync")
 
 # ------------------ DB CONNECTION ------------------ #
-asnc def get_db():
+async def get_db():
     try:
         return await asyncpg.connect(DATABASE_URL)
     except Exception as e:
