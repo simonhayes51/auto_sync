@@ -22,10 +22,10 @@ DATABASE_URL = os.getenv(“DATABASE_URL”, “postgresql://postgres:FiwuZKPRyU
 # Table and column names for your fut_players table
 
 TABLE_NAME = “fut_players”
-CARD_ID_COLUMN = “card_id”  # Modify this to match your actual column name
-PRICE_COLUMN = “price”      # Modify this to match your actual column name
+CARD_ID_COLUMN = “card_id”
+PRICE_COLUMN = “price”
 
-# ✅ Use proper browser headers to bypass detection
+# Use proper browser headers to bypass detection
 
 HEADERS = {
 “User-Agent”: “Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36”,
@@ -39,7 +39,7 @@ HEADERS = {
 # Setup logging with debug level to see more details
 
 logger = logging.getLogger(“fut-price-sync”)
-logger.setLevel(logging.DEBUG)  # Changed to DEBUG to see more details
+logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
 formatter = logging.Formatter(”[%(asctime)s] %(levelname)s: %(message)s”)
 handler.setFormatter(formatter)
