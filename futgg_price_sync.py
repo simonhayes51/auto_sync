@@ -1,14 +1,18 @@
 import aiohttp
 import asyncio
+import asyncpg
 import logging
-import random
-import csv
 import os
+import random
+import json
 
-API_URL = "https://www.fut.gg/api/fut/player-prices/25"
-MAX_RETRIES = 3
-SKIPPED_FILE = "skipped_players.csv"
+# Database URL
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+# FUT.GG API endpoint template
+API_URL = "https://www.fut.gg/api/fut/player-prices/25/{}"
+
+# User agents to avoid detection
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -24,80 +28,68 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-# Create skipped players CSV if not exists
-if not os.path.exists(SKIPPED_FILE):
-    with open(SKIPPED_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["card_id", "reason"])
-
 async def fetch_price(session, card_id):
-    """Fetch a player's price from FUT.GG using their card_id."""
-    # ✅ Strip prefix if card_id starts with "25-"
-    clean_id = str(card_id).replace("25-", "").strip()
-    url = f"{API_URL}/{clean_id}"
+    url = API_URL.format(card_id)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "application/json, text/plain, */*",
-                "Referer": f"https://www.fut.gg/players/{clean_id}/"
-            }
+    try:
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://www.fut.gg/players/{card_id}/",
+        }
 
-            async with session.get(url, headers=headers, timeout=15) as resp:
-                logger.info(f"🔹 Fetching {clean_id} → Attempt {attempt} → {url}")
+        async with session.get(url, headers=headers, timeout=15) as resp:
+            text = await resp.text()
 
-                # Handle rate limiting / blocking
-                if resp.status in [403, 429, 500, 502, 503]:
-                    logger.warning(f"⚠️ Blocked {clean_id} → Status {resp.status}")
-                    await asyncio.sleep(random.uniform(1, 3))
-                    continue
+            # If blocked, FUT.GG sends HTML, not JSON → detect this
+            if resp.status in [403, 429, 500]:
+                logger.warning(f"⚠️ Blocked or throttled for {card_id} ({resp.status})")
+                return None
 
-                # Not found on FUT.GG
-                if resp.status == 404:
-                    logger.info(f"⏭️ {clean_id} → Not found")
-                    log_skipped(clean_id, "Not found (404)")
-                    return None
+            # FUT.GG sometimes returns empty data for SBC/reward players
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning(f"⚠️ Invalid JSON for {card_id} → probably SBC/Reward")
+                return None
 
-                # Success
-                data = await resp.json()
-                price = data.get("data", {}).get("currentPrice", {}).get("price")
+            # Extract the price
+            price = data.get("data", {}).get("currentPrice", {}).get("price")
+            if price:
+                logger.info(f"✅ {card_id} → {price}")
+                return price
+            else:
+                logger.info(f"ℹ️ No price for {card_id} → SBC/Reward?")
+                return None
 
-                if price is not None:
-                    logger.info(f"✅ {clean_id} → {price}")
-                    return price
-                else:
-                    logger.warning(f"⚠️ {clean_id} → No price found in JSON")
-                    log_skipped(clean_id, "No price in JSON")
-                    return None
+    except Exception as e:
+        logger.error(f"❌ Error fetching {card_id}: {e}")
+        return None
 
-        except asyncio.TimeoutError:
-            logger.error(f"⏳ Timeout {clean_id} → Attempt {attempt}")
-            await asyncio.sleep(random.uniform(1, 3))
-        except Exception as e:
-            logger.error(f"❌ Error fetching {clean_id}: {e}")
-            await asyncio.sleep(random.uniform(1, 2))
+async def update_prices():
+    conn = await asyncpg.connect(DATABASE_URL)
+    players = await conn.fetch("SELECT id, card_id FROM fut_players")
+    logger.info(f"📦 Starting price sync for {len(players)} players...")
 
-    # If all retries fail, log skipped
-    logger.error(f"⏭️ Skipping {clean_id} → All retries failed")
-    log_skipped(clean_id, "All retries failed")
-    return None
-
-def log_skipped(card_id, reason):
-    """Save skipped players into CSV for debugging."""
-    with open(SKIPPED_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([card_id, reason])
-
-async def main():
-    """Main entry point for fetching prices."""
-    card_ids = []  # TODO: Replace with DB fetch later
-    # Example for testing:
-    card_ids = ["25-100664475", "100664475", "25-8219", "8219"]
+    updated = 0
+    skipped = 0
 
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_price(session, cid) for cid in card_ids]
-        await asyncio.gather(*tasks)
+        for player in players:
+            card_id = player["card_id"]
+            price = await fetch_price(session, card_id)
+
+            if price:
+                await conn.execute("UPDATE fut_players SET price = $1 WHERE id = $2", price, player["id"])
+                updated += 1
+            else:
+                skipped += 1
+
+            # Sleep slightly to avoid being blocked
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+
+    logger.info(f"🎯 Price sync complete → ✅ {updated} updated | ⏭️ {skipped} skipped")
+    await conn.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(update_prices())
