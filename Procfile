@@ -1,1 +1,1 @@
-worker: python futgg_auto_sync.py
+worker: python futgg_price_sync.py
