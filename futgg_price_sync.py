@@ -15,9 +15,14 @@ BATCH_SIZE = 10  # Process cards in batches to avoid overwhelming the API
 DELAY_BETWEEN_REQUESTS = 0.5  # Seconds between requests
 DELAY_BETWEEN_BATCHES = 2.0   # Seconds between batches
 
-# Railway PostgreSQL configuration
+# Railway PostgreSQL configuration - use Railway’s environment variable
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    logger = logging.getLogger("fut-price-sync")
+    logger.error("❌ DATABASE_URL environment variable not found!")
+    raise ValueError("DATABASE_URL is required")
 
 # Table and column names for your fut_players table
 
@@ -217,8 +222,8 @@ async def main():
 
     try:
         await db_manager.connect()
-        card_ids = await db_manager.get_card_ids()
         
+        card_ids = await db_manager.get_card_ids()
         if not card_ids:
             logger.warning("⚠️ No card IDs found in database")
             return
@@ -255,7 +260,6 @@ async def test_api_with_sample_cards():
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
-        
         sample_cards = await db_manager.get_card_ids(limit=5)
         logger.info(f"🧪 Testing API with {len(sample_cards)} sample cards: {sample_cards}")
         
@@ -277,7 +281,6 @@ async def test_database_connection():
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
-        
         async with db_manager.pool.acquire() as conn:
             result = await conn.fetch("""
                 SELECT column_name, data_type 
