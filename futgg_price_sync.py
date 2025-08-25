@@ -1,96 +1,65 @@
-import asyncio
 import aiohttp
-import asyncpg
-import os
+import asyncio
 import logging
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+import random
 
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
 API_URL = "https://www.fut.gg/api/fut/player-prices/25"
+MAX_RETRIES = 3
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger("price_sync")
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.248 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+]
 
-# Limit concurrent requests to avoid bans / 403s
-MAX_CONCURRENT_REQUESTS = 8
-SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+logger = logging.getLogger("fut-price-sync")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 async def fetch_price(session, card_id):
-    """Fetch player price from FUT.GG API."""
-    url = f"{API_URL}/{card_id}/"
-    async with SEM:
+    url = f"{API_URL}/{card_id}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(url, timeout=15) as resp:
-                if resp.status == 403:
-                    logger.warning(f"⚠️ Forbidden for {card_id} — blocked by FUT.GG")
-                    return None
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"https://www.fut.gg/players/{card_id}/",
+            }
+
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                # ✅ Handle rate limits or temporary blocks
+                if resp.status in [403, 429, 500, 502, 503]:
+                    logger.warning(f"⚠️ Attempt {attempt}/{MAX_RETRIES} → {card_id} blocked ({resp.status})")
+                    await asyncio.sleep(random.uniform(1, 3))  # Backoff
+                    continue
+
+                # ❌ Player doesn't exist on FUT.GG
                 if resp.status == 404:
-                    logger.info(f"ℹ️ No price for {card_id} — SBC/Reward likely")
-                    return None
-                if resp.status != 200:
-                    logger.error(f"❌ Failed API call for {card_id} → {resp.status}")
+                    logger.info(f"⏭️ {card_id} → Not found (404)")
                     return None
 
+                # ✅ Success
                 data = await resp.json()
                 price = data.get("data", {}).get("currentPrice", {}).get("price")
-                return price
+
+                if price is not None:
+                    logger.info(f"✅ {card_id} → {price}")
+                    return price
+                else:
+                    logger.warning(f"⚠️ {card_id} → No price found")
+                    return None
+
+        except asyncio.TimeoutError:
+            logger.error(f"⏳ Timeout fetching {card_id} (attempt {attempt})")
+            await asyncio.sleep(random.uniform(1, 3))
         except Exception as e:
-            logger.error(f"⚠️ Error fetching price for {card_id}: {e}")
-            return None
+            logger.error(f"❌ Error fetching {card_id}: {e}")
+            await asyncio.sleep(random.uniform(1, 2))
 
-async def update_price(conn, player_id, price):
-    """Update price in DB."""
-    try:
-        await conn.execute("""
-            UPDATE fut_players
-            SET price = $1, created_at = $2
-            WHERE card_id = $3
-        """, price, datetime.now(timezone.utc), player_id)
-    except Exception as e:
-        logger.error(f"⚠️ Failed DB update for {player_id}: {e}")
-
-async def sync_prices():
-    """Main price sync process."""
-    logger.info("⏳ Starting price sync...")
-
-    conn = await asyncpg.connect(DATABASE_URL)
-    async with aiohttp.ClientSession() as session:
-        # Get all player IDs from DB
-        players = await conn.fetch("SELECT card_id FROM fut_players")
-        total = len(players)
-        updated = 0
-        skipped = 0
-
-        for idx, player in enumerate(players, start=1):
-            card_id = player["card_id"]
-            price = await fetch_price(session, card_id)
-
-            if price:
-                await update_price(conn, card_id, price)
-                updated += 1
-            else:
-                skipped += 1
-
-            # Log progress every 100 players
-            if idx % 100 == 0 or idx == total:
-                logger.info(f"⏳ Processed {idx}/{total} players...")
-
-        logger.info(f"🎯 Price sync complete → ✅ {updated} updated | ⏭️ {skipped} skipped.")
-    await conn.close()
-
-async def main():
-    while True:
-        await sync_prices()
-        logger.info("⏲️ Waiting 5 minutes before next sync...")
-        await asyncio.sleep(300)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    logger.error(f"⏭️ Skipping {card_id} → All retries failed")
+    return None
