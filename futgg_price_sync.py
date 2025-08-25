@@ -7,16 +7,15 @@ import os
 import json
 from typing import Optional, List
 
-# Configuration
-
+# Configuration - Optimized for speed
 API_URL = "https://www.fut.gg/api/fut/player-prices/25"
 MAX_RETRIES = 3
-BATCH_SIZE = 10  # Process cards in batches to avoid overwhelming the API
-DELAY_BETWEEN_REQUESTS = 0.5  # Seconds between requests
-DELAY_BETWEEN_BATCHES = 2.0   # Seconds between batches
+BATCH_SIZE = 50  # Increased from 10 to 50
+DELAY_BETWEEN_REQUESTS = 0.1  # Reduced from 0.5s to 0.1s
+DELAY_BETWEEN_BATCHES = 0.5   # Reduced from 2.0s to 0.5s
+MAX_CONCURRENT_REQUESTS = 20  # New: concurrent requests per batch
 
 # Railway PostgreSQL configuration - use the exact Railway DATABASE_URL
-
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
 
 if not DATABASE_URL:
@@ -24,13 +23,11 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL is required")
 
 # Table and column names for your fut_players table
-
 TABLE_NAME = "fut_players"
 CARD_ID_COLUMN = "card_id"
 PRICE_COLUMN = "price"
 
 # Use proper browser headers to bypass detection
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -41,7 +38,6 @@ HEADERS = {
 }
 
 # Setup logging with debug level to see more details
-
 logger = logging.getLogger("fut-price-sync")
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
@@ -105,7 +101,8 @@ class DatabaseManager:
         try:
             async with self.pool.acquire() as conn:
                 query = f"UPDATE {TABLE_NAME} SET {PRICE_COLUMN} = $1 WHERE {CARD_ID_COLUMN} = $2"
-                result = await conn.execute(query, price, card_id)
+                # Convert card_id to string since database expects string
+                result = await conn.execute(query, price, str(card_id))
                 
                 # Check if any row was updated
                 rows_updated = int(result.split()[-1])
@@ -131,7 +128,8 @@ class DatabaseManager:
                     
                     updated_count = 0
                     for price, card_id in price_updates:
-                        result = await conn.execute(query, price, card_id)
+                        # Convert card_id to string since database expects string
+                        result = await conn.execute(query, price, str(card_id))
                         rows_updated = int(result.split()[-1])
                         if rows_updated > 0:
                             updated_count += 1
@@ -141,7 +139,6 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"❌ Batch update failed: {e}")
             return 0
-
 
 async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[int]:
     """Fetch price for a single card ID with enhanced debugging"""
@@ -209,26 +206,44 @@ async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[
     logger.error(f"⏭️ {card_id} → All retries failed")
     return None
 
-
-async def process_batch(session: aiohttp.ClientSession, db_manager: DatabaseManager,
-                        card_ids: List[int]) -> int:
-    """Process a batch of card IDs"""
+async def process_batch_concurrent(session: aiohttp.ClientSession, db_manager: DatabaseManager,
+                                   card_ids: List[int]) -> int:
+    """Process a batch of card IDs concurrently for speed"""
+    
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    
+    async def fetch_with_semaphore(card_id):
+        async with semaphore:
+            return await fetch_price(session, card_id)
+    
+    # Execute all requests concurrently
+    tasks = [fetch_with_semaphore(card_id) for card_id in card_ids]
+    prices = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Collect successful price updates
     price_updates = []
-
-    for card_id in card_ids:
-        price = await fetch_price(session, card_id)
-        if price is not None:
+    successful = 0
+    errors = 0
+    
+    for card_id, price in zip(card_ids, prices):
+        if isinstance(price, Exception):
+            logger.error(f"❌ {card_id} → Exception: {price}")
+            errors += 1
+        elif price is not None:
             price_updates.append((price, card_id))
-        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
-
+            successful += 1
+    
+    # Update all prices in database
     updated_count = await db_manager.update_prices_batch(price_updates)
+    
+    logger.info(f"🚀 Batch complete: {successful} fetched, {updated_count} updated, {errors} errors")
     return updated_count
-
 
 async def main():
     """Main function to orchestrate the price scraping and database updates"""
     db_manager = DatabaseManager()
-
+    
     try:
         # Connect to database
         await db_manager.connect()
@@ -242,9 +257,12 @@ async def main():
         
         logger.info(f"🚀 Starting to process {len(card_ids)} cards")
         
-        # Process cards in batches
+        # Process cards in batches with concurrent requests
         total_updated = 0
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=100, limit_per_host=50),
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
             for i in range(0, len(card_ids), BATCH_SIZE):
                 batch = card_ids[i:i + BATCH_SIZE]
                 batch_num = (i // BATCH_SIZE) + 1
@@ -252,10 +270,10 @@ async def main():
                 
                 logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} cards)")
                 
-                updated_count = await process_batch(session, db_manager, batch)
+                updated_count = await process_batch_concurrent(session, db_manager, batch)
                 total_updated += updated_count
                 
-                # Delay between batches to be respectful to the API
+                # Shorter delay between batches
                 if i + BATCH_SIZE < len(card_ids):
                     logger.info(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s before next batch...")
                     await asyncio.sleep(DELAY_BETWEEN_BATCHES)
@@ -268,13 +286,12 @@ async def main():
     finally:
         await db_manager.close()
 
-
 async def test_api_with_sample_cards():
     """Test API with a few cards from your database"""
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
-
+        
         # Get first 5 card IDs from your database
         sample_cards = await db_manager.get_card_ids(limit=5)
         logger.info(f"🧪 Testing API with {len(sample_cards)} sample cards: {sample_cards}")
@@ -291,13 +308,12 @@ async def test_api_with_sample_cards():
     finally:
         await db_manager.close()
 
-
 async def test_database_connection():
     """Test database connection and show table structure"""
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
-
+        
         async with db_manager.pool.acquire() as conn:
             # Check if table exists and show structure
             result = await conn.fetch("""
@@ -325,14 +341,35 @@ async def test_database_connection():
     finally:
         await db_manager.close()
 
+async def test_api_with_sample_cards():
+    """Test API with a few cards from your database"""
+    db_manager = DatabaseManager()
+    try:
+        await db_manager.connect()
+        
+        # Get first 5 card IDs from your database
+        sample_cards = await db_manager.get_card_ids(limit=5)
+        logger.info(f"🧪 Testing API with {len(sample_cards)} sample cards: {sample_cards}")
+        
+        async with aiohttp.ClientSession() as session:
+            for card_id in sample_cards:
+                logger.info(f"\n🔍 Testing card_id: {card_id}")
+                price = await fetch_price(session, card_id)
+                logger.info(f"Result: {price}")
+                await asyncio.sleep(1)  # Small delay between tests
+                
+    except Exception as e:
+        logger.error(f"❌ Test failed: {e}")
+    finally:
+        await db_manager.close()
 
 if __name__ == "__main__":
     try:
         # Add some startup logging
-        logger.info("🚀 FUT Price Sync starting…")
+        logger.info("🚀 FUT Price Sync starting...")
         logger.info(f"📊 DATABASE_URL configured: {'Yes' if DATABASE_URL else 'No'}")
         logger.info(f"🔗 Using connection: postgresql://postgres:***@shuttle.proxy.rlwy.net:19669/railway")
-
+        
         # Test database connection and table structure (optional)
         # asyncio.run(test_database_connection())
         
