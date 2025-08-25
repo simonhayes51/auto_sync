@@ -4,6 +4,7 @@ import asyncpg
 import logging
 import random
 import os
+import json
 from typing import Optional, List
 
 # Configuration
@@ -35,10 +36,10 @@ HEADERS = {
 “Connection”: “keep-alive”
 }
 
-# Setup logging
+# Setup logging with debug level to see more details
 
 logger = logging.getLogger(“fut-price-sync”)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Changed to DEBUG to see more details
 handler = logging.StreamHandler()
 formatter = logging.Formatter(”[%(asctime)s] %(levelname)s: %(message)s”)
 handler.setFormatter(formatter)
@@ -124,7 +125,7 @@ async def update_prices_batch(self, price_updates: List[tuple]) -> int:
 ```
 
 async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[int]:
-“”“Fetch price for a single card ID”””
+“”“Fetch price for a single card ID with enhanced debugging”””
 url = f”{API_URL}/{card_id}”
 
 ```
@@ -136,17 +137,35 @@ for attempt in range(1, MAX_RETRIES + 1):
             if resp.status == 200:
                 try:
                     data = await resp.json()
-                    price = data.get("data", {}).get("currentPrice", {}).get("price")
-
-                    if price is not None:
-                        logger.info(f"✅ {card_id} → {price}")
-                        return int(price)
-                    else:
-                        logger.warning(f"⚠️ {card_id} → No price in response")
-                        return None
+                    
+                    # Enhanced debugging - let's see what we actually get
+                    logger.debug(f"🔍 {card_id} → Full response: {json.dumps(data, indent=2)[:500]}")
+                    
+                    # Try multiple possible paths to find the price
+                    price_paths = [
+                        ("data.currentPrice.price", data.get("data", {}).get("currentPrice", {}).get("price")),
+                        ("data.price", data.get("data", {}).get("price")),
+                        ("price", data.get("price")),
+                        ("currentPrice.price", data.get("currentPrice", {}).get("price") if isinstance(data.get("currentPrice"), dict) else None),
+                        ("currentPrice", data.get("currentPrice")),
+                        ("data.marketPrice", data.get("data", {}).get("marketPrice")),
+                        ("marketPrice", data.get("marketPrice")),
+                    ]
+                    
+                    for path, value in price_paths:
+                        if value is not None:
+                            logger.info(f"✅ {card_id} → {value} (found at {path})")
+                            return int(value)
+                    
+                    # If no price found, log the structure for debugging
+                    logger.warning(f"⚠️ {card_id} → No price found. Response keys: {list(data.keys())}")
+                    if "data" in data:
+                        logger.warning(f"⚠️ {card_id} → Data keys: {list(data['data'].keys()) if isinstance(data['data'], dict) else type(data['data'])}")
+                    return None
 
                 except Exception as e:
                     logger.error(f"❌ {card_id} → JSON parse failed: {e}")
+                    logger.error(f"❌ {card_id} → Raw response: {text[:200]}")
                     return None
 
             elif resp.status in [403, 429]:
@@ -159,7 +178,7 @@ for attempt in range(1, MAX_RETRIES + 1):
                 return None
 
             else:
-                logger.error(f"❌ {card_id} → Unexpected status {resp.status}")
+                logger.error(f"❌ {card_id} → Unexpected status {resp.status}: {text[:100]}")
                 return None
 
     except asyncio.TimeoutError:
@@ -273,14 +292,44 @@ finally:
     await db_manager.close()
 ```
 
-if **name** == “**main**”:
+async def test_api_with_sample_cards():
+“”“Test API with a few cards from your database”””
+db_manager = DatabaseManager()
 try:
-# Uncomment the line below to test database connection first
-     asyncio.run(test_database_connection())
+await db_manager.connect()
 
 ```
-    # Run the main price scraping process
-    asyncio.run(main())
+    # Get first 5 card IDs from your database
+    sample_cards = await db_manager.get_card_ids(limit=5)
+    logger.info(f"🧪 Testing API with {len(sample_cards)} sample cards: {sample_cards}")
+    
+    async with aiohttp.ClientSession() as session:
+        for card_id in sample_cards:
+            logger.info(f"\n🔍 Testing card_id: {card_id}")
+            price = await fetch_price(session, card_id)
+            logger.info(f"Result: {price}")
+            await asyncio.sleep(1)  # Small delay between tests
+            
+except Exception as e:
+    logger.error(f"❌ Test failed: {e}")
+finally:
+    await db_manager.close()
+```
+
+if **name** == “**main**”:
+try:
+# Uncomment ONE of these lines to run different tests:
+
+```
+    # Test database connection and table structure
+    # asyncio.run(test_database_connection())
+    
+    # Test API with sample cards from your database  
+    asyncio.run(test_api_with_sample_cards())
+    
+    # Run the full price scraping process
+    # asyncio.run(main())
+    
 except KeyboardInterrupt:
     logger.info("🛑 Process interrupted by user")
 except Exception as e:
