@@ -7,13 +7,13 @@ import os
 import json
 from typing import Optional, List
 
-# Configuration - Optimized for speed
+# Configuration - Optimized for speed but stable
 API_URL = "https://www.fut.gg/api/fut/player-prices/25"
 MAX_RETRIES = 3
-BATCH_SIZE = 50  # Increased from 10 to 50
+BATCH_SIZE = 30  # Reduced slightly for stability
 DELAY_BETWEEN_REQUESTS = 0.1  # Reduced from 0.5s to 0.1s
 DELAY_BETWEEN_BATCHES = 0.5   # Reduced from 2.0s to 0.5s
-MAX_CONCURRENT_REQUESTS = 20  # New: concurrent requests per batch
+MAX_CONCURRENT_REQUESTS = 15  # Reduced from 20 to 15 for stability
 
 # Railway PostgreSQL configuration - use the exact Railway DATABASE_URL
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
@@ -257,7 +257,8 @@ async def main():
         
         logger.info(f"🚀 Starting to process {len(card_ids)} cards")
         
-        # Process cards in batches with concurrent requests
+        # Show progress more frequently
+        processed_cards = 0
         total_updated = 0
         async with aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=100, limit_per_host=50),
@@ -272,6 +273,11 @@ async def main():
                 
                 updated_count = await process_batch_concurrent(session, db_manager, batch)
                 total_updated += updated_count
+                processed_cards += len(batch)
+                
+                # Show progress every few batches
+                progress = (processed_cards / len(card_ids)) * 100
+                logger.info(f"📈 Progress: {processed_cards}/{len(card_ids)} cards ({progress:.1f}%) - {total_updated} prices updated")
                 
                 # Shorter delay between batches
                 if i + BATCH_SIZE < len(card_ids):
