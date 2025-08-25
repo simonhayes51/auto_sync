@@ -15,12 +15,11 @@ BATCH_SIZE = 10  # Process cards in batches to avoid overwhelming the API
 DELAY_BETWEEN_REQUESTS = 0.5  # Seconds between requests
 DELAY_BETWEEN_BATCHES = 2.0   # Seconds between batches
 
-# Railway PostgreSQL configuration - use Railway’s environment variable
+# Railway PostgreSQL configuration - use the exact Railway DATABASE_URL
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
 
 if not DATABASE_URL:
-    logger = logging.getLogger("fut-price-sync")
     logger.error("❌ DATABASE_URL environment variable not found!")
     raise ValueError("DATABASE_URL is required")
 
@@ -50,7 +49,6 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-
 class DatabaseManager:
     def __init__(self):
         self.pool = None
@@ -58,10 +56,17 @@ class DatabaseManager:
     async def connect(self):
         """Create database connection pool"""
         try:
-            self.pool = await asyncpg.create_pool(DATABASE_URL)
+            logger.info(f"🔌 Connecting to database...")
+            self.pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                command_timeout=60
+            )
             logger.info("✅ Connected to Railway PostgreSQL database")
         except Exception as e:
             logger.error(f"❌ Database connection failed: {e}")
+            logger.error(f"❌ Using URL: {DATABASE_URL[:50]}...")
             raise
 
     async def close(self):
@@ -102,6 +107,7 @@ class DatabaseManager:
                 query = f"UPDATE {TABLE_NAME} SET {PRICE_COLUMN} = $1 WHERE {CARD_ID_COLUMN} = $2"
                 result = await conn.execute(query, price, card_id)
                 
+                # Check if any row was updated
                 rows_updated = int(result.split()[-1])
                 if rows_updated > 0:
                     logger.info(f"💾 Updated {card_id} with price {price}")
@@ -150,8 +156,10 @@ async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[
                     try:
                         data = await resp.json()
                         
+                        # Enhanced debugging - let's see what we actually get
                         logger.debug(f"🔍 {card_id} → Full response: {json.dumps(data, indent=2)[:500]}")
                         
+                        # Try multiple possible paths to find the price
                         price_paths = [
                             ("data.currentPrice.price", data.get("data", {}).get("currentPrice", {}).get("price")),
                             ("data.price", data.get("data", {}).get("price")),
@@ -167,6 +175,7 @@ async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[
                                 logger.info(f"✅ {card_id} → {value} (found at {path})")
                                 return int(value)
                         
+                        # If no price found, log the structure for debugging
                         logger.warning(f"⚠️ {card_id} → No price found. Response keys: {list(data.keys())}")
                         if "data" in data:
                             logger.warning(f"⚠️ {card_id} → Data keys: {list(data['data'].keys()) if isinstance(data['data'], dict) else type(data['data'])}")
@@ -221,15 +230,19 @@ async def main():
     db_manager = DatabaseManager()
 
     try:
+        # Connect to database
         await db_manager.connect()
         
+        # Get all card IDs from database
         card_ids = await db_manager.get_card_ids()
+        
         if not card_ids:
             logger.warning("⚠️ No card IDs found in database")
             return
         
         logger.info(f"🚀 Starting to process {len(card_ids)} cards")
         
+        # Process cards in batches
         total_updated = 0
         async with aiohttp.ClientSession() as session:
             for i in range(0, len(card_ids), BATCH_SIZE):
@@ -242,6 +255,7 @@ async def main():
                 updated_count = await process_batch(session, db_manager, batch)
                 total_updated += updated_count
                 
+                # Delay between batches to be respectful to the API
                 if i + BATCH_SIZE < len(card_ids):
                     logger.info(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s before next batch...")
                     await asyncio.sleep(DELAY_BETWEEN_BATCHES)
@@ -260,6 +274,8 @@ async def test_api_with_sample_cards():
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
+
+        # Get first 5 card IDs from your database
         sample_cards = await db_manager.get_card_ids(limit=5)
         logger.info(f"🧪 Testing API with {len(sample_cards)} sample cards: {sample_cards}")
         
@@ -268,7 +284,7 @@ async def test_api_with_sample_cards():
                 logger.info(f"\n🔍 Testing card_id: {card_id}")
                 price = await fetch_price(session, card_id)
                 logger.info(f"Result: {price}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1)  # Small delay between tests
                 
     except Exception as e:
         logger.error(f"❌ Test failed: {e}")
@@ -281,7 +297,9 @@ async def test_database_connection():
     db_manager = DatabaseManager()
     try:
         await db_manager.connect()
+
         async with db_manager.pool.acquire() as conn:
+            # Check if table exists and show structure
             result = await conn.fetch("""
                 SELECT column_name, data_type 
                 FROM information_schema.columns 
@@ -294,6 +312,7 @@ async def test_database_connection():
                 for row in result:
                     logger.info(f"  - {row['column_name']} ({row['data_type']})")
                 
+                # Show sample data
                 sample = await conn.fetch(f"SELECT * FROM {TABLE_NAME} LIMIT 3")
                 logger.info(f"📊 Sample data from {TABLE_NAME}:")
                 for row in sample:
@@ -309,13 +328,22 @@ async def test_database_connection():
 
 if __name__ == "__main__":
     try:
-        # Uncomment ONE of these lines to run different tests:
+        # Add some startup logging
+        logger.info("🚀 FUT Price Sync starting…")
+        logger.info(f"📊 DATABASE_URL configured: {'Yes' if DATABASE_URL else 'No'}")
+        logger.info(f"🔗 Using connection: postgresql://postgres:***@shuttle.proxy.rlwy.net:19669/railway")
 
+        # Test database connection and table structure (optional)
         # asyncio.run(test_database_connection())
+        
+        # Test API with sample cards from your database (optional)  
         # asyncio.run(test_api_with_sample_cards())
+        
+        # Run the full price scraping process
         asyncio.run(main())
         
     except KeyboardInterrupt:
         logger.info("🛑 Process interrupted by user")
     except Exception as e:
         logger.error(f"💥 Fatal error: {e}")
+        raise  # Re-raise to show full traceback
