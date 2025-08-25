@@ -1,22 +1,21 @@
 import aiohttp
 import asyncio
-import asyncpg
 import logging
-import os
 import random
-import re
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-API_URL = "https://www.fut.gg/api/fut/player-prices/25/{}"
+API_URL = "https://www.fut.gg/api/fut/player-prices/25"
+MAX_RETRIES = 3
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.248 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-]
+# ✅ Use proper browser headers to bypass detection
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.fut.gg/",
+    "Origin": "https://www.fut.gg",
+    "Connection": "keep-alive"
+}
 
-# Logging setup
 logger = logging.getLogger("fut-price-sync")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -24,65 +23,59 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-price_regex = re.compile(r'"price":(\d+)')
-
 async def fetch_price(session, card_id):
-    """Fetch player price by scraping raw API response"""
-    url = API_URL.format(card_id)
+    url = f"{API_URL}/{card_id}"
 
-    try:
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "application/json, text/plain, */*"
-        }
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.get(url, headers=HEADERS, timeout=15) as resp:
+                text = await resp.text()
 
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                logger.warning(f"⚠️ {card_id} → HTTP {resp.status}")
-                return None
+                if resp.status == 200:
+                    try:
+                        data = await resp.json()
+                        price = data.get("data", {}).get("currentPrice", {}).get("price")
 
-            text = await resp.text()
-            match = price_regex.search(text)
-            if match:
-                price = int(match.group(1))
-                logger.info(f"✅ {card_id} → {price}")
-                return price
-            else:
-                logger.info(f"ℹ️ {card_id} → No price found (SBC/Reward)")
-                return None
+                        if price is not None:
+                            logger.info(f"✅ {card_id} → {price}")
+                            return price
+                        else:
+                            logger.warning(f"⚠️ {card_id} → No price in response: {text[:80]}")
+                            return None
 
-    except Exception as e:
-        logger.error(f"❌ Error fetching {card_id}: {e}")
-        return None
+                    except Exception as e:
+                        logger.error(f"❌ {card_id} → JSON parse failed: {e} | Response: {text[:80]}")
+                        return None
 
-async def update_prices():
-    """Sync prices for all players in DB"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    players = await conn.fetch("SELECT id, card_id FROM fut_players")
-    logger.info(f"📦 Starting price sync for {len(players)} players...")
+                elif resp.status in [403, 429]:
+                    logger.warning(f"🚫 {card_id} blocked ({resp.status}), retrying...")
+                    await asyncio.sleep(random.uniform(1.5, 3))
+                    continue
 
-    updated = 0
-    skipped = 0
+                elif resp.status == 404:
+                    logger.info(f"⏭️ {card_id} → Not found (404)")
+                    return None
 
+                else:
+                    logger.error(f"❌ {card_id} → Unexpected status {resp.status}: {text[:80]}")
+                    return None
+
+        except asyncio.TimeoutError:
+            logger.error(f"⏳ Timeout fetching {card_id} (attempt {attempt})")
+            await asyncio.sleep(random.uniform(1, 3))
+        except Exception as e:
+            logger.error(f"❌ {card_id} → Request failed: {e}")
+            await asyncio.sleep(random.uniform(1, 2))
+
+    logger.error(f"⏭️ {card_id} → All retries failed")
+    return None
+
+async def main():
+    test_ids = [100664475, 50509123, 246236, 213648, 207435]  # Change to real IDs from DB
     async with aiohttp.ClientSession() as session:
-        for player in players:
-            card_id = player["card_id"]
-            price = await fetch_price(session, card_id)
-
-            if price is not None:
-                await conn.execute(
-                    "UPDATE fut_players SET price = $1 WHERE id = $2",
-                    price, player["id"]
-                )
-                updated += 1
-            else:
-                skipped += 1
-
-            # Random delay to avoid detection
-            await asyncio.sleep(random.uniform(0.15, 0.3))
-
-    logger.info(f"🎯 Price sync complete → ✅ {updated} updated | ⏭️ {skipped} skipped")
-    await conn.close()
+        for cid in test_ids:
+            price = await fetch_price(session, cid)
+            await asyncio.sleep(0.5)  # 🔹 Small delay to prevent getting blocked
 
 if __name__ == "__main__":
-    asyncio.run(update_prices())
+    asyncio.run(main())
