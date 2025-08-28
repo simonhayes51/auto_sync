@@ -11,6 +11,7 @@ from datetime import datetime
 from html import unescape
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List, Set, Tuple
+from aiohttp import web  # health server
 
 # ------------------ CONFIG ------------------ #
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -28,7 +29,7 @@ NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))
 REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.8)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.9)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -96,7 +97,7 @@ def normalize_name(obj, *keys) -> Optional[str]:
         s = obj.strip()
         return s or None
     if isinstance(obj, dict):
-        for k in keys or ("name", "shortName", "LongName", "fullName"):
+        for k in keys or ("name", "shortName", "longName", "fullName"):
             v = obj.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
@@ -108,7 +109,7 @@ def pick_first(d: dict, keys: List[str]):
             return d[k]
     return None
 
-# Numeric ID extraction: works for "25-231443", "231443", or any string ending with digits
+# Numeric ID extraction: "25-231443", "231443", or any string ending with digits
 _RE_NUMERIC_ID_TAIL = re.compile(r'(^|-)(\d+)$')
 _RE_ANY_DIGITS_AT_END = re.compile(r'(\d+)$')
 def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
@@ -123,7 +124,6 @@ def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
 def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[str]]:
     """
     Returns: (price, is_objective, is_untradeable, is_extinct, price_updated_at_text)
-    price_updated_at_text is ISO text or None to be cast in SQL (::timestamptz).
     """
     price = None
     is_objective = None
@@ -153,7 +153,6 @@ def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool
         if cp.get("price") is not None:
             price = int(cp["price"])
         if cp.get("priceUpdatedAt"):
-            # keep as text; let SQL cast to timestamptz
             updated_at_text = str(cp["priceUpdatedAt"])
     except Exception:
         pass
@@ -312,7 +311,6 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         skipped_missing = 0
 
         for cid in card_ids:
-            # Ensure the row still exists and has an id
             if cid not in id_by_card:
                 skipped_missing += 1
                 continue
@@ -358,7 +356,6 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             return
 
         try:
-            # created_at set in SQL to avoid tz adapter issues
             await conn.executemany(
                 """
                 UPDATE public.fut_players
@@ -389,10 +386,6 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
     log.info("✅ Enriched %d player(s). Skipped %d malformed card_id, %d missing rows.", len(batch), skipped_bad, skipped_missing)
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
-    """
-    Loop in 1000-row chunks until no more rows are missing any essential fields.
-    Skips rows whose card_id doesn't end with digits.
-    """
     total = 0
     while True:
         try:
@@ -480,6 +473,20 @@ async def run_once() -> None:
         except Exception:
             pass
 
+# ------------------ Health server (for Web deployments) ------------------ #
+async def start_health_server() -> asyncio.Task:
+    async def handle(_):
+        return web.Response(text="OK")
+    app = web.Application()
+    app.add_routes([web.get("/", handle), web.get("/health", handle)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("🌐 Health server listening on :%d", port)
+    return asyncio.create_task(asyncio.Event().wait())  # keep alive
+
 # ------------------ Main loop: run now, then daily @ 19:00 UK ------------------ #
 shutdown = asyncio.Event()
 
@@ -492,7 +499,7 @@ async def sleep_until_19_uk() -> None:
     now = datetime.now(tz)
     target = now.replace(hour=19, minute=0, second=0, microsecond=0)
     if now >= target:
-        target += timedelta(days=1)
+        target +=  timedelta(days=1)
     sleep_s = (target - now).total_seconds()
     log.info("🕖 Next new-player check scheduled for %s", target.isoformat())
     await asyncio.sleep(sleep_s)
@@ -506,6 +513,11 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
+    # Start health server if running as Web (PORT set)
+    health_task = None
+    if os.getenv("PORT"):
+        health_task = await start_health_server()
+
     while not shutdown.is_set():
         try:
             log.info("🚦 Cycle start")
@@ -514,6 +526,9 @@ async def main() -> None:
         except Exception as e:
             log.error("❌ Unhandled error in cycle: %s", e)
         await sleep_until_19_uk()
+
+    if health_task:
+        health_task.cancel()
 
 if __name__ == "__main__":
     try:
