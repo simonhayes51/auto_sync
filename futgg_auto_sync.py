@@ -6,6 +6,7 @@ import asyncio
 import asyncpg
 import aiohttp
 import logging
+import signal
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from zoneinfo import ZoneInfo
@@ -27,7 +28,7 @@ NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))         # pages per URL
 REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))  # seconds
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.5)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.6)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -58,7 +59,7 @@ logging.basicConfig(
 )
 for h in logging.getLogger().handlers:
     h.addFilter(RateLimitFilter())
-log = logging.getLogger("new_players_sync")
+log = logging.getLogger("futgg_auto_sync")
 print(f"▶️ Starting: {os.path.basename(__file__)} | LOG_LEVEL={LOG_LEVEL}", flush=True)
 
 # ------------------ DB ------------------ #
@@ -146,35 +147,23 @@ def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool
     return price, is_objective, is_untradeable, is_extinct, updated_at
 
 def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
-    """
-    Return: name, rating(int->str), version, image_url, player_slug, position, club, nation, league
-    Works defensively across possible shapes.
-    """
     if not isinstance(data, dict):
         return {k: None for k in ("name","rating","version","image_url","player_slug","position","club","nation","league")}
 
-    # Name
     name = (data.get("name")
             or normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
 
-    # Rating
     rating_val = pick_first(data, ["rating", "overall", "overallRating", "ovr"])
     try:
         rating = int(rating_val) if rating_val is not None else None
     except Exception:
         rating = None
 
-    # Version / card type
     version = pick_first(data, ["version", "cardType", "rarity", "program", "itemType"])
-
-    # Image URL
     image_url = (pick_first(data, ["imageUrl", "imageURL", "imgUrl", "imgURL"])
                  or (isinstance(data.get("image"), dict) and pick_first(data["image"], ["url", "href"])))
-
-    # Slug
     player_slug = pick_first(data, ["slug", "seoName", "urlName", "pathSegment"])
 
-    # Position / club / nation / league
     position = data.get("position") or data.get("bestPosition") or data.get("primaryPosition")
     if isinstance(position, dict):
         position = normalize_name(position, "code", "name")
@@ -191,7 +180,6 @@ def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
     elif not position:
         position = meta.get("position")
 
-    # Cast rating to str? Your table defined rating INT — we’ll keep INT in DB.
     return {
         "name": (name or "").strip() or None,
         "rating": rating,
@@ -308,11 +296,15 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         ]] = []
         for cid in card_ids:
             numeric_id = cid.split("-")[1]
-            (price, is_obj, is_untrad, is_ext, price_ts), meta = await asyncio.gather(
-                fetch_price(session, numeric_id),
-                fetch_meta(session, numeric_id)
-            )
-            # If we obtained a slug, we can refine player_url
+            try:
+                (price, is_obj, is_untrad, is_ext, price_ts), meta = await asyncio.gather(
+                    fetch_price(session, numeric_id),
+                    fetch_meta(session, numeric_id)
+                )
+            except Exception as e:
+                log.error("❌ fetch failed for %s: %s", cid, e)
+                continue
+
             player_slug = meta.get("player_slug")
             pretty_url = f"https://www.fut.gg/players/{numeric_id}/" + (f"{player_slug}/" if player_slug else "")
 
@@ -332,57 +324,71 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 is_untrad,
                 is_ext,
                 price_ts,
-                datetime.now(timezone.utc),  # created_at (per your preference)
+                datetime.now(timezone.utc),
                 id_by_card[cid]
             ))
 
-        await conn.executemany(
-            """
-            UPDATE public.fut_players
-            SET price            = COALESCE($1,  price),
-                position         = COALESCE($2,  position),
-                club             = COALESCE($3,  club),
-                nation           = COALESCE($4,  nation),
-                league           = COALESCE($5,  league),
-                name             = COALESCE($6,  name),
-                rating           = COALESCE($7,  rating),
-                version          = COALESCE($8,  version),
-                image_url        = COALESCE($9,  image_url),
-                player_slug      = COALESCE($10, player_slug),
-                player_url       = COALESCE($11, player_url),
-                is_objective     = COALESCE($12, is_objective),
-                is_untradeable   = COALESCE($13, is_untradeable),
-                is_extinct       = COALESCE($14, is_extinct),
-                price_updated_at = COALESCE($15, price_updated_at),
-                created_at       = $16
-            WHERE id = $17
-            """,
-            batch
-        )
+        if not batch:
+            log.info("ℹ️ Nothing to enrich for given batch.")
+            return
+
+        try:
+            await conn.executemany(
+                """
+                UPDATE public.fut_players
+                SET price            = COALESCE($1,  price),
+                    position         = COALESCE($2,  position),
+                    club             = COALESCE($3,  club),
+                    nation           = COALESCE($4,  nation),
+                    league           = COALESCE($5,  league),
+                    name             = COALESCE($6,  name),
+                    rating           = COALESCE($7,  rating),
+                    version          = COALESCE($8,  version),
+                    image_url        = COALESCE($9,  image_url),
+                    player_slug      = COALESCE($10, player_slug),
+                    player_url       = COALESCE($11, player_url),
+                    is_objective     = COALESCE($12, is_objective),
+                    is_untradeable   = COALESCE($13, is_untradeable),
+                    is_extinct       = COALESCE($14, is_extinct),
+                    price_updated_at = COALESCE($15, price_updated_at),
+                    created_at       = $16
+                WHERE id = $17
+                """,
+                batch
+            )
+        except Exception as e:
+            log.error("❌ DB update failed for batch of %d: %s", len(batch), e)
+            return
+
     log.info("✅ Enriched %d player(s).", len(card_ids))
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
     total = 0
     while True:
-        rows = await conn.fetch(
-            """
-            SELECT id, card_id
-            FROM public.fut_players
-            WHERE card_id IS NOT NULL
-              AND (
-                name IS NULL OR name = '' OR
-                position IS NULL OR position = '' OR
-                club IS NULL OR club = '' OR
-                nation IS NULL OR nation = '' OR
-                league IS NULL OR league = '' OR
-                rating IS NULL OR
-                version IS NULL OR version = '' OR
-                image_url IS NULL OR image_url = '' OR
-                player_slug IS NULL OR player_slug = ''
-              )
-            LIMIT 1000
-            """
-        )
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT id, card_id
+                FROM public.fut_players
+                WHERE card_id IS NOT NULL
+                  AND (
+                    name IS NULL OR name = '' OR
+                    position IS NULL OR position = '' OR
+                    club IS NULL OR club = '' OR
+                    nation IS NULL OR nation = '' OR
+                    league IS NULL OR league = '' OR
+                    rating IS NULL OR
+                    version IS NULL OR version = '' OR
+                    image_url IS NULL OR image_url = '' OR
+                    player_slug IS NULL OR player_slug = ''
+                  )
+                LIMIT 1000
+                """
+            )
+        except Exception as e:
+            log.error("❌ Backfill query failed: %s", e)
+            return
+
         if not rows:
             if total == 0:
                 log.info("ℹ️ No rows need meta backfill.")
@@ -393,7 +399,12 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
         card_ids = [r["card_id"] for r in rows]
         total += len(card_ids)
         log.info("🧩 Backfilling meta for %d players (running total %d)…", len(card_ids), total)
-        await enrich_by_card_ids(conn, card_ids)
+        try:
+            await enrich_by_card_ids(conn, card_ids)
+        except Exception as e:
+            log.error("❌ Enrich step failed during backfill: %s", e)
+            # continue loop; try next chunk
+            await asyncio.sleep(1)
 
 # ------------------ One-cycle task ------------------ #
 async def run_once() -> None:
@@ -401,53 +412,84 @@ async def run_once() -> None:
     try:
         await preflight_check(conn)
 
-        async with aiohttp.ClientSession() as session:
-            new_ids = await discover_new_player_ids(session, pages=NEW_PAGES)
+        # 1) Discover
+        new_ids: Set[int] = set()
+        try:
+            async with aiohttp.ClientSession() as session:
+                new_ids = await discover_new_player_ids(session, pages=NEW_PAGES)
+        except Exception as e:
+            log.error("❌ Discovery failed: %s", e)
 
-        added_card_ids = await upsert_new_players(conn, new_ids)
-        if added_card_ids:
-            log.info("🆕 Inserted %d new players.", len(added_card_ids))
-            await enrich_by_card_ids(conn, added_card_ids)
-        else:
-            log.info("ℹ️ No new players found from discovery.")
+        # 2) Upsert
+        added_card_ids: List[str] = []
+        try:
+            added_card_ids = await upsert_new_players(conn, new_ids)
+            if added_card_ids:
+                log.info("🆕 Inserted %d new players.", len(added_card_ids))
+            else:
+                log.info("ℹ️ No new players found from discovery.")
+        except Exception as e:
+            log.error("❌ Upsert failed: %s", e)
 
-        await backfill_missing_meta(conn)
+        # 3) Enrich just-added
+        try:
+            if added_card_ids:
+                await enrich_by_card_ids(conn, added_card_ids)
+        except Exception as e:
+            log.error("❌ Enrich (new) failed: %s", e)
+
+        # 4) Backfill all missing meta
+        try:
+            await backfill_missing_meta(conn)
+        except Exception as e:
+            log.error("❌ Backfill loop failed: %s", e)
 
     finally:
-        await conn.close()
-
-# ------------------ Daily scheduler @ 19:00 UK ------------------ #
-async def scheduler_19_uk() -> None:
-    tz = ZoneInfo("Europe/London")
-    while True:
-        now = datetime.now(tz)
-        target = now.replace(hour=19, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        sleep_s = (target - now).total_seconds()
-        log.info("🕖 Next new-player check scheduled for %s", target.isoformat())
-        await asyncio.sleep(sleep_s)
-        for attempt in range(3):
-            try:
-                log.info("⏰ 19:00 UK tick — running discovery/backfill")
-                await run_once()
-                break
-            except Exception as e:
-                wait = 5 * (attempt + 1)
-                log.error("❌ Run failed (attempt %d/3): %s. Retrying in %ds", attempt+1, e, wait)
-                await asyncio.sleep(wait)
-
-# ------------------ Entrypoint ------------------ #
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--now", action="store_true", help="Run once immediately and exit")
-    args = ap.parse_args()
-
-    if args.now:
-        asyncio.run(run_once())
-    else:
         try:
-            asyncio.run(run_once())
-        finally:
-            asyncio.run(scheduler_19_uk())
+            await conn.close()
+        except Exception:
+            pass
+
+# ------------------ Main loop: run now, then daily @ 19:00 UK ------------------ #
+shutdown = asyncio.Event()
+
+def _signal_handler():
+    log.info("🛑 Received shutdown signal. Finishing current cycle…")
+    shutdown.set()
+
+async def sleep_until_19_uk() -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime.now(tz)
+    target = now.replace(hour=19, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    sleep_s = (target - now).total_seconds()
+    log.info("🕖 Next new-player check scheduled for %s", target.isoformat())
+    await asyncio.sleep(sleep_s)
+
+async def main() -> None:
+    # handle SIGTERM/SIGINT
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            pass  # e.g., on Windows
+
+    while not shutdown.is_set():
+        try:
+            log.info("🚦 Cycle start")
+            await run_once()
+            log.info("✅ Cycle complete")
+        except Exception as e:
+            log.error("❌ Unhandled error in cycle: %s", e)
+        # sleep until 19:00 UK (unless shutdown requested)
+        await sleep_until_19_uk()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        # last chance log (so Railway doesn't stop without context)
+        print(f"FATAL: {e}", file=sys.stderr, flush=True)
+        raise
