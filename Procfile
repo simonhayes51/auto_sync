@@ -1,1 +1,1 @@
-worker: python futgg_price_sync.py
+worker: python new_players_sync.py
