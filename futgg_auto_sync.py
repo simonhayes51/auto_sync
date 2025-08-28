@@ -193,6 +193,12 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
     if isinstance(data, dict) and "data" in data:
         log.info(f"Unwrapping 'data' key for card {card_id}")
         data = data["data"]
+    
+    # Double-check the unwrapping worked correctly
+    if isinstance(data, dict) and "position" in data:
+        log.info(f"Position field found in unwrapped data for {card_id}: {data.get('position')}")
+    elif isinstance(data, dict):
+        log.warning(f"Position field NOT found after unwrapping for {card_id}. Keys: {list(data.keys())[:10]}")
 
     if not isinstance(data, dict):
         log.warning(f"Final data is not a dict for card {card_id}: {type(data)}")
@@ -201,6 +207,12 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
     # Log available keys for debugging
     available_keys = list(data.keys())
     log.info(f"Available keys for card {card_id}: {available_keys[:10]}")
+    
+    # If no position found, log a sample of the data structure
+    if "position" not in available_keys:
+        # Log first few key-value pairs to understand structure
+        sample_data = {k: v for k, v in list(data.items())[:5]}
+        log.info(f"Sample data structure for {card_id}: {sample_data}")
 
     first = data.get("firstName")
     last  = data.get("lastName")
