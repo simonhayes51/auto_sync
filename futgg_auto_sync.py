@@ -28,7 +28,7 @@ NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))         # pages per URL
 REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))  # seconds
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.6)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.7)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -107,6 +107,18 @@ def pick_first(d: dict, keys: List[str]):
         if k in d and d[k] not in (None, "", []):
             return d[k]
     return None
+
+# Robust numeric-id extractor: works for "25-231443", "231443", or any string ending with digits
+_RE_NUMERIC_ID_TAIL = re.compile(r'(^|-)(' r'\d+' r')$')  # captures digits at end optionally after a dash
+_RE_ANY_DIGITS_AT_END = re.compile(r'(\d+)$')
+def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
+    if not card_id:
+        return None
+    m = _RE_NUMERIC_ID_TAIL.search(card_id)
+    if m:
+        return m.group(2)
+    m2 = _RE_ANY_DIGITS_AT_END.search(card_id)
+    return m2.group(1) if m2 else None
 
 def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[datetime]]:
     price = None
@@ -265,7 +277,7 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: Set[int]) ->
     if not to_insert:
         return []
 
-    rows: List[Tuple[str, str]] = [(cid, f"https://www.fut.gg/players/{cid.split('-')[1]}/") for cid in to_insert]
+    rows: List[Tuple[str, str]] = [(cid, f"https://www.fut.gg/players/{extract_numeric_id(cid)}/") for cid in to_insert]
     await conn.executemany(
         """
         INSERT INTO public.fut_players (card_id, player_url)
@@ -294,8 +306,13 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[datetime],
             datetime, int
         ]] = []
+        skipped_bad = 0
+
         for cid in card_ids:
-            numeric_id = cid.split("-")[1]
+            numeric_id = extract_numeric_id(cid)
+            if not numeric_id:
+                skipped_bad += 1
+                continue
             try:
                 (price, is_obj, is_untrad, is_ext, price_ts), meta = await asyncio.gather(
                     fetch_price(session, numeric_id),
@@ -329,7 +346,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             ))
 
         if not batch:
-            log.info("ℹ️ Nothing to enrich for given batch.")
+            log.info("ℹ️ Nothing to enrich for given batch. (Skipped %d malformed card_id row(s))", skipped_bad)
             return
 
         try:
@@ -360,9 +377,13 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             log.error("❌ DB update failed for batch of %d: %s", len(batch), e)
             return
 
-    log.info("✅ Enriched %d player(s).", len(card_ids))
+    log.info("✅ Enriched %d player(s). Skipped %d malformed card_id row(s).", len(batch), skipped_bad)
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
+    """
+    Loop in 1000-row chunks until no more rows are missing any essential fields.
+    Skips rows whose card_id doesn't end with digits.
+    """
     total = 0
     while True:
         try:
@@ -371,6 +392,7 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
                 SELECT id, card_id
                 FROM public.fut_players
                 WHERE card_id IS NOT NULL
+                  AND card_id ~ '(^|-)\\d+$'   -- must end with digits, optionally after a dash
                   AND (
                     name IS NULL OR name = '' OR
                     position IS NULL OR position = '' OR
@@ -403,8 +425,7 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
             await enrich_by_card_ids(conn, card_ids)
         except Exception as e:
             log.error("❌ Enrich step failed during backfill: %s", e)
-            # continue loop; try next chunk
-            await asyncio.sleep(1)
+            await asyncio.sleep(1)  # continue loop; try next chunk
 
 # ------------------ One-cycle task ------------------ #
 async def run_once() -> None:
@@ -474,7 +495,7 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            pass  # e.g., on Windows
+            pass  # Windows etc.
 
     while not shutdown.is_set():
         try:
@@ -483,13 +504,11 @@ async def main() -> None:
             log.info("✅ Cycle complete")
         except Exception as e:
             log.error("❌ Unhandled error in cycle: %s", e)
-        # sleep until 19:00 UK (unless shutdown requested)
         await sleep_until_19_uk()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        # last chance log (so Railway doesn't stop without context)
         print(f"FATAL: {e}", file=sys.stderr, flush=True)
         raise
