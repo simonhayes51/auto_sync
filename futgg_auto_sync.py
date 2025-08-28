@@ -169,9 +169,12 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
         async with session.get(META_API.format(card_id), timeout=REQUEST_TIMEOUT,
                                headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
+                log.warning(f"API returned status {resp.status} for card {card_id}")
                 return {}
             raw = await resp.json()
-    except Exception:
+            log.info(f"Got API response for card {card_id}: {type(raw)} with {len(str(raw))} chars")
+    except Exception as e:
+        log.error(f"API request failed for card {card_id}: {e}")
         return {}
 
     # choose best item
@@ -187,12 +190,19 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
         data = best or (raw[0] if raw else {})
 
     if not isinstance(data, dict):
+        log.warning(f"Final data is not a dict for card {card_id}: {type(data)}")
         return {}
+
+    # Log available keys for debugging
+    available_keys = list(data.keys())
+    log.info(f"Available keys for card {card_id}: {available_keys[:10]}")
 
     first = data.get("firstName")
     last  = data.get("lastName")
     nick  = data.get("nickname")
     name  = pick_name(nick, first, last)
+    
+    log.info(f"Name extraction for {card_id}: first='{first}', last='{last}', nick='{nick}', final='{name}'")
 
     # position
     pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId") or (data.get("meta") or {}).get("position")
@@ -214,6 +224,8 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
     club   = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
     league = _lbl(data.get("league")) or _lbl(data.get("uniqueLeagueSlug"))
     nation = _lbl(data.get("nation")) or _lbl(data.get("uniqueNationSlug")) or _lbl(data.get("country"))
+    
+    log.info(f"Club/League/Nation for {card_id}: club='{club}', league='{league}', nation='{nation}'")
 
     rating = None
     try:
@@ -232,7 +244,7 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
 
     image_url = build_image_url(data.get("cardImagePath"))
 
-    return {
+    result = {
         "name": name,
         "nickname": nick.strip() if isinstance(nick, str) and nick.strip() else None,
         "first_name": first.strip() if isinstance(first, str) and first.strip() else None,
@@ -245,6 +257,12 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
         "nation": nation,
         "image_url": image_url,
     }
+    
+    # Debug: Count non-null fields
+    filled_fields = sum(1 for v in result.values() if v is not None)
+    log.info(f"Card {card_id} extracted {filled_fields}/11 fields: {result}")
+    
+    return result
 
 # ================== DISCOVERY ================== #
 # e.g. href="/players/256343-robson-bambu/25-50587991/"
