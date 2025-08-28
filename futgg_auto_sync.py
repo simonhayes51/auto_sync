@@ -1,28 +1,32 @@
 import os
 import re
-import json
-import asyncio 
+import sys
+import time
+import asyncio
 import asyncpg
 import aiohttp
 import logging
 from datetime import datetime, timedelta, timezone
 from html import unescape
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List, Set
 
 # ------------------ CONFIG ------------------ #
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 PRICE_API = "https://www.fut.gg/api/fut/player-prices/25/{}"
 META_API  = "https://www.fut.gg/api/fut/player-item-definitions/25/{}"
 NEW_URLS  = [
-    "https://www.fut.gg/players/new/?page={}",     # primary
-    "https://www.fut.gg/players/?sort=new&page={}" # fallback list view
+    "https://www.fut.gg/players/new/?page={}",
+    "https://www.fut.gg/players/?sort=new&page={}",
 ]
 
-NEW_PAGES     = int(os.getenv("NEW_PAGES", "5"))   # pages to scan per URL
-REQUEST_TO    = 15
-UA_HEADERS    = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.1)",
+NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))  # pages per URL
+REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
+UA_HEADERS  = {
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.2)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -30,23 +34,66 @@ UA_HEADERS    = {
     "Referer": "https://www.fut.gg/players/new/"
 }
 
-BATCH_SIZE = 100
+# ------------------ LOGGING (rate-limited) ------------------ #
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "300"))  # identical messages throttled within this window
 
-# ------------------ LOGGING ------------------ #
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+class RateLimitFilter(logging.Filter):
+    _last = {}
+    def filter(self, record: logging.LogRecord) -> bool:
+        key = getattr(record, "msg", "")
+        now = time.monotonic() * 1000
+        last = self._last.get(key, 0)
+        if now - last < LOG_THROTTLE_MS:
+            return False
+        self._last[key] = now
+        return True
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+for h in logging.getLogger().handlers:
+    h.addFilter(RateLimitFilter())
 log = logging.getLogger("new_players_sync")
 
+print(f"▶️ Starting: {os.path.basename(__file__)} | LOG_LEVEL={LOG_LEVEL}", flush=True)
+
 # ------------------ DB ------------------ #
-async def get_db():
+async def get_db() -> asyncpg.Connection:
     return await asyncpg.connect(DATABASE_URL)
 
-# ------------------ HELPERS ------------------ #
-# Robust ID extraction patterns
+async def preflight_check(conn: asyncpg.Connection) -> None:
+    """Ensure UNIQUE constraint or index exists for card_id (needed for ON CONFLICT)."""
+    q = """
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
+    WHERE t.relname = 'fut_players'
+      AND c.contype = 'u'
+      AND a.attname = 'card_id'
+    UNION ALL
+    SELECT 1
+    FROM pg_indexes
+    WHERE tablename = 'fut_players'
+      AND indexdef ILIKE '%%UNIQUE%%(card_id%%)'
+    LIMIT 1;
+    """
+    ok = await conn.fetchval(q)
+    if not ok:
+        raise RuntimeError(
+            "UNIQUE constraint on fut_players(card_id) is missing. "
+            "Run the provided SQL to add it before starting this worker."
+        )
+
+# ------------------ Helpers ------------------ #
 RX_HREF = re.compile(r'href=[\'\"]/players/(\d+)(?:/[^\'\"]*)?[\'\"]')
 RX_DATA = re.compile(r'data-player-id=[\'\"](\d+)[\'\"]')
 RX_ANY  = re.compile(r'/players/(\d+)(?:/|\b)')
 
-def normalize_name(obj, *keys):
+def normalize_name(obj, *keys) -> Optional[str]:
     if obj is None:
         return None
     if isinstance(obj, str):
@@ -59,39 +106,80 @@ def normalize_name(obj, *keys):
                 return v.strip()
     return None
 
+def extract_price(payload: dict) -> Optional[int]:
+    if not isinstance(payload, dict):
+        return None
+    # Legacy shape
+    try:
+        ps = (payload.get("ps") or {}).get("LCPrice")
+        xb = (payload.get("xbox") or {}).get("LCPrice")
+        if ps: return int(ps)
+        if xb: return int(xb)
+    except Exception:
+        pass
+    # GraphQL-ish: data.currentPrice.price
+    try:
+        d = payload.get("data") or {}
+        cp = d.get("currentPrice") or {}
+        if cp.get("isExtinct") is True:
+            return None
+        if "price" in cp and cp["price"] is not None:
+            return int(cp["price"])
+    except Exception:
+        pass
+    # Top-level currentPrice
+    try:
+        cp = payload.get("currentPrice") or {}
+        if cp.get("isExtinct") is True:
+            return None
+        if "price" in cp and cp["price"] is not None:
+            return int(cp["price"])
+    except Exception:
+        pass
+    # data.prices.ps.lowest pattern (defensive)
+    try:
+        d = payload.get("data") or {}
+        prices = d.get("prices") or {}
+        for k in ("ps", "xbox", "pc"):
+            v = prices.get(k) or {}
+            for key in ("lowest", "LCPrice", "price"):
+                if key in v and v[key] is not None:
+                    return int(v[key])
+    except Exception:
+        pass
+    return None
+
 # ------------------ HTTP ------------------ #
-async def http_get_text(session: aiohttp.ClientSession, url: str) -> str | None:
+async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
         async with session.get(url, timeout=REQUEST_TO, headers=UA_HEADERS) as resp:
             if resp.status != 200:
-                log.debug(f"GET {url} -> {resp.status}")
+                log.debug("GET %s -> %s", url, resp.status)
                 return None
             return await resp.text()
     except Exception as e:
-        log.debug(f"GET {url} exception: {e}")
+        log.debug("GET %s exception: %s", url, e)
         return None
 
-async def fetch_price(session: aiohttp.ClientSession, numeric_id: str) -> int | None:
+async def fetch_price(session: aiohttp.ClientSession, numeric_id: str) -> Optional[int]:
     try:
         async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
-            price = (data.get("ps") or {}).get("LCPrice") or (data.get("xbox") or {}).get("LCPrice")
-            return int(price) if price else None
+            payload = await resp.json()
+            return extract_price(payload)
     except Exception:
         return None
 
-async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str):
-    """Return dict(name, position, club, nation, league)."""
+async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str) -> Dict[str, Optional[str]]:
     try:
         async with session.get(META_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return {"name": None, "position": None, "club": None, "nation": None, "league": None}
             data = await resp.json()
 
-            name = (data.get("name")
-                    or normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
+            name = (data.get("name") or
+                    normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
 
             position = data.get("position") or data.get("bestPosition") or data.get("primaryPosition")
             if isinstance(position, dict):
@@ -118,40 +206,30 @@ async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str):
     except Exception:
         return {"name": None, "position": None, "club": None, "nation": None, "league": None}
 
-# ------------------ DISCOVERY ------------------ #
-async def discover_new_player_ids(session: aiohttp.ClientSession, pages: int = NEW_PAGES) -> set[int]:
-    """
-    Scrape multiple URLs & pages, extract numeric IDs via several patterns.
-    Logs how many IDs found per page to help diagnose.
-    """
-    found: set[int] = set()
-
+# ------------------ Discovery ------------------ #
+async def discover_new_player_ids(session: aiohttp.ClientSession, pages: int) -> Set[int]:
+    found: Set[int] = set()
     for base in NEW_URLS:
         for page in range(1, pages + 1):
             url = base.format(page)
             html = await http_get_text(session, url)
             if not html:
-                log.info(f"🔍 {url}: no HTML")
+                log.info("🔍 %s: no HTML", url)
                 continue
-
             html = unescape(html)
             before = len(found)
-
             for rx in (RX_HREF, RX_DATA, RX_ANY):
                 for m in rx.finditer(html):
                     try:
                         found.add(int(m.group(1)))
                     except Exception:
                         pass
-
             added = len(found) - before
-            log.info(f"🔎 {url}: +{added} ids (total {len(found)})")
-
+            log.info("🔎 %s: +%d ids (total %d)", url, added, len(found))
     return found
 
-# ------------------ UPSERT / ENRICH ------------------ #
-async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: set[int]) -> list[str]:
-    """Insert any missing players. Returns list of new card_ids ("25-{id}")."""
+# ------------------ Upsert / Enrich ------------------ #
+async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: Set[int]) -> List[str]:
     if not numeric_ids:
         return []
     candidates = [f"25-{i}" for i in numeric_ids]
@@ -175,8 +253,7 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: set[int]) ->
     )
     return to_insert
 
-async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: list[str]):
-    """Fetch name/meta/price for the given card_ids."""
+async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> None:
     if not card_ids:
         return
     rows = await conn.fetch(
@@ -202,7 +279,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: list[str]):
                 meta.get("nation"),
                 meta.get("league"),
                 meta.get("name"),
-                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),  # write to created_at
                 id_by_card[cid]
             ))
 
@@ -220,23 +297,20 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: list[str]):
             """,
             batch
         )
+    log.info("✅ Enriched %d player(s).", len(card_ids))
 
-async def backfill_missing_meta(conn: asyncpg.Connection):
-    """
-    For existing rows with missing name/position/club/nation/league, fetch meta (and price).
-    Runs even if zero new players were found.
-    """
+async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
     rows = await conn.fetch(
         """
         SELECT id, card_id
         FROM fut_players
         WHERE card_id IS NOT NULL
           AND (
-            name   IS NULL OR name = '' OR
+            name IS NULL OR name = '' OR
             position IS NULL OR position = '' OR
-            club     IS NULL OR club = '' OR
-            nation   IS NULL OR nation = '' OR
-            league   IS NULL OR league = ''
+            club IS NULL OR club = '' OR
+            nation IS NULL OR nation = '' OR
+            league IS NULL OR league = ''
           )
         LIMIT 1000
         """
@@ -244,35 +318,33 @@ async def backfill_missing_meta(conn: asyncpg.Connection):
     if not rows:
         log.info("ℹ️ No rows need meta backfill.")
         return
-
     card_ids = [r["card_id"] for r in rows]
-    log.info(f"🧩 Backfilling meta for {len(card_ids)} existing players...")
+    log.info("🧩 Backfilling meta for %d existing players…", len(card_ids))
     await enrich_by_card_ids(conn, card_ids)
 
-# ------------------ ONE-CYCLE TASK ------------------ #
-async def run_once():
+# ------------------ One-cycle task ------------------ #
+async def run_once() -> None:
     conn = await get_db()
     try:
-        # 1) Discover & insert any new players
+        await preflight_check(conn)
+
         async with aiohttp.ClientSession() as session:
             new_ids = await discover_new_player_ids(session, pages=NEW_PAGES)
-        added_card_ids = await upsert_new_players(conn, new_ids)
 
+        added_card_ids = await upsert_new_players(conn, new_ids)
         if added_card_ids:
-            log.info(f"🆕 Inserted {len(added_card_ids)} new players.")
+            log.info("🆕 Inserted %d new players.", len(added_card_ids))
             await enrich_by_card_ids(conn, added_card_ids)
-            log.info("✅ Enriched newly added players.")
         else:
             log.info("ℹ️ No new players found from discovery.")
 
-        # 2) Always try to backfill missing meta on existing rows
         await backfill_missing_meta(conn)
 
     finally:
         await conn.close()
 
-# ------------------ DAILY SCHEDULER @ 19:00 UK ------------------ #
-async def scheduler_19_uk():
+# ------------------ Daily scheduler @ 19:00 UK ------------------ #
+async def scheduler_19_uk() -> None:
     tz = ZoneInfo("Europe/London")
     while True:
         now = datetime.now(tz)
@@ -280,16 +352,30 @@ async def scheduler_19_uk():
         if now >= target:
             target += timedelta(days=1)
         sleep_s = (target - now).total_seconds()
-        log.info(f"🕖 Next new-player check scheduled for {target.isoformat()}")
+        log.info("🕖 Next new-player check scheduled for %s", target.isoformat())
         await asyncio.sleep(sleep_s)
-        try:
-            await run_once()
-        except Exception as e:
-            log.error(f"❌ Run failed: {e}")
+        for attempt in range(3):
+            try:
+                log.info("⏰ 19:00 UK tick — running discovery/backfill")
+                await run_once()
+                break
+            except Exception as e:
+                wait = 5 * (attempt + 1)
+                log.error("❌ Run failed (attempt %d/3): %s. Retrying in %ds", attempt+1, e, wait)
+                await asyncio.sleep(wait)
 
+# ------------------ Entrypoint ------------------ #
 if __name__ == "__main__":
-    # Run immediately on startup, then follow the 19:00 UK schedule
-    try:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--now", action="store_true", help="Run once immediately and exit")
+    args = ap.parse_args()
+
+    if args.now:
         asyncio.run(run_once())
-    finally:
-        asyncio.run(scheduler_19_uk())
+    else:
+        # Run once immediately, then schedule daily at 19:00 UK
+        try:
+            asyncio.run(run_once())
+        finally:
+            asyncio.run(scheduler_19_uk())
