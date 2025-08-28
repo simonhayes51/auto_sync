@@ -188,6 +188,11 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
             if r > best_rating:
                 best_rating, best = r, it
         data = best or (raw[0] if raw else {})
+    
+    # FIXED: Handle data wrapper - this was the missing piece!
+    if isinstance(data, dict) and "data" in data:
+        log.info(f"Unwrapping 'data' key for card {card_id}")
+        data = data["data"]
 
     if not isinstance(data, dict):
         log.warning(f"Final data is not a dict for card {card_id}: {type(data)}")
