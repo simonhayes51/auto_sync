@@ -209,15 +209,25 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
     
     log.info(f"Name extraction for {card_id}: first='{first}', last='{last}', nick='{nick}', final='{name}'")
 
-    # position - simplified logic
+    # position - simplified logic with better debugging
     pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId") or (data.get("meta") or {}).get("position")
+    
+    # Debug: Log the raw position value we found
+    log.info(f"Position debug for {card_id}: pos_raw={pos_raw} (type: {type(pos_raw)})")
+    
     if isinstance(pos_raw, int):
-        position = POSITION_MAP.get(pos_raw) or str(pos_raw)
-        # Debug for unmapped positions
-        if pos_raw not in POSITION_MAP:
+        position = POSITION_MAP.get(pos_raw)
+        if position:
+            log.info(f"Position mapped for {card_id}: {pos_raw} -> '{position}'")
+        else:
             log.warning(f"Unmapped position {pos_raw} for card {card_id}")
+            position = str(pos_raw)  # fallback to string representation
     else:
         position = pos_raw if isinstance(pos_raw, str) and pos_raw.strip() else None
+        if pos_raw is None:
+            log.warning(f"No position data found for {card_id}")
+        else:
+            log.info(f"String position for {card_id}: '{pos_raw}'")
 
     # club/league/nation - FIXED: Check nested objects first, with special handling for Icons/Heroes
     def _lbl(block):
