@@ -11,7 +11,7 @@ import signal
 from datetime import datetime, timedelta
 from html import unescape
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List
 from aiohttp import web  # health server
 
 # ================== CONFIG ================== #
@@ -24,18 +24,20 @@ LISTING_URLS = [
     "https://www.fut.gg/players/new/?page={}",
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
+FULL_LISTING_URL = "https://www.fut.gg/players/?page={}"  # full catalog
 
-NEW_PAGES          = int(os.getenv("NEW_PAGES", "5"))            # pages per listing group
-REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))     # seconds
-CONCURRENCY        = int(os.getenv("CONCURRENCY", "12"))        # Reduced for bulk processing
+NEW_PAGES          = int(os.getenv("NEW_PAGES", "5"))             # pages per listing group (daily)
+FULL_PAGES         = int(os.getenv("FULL_PAGES", "335"))          # pages for one-off full build
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))      # seconds
+CONCURRENCY        = int(os.getenv("CONCURRENCY", "12"))          # HTTP concurrency (kept modest)
 DISCOVERY_CONC     = int(os.getenv("DISCOVERY_CONCURRENCY", "8"))
 UPDATE_CHUNK_SIZE  = int(os.getenv("UPDATE_CHUNK_SIZE", "100"))
 
 # Rate limiting for bulk processing
-RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", "0.1"))    # Delay between requests (100ms)
-BATCH_DELAY        = float(os.getenv("BATCH_DELAY", "5.0"))         # Delay between batches (5 seconds)
-BULK_BATCH_SIZE    = int(os.getenv("BULK_BATCH_SIZE", "50"))        # Cards per batch
-MAX_RETRIES        = int(os.getenv("MAX_RETRIES", "3"))             # Retries for failed requests
+RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", "0.1"))   # Delay between requests (100ms)
+BATCH_DELAY        = float(os.getenv("BATCH_DELAY", "5.0"))        # Delay between batches (5s)
+BULK_BATCH_SIZE    = int(os.getenv("BULK_BATCH_SIZE", "50"))       # Cards per batch
+MAX_RETRIES        = int(os.getenv("MAX_RETRIES", "3"))            # Retries per request
 
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/3.1)",
@@ -133,15 +135,14 @@ async def preflight(conn: asyncpg.Connection) -> None:
 # ================== HELPERS ================== #
 def build_image_url(card_image_path: Optional[str]) -> Optional[str]:
     """
-    Build the complete image URL from the cardImagePath
+    Build the complete image URL from the cardImagePath (as returned by API).
     """
     if not card_image_path or not isinstance(card_image_path, str):
         return None
-    
     path = card_image_path.strip()
     if not path:
         return None
-    
+    # Using the path as-is (you confirmed this works in your env)
     return f"https://game-assets.fut.gg/cdn-cgi/image/quality=100,format=auto,width=500/{path}"
 
 def pick_name(nick, first, last) -> Optional[str]:
@@ -169,46 +170,43 @@ async def fetch_meta_with_retry(session: aiohttp.ClientSession, card_id: str) ->
     """
     Fetch metadata with retry logic and rate limiting
     """
+    api_headers = {
+        "User-Agent": UA_HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.fut.gg/players/",
+        "Origin": "https://www.fut.gg",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
     for attempt in range(MAX_RETRIES):
         try:
-            # Rate limiting delay
             await asyncio.sleep(RATE_LIMIT_DELAY)
-            
-            async with session.get(META_API.format(card_id), timeout=REQUEST_TIMEOUT,
-                                   headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
-                if resp.status == 429:  # Rate limited
-                    wait_time = min(2 ** attempt, 30)  # Exponential backoff, max 30s
-                    log.warning(f"Rate limited for card {card_id}, waiting {wait_time}s")
+            async with session.get(META_API.format(card_id), timeout=REQUEST_TIMEOUT, headers=api_headers) as resp:
+                if resp.status == 429:
+                    wait_time = min(2 ** attempt, 30)
+                    log.warning("Rate limited for card %s, waiting %ss", card_id, wait_time)
                     await asyncio.sleep(wait_time)
                     continue
                 elif resp.status != 200:
-                    log.warning(f"API returned status {resp.status} for card {card_id}")
-                    return {}
-                    
+                    log.warning("META %s → HTTP %s (try %d)", card_id, resp.status, attempt + 1)
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
                 raw = await resp.json()
                 return parse_player_data(raw, card_id)
-                
         except asyncio.TimeoutError:
-            log.warning(f"Timeout on attempt {attempt + 1} for card {card_id}")
-            if attempt == MAX_RETRIES - 1:
-                return {}
+            log.warning("Timeout on attempt %d for card %s", attempt + 1, card_id)
         except Exception as e:
-            log.error(f"Error on attempt {attempt + 1} for card {card_id}: {e}")
-            if attempt == MAX_RETRIES - 1:
-                return {}
-    
+            log.warning("Exception on attempt %d for card %s: %s", attempt + 1, card_id, e)
     return {}
 
 def parse_player_data(raw: dict, card_id: str) -> dict:
     """
     Parse player data from API response
     """
-    # Handle data wrapper
     data = raw
     if isinstance(raw, dict) and "data" in raw:
         data = raw["data"]
-    
-    # Handle list response (pick best rating)
+
     if isinstance(data, list):
         best, best_rating = None, -1
         for it in data:
@@ -223,18 +221,16 @@ def parse_player_data(raw: dict, card_id: str) -> dict:
         return {}
 
     first = data.get("firstName")
-    last = data.get("lastName")
-    nick = data.get("nickname")
-    name = pick_name(nick, first, last)
+    last  = data.get("lastName")
+    nick  = data.get("nickname")
+    name  = pick_name(nick, first, last)
 
-    # position
     pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId") or (data.get("meta") or {}).get("position")
     if isinstance(pos_raw, int):
         position = POSITION_MAP.get(pos_raw) or str(pos_raw)
     else:
         position = pos_raw if isinstance(pos_raw, str) and pos_raw.strip() else None
 
-    # club/league/nation
     def _lbl(block):
         if isinstance(block, dict):
             v = block.get("name") or block.get("slug")
@@ -243,11 +239,10 @@ def parse_player_data(raw: dict, card_id: str) -> dict:
             return block.strip() or None
         return None
 
-    club = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
+    club   = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
     league = _lbl(data.get("league")) or _lbl(data.get("uniqueLeagueSlug"))
     nation = _lbl(data.get("nation")) or _lbl(data.get("uniqueNationSlug")) or _lbl(data.get("country"))
 
-    rating = None
     try:
         rv = data.get("overall") or data.get("rating") or data.get("overallRating") or data.get("ovr")
         rating = int(rv) if rv is not None else None
@@ -268,7 +263,7 @@ def parse_player_data(raw: dict, card_id: str) -> dict:
         "name": name,
         "nickname": nick.strip() if isinstance(nick, str) and nick.strip() else None,
         "first_name": first.strip() if isinstance(first, str) and first.strip() else None,
-        "last_name": last.strip() if isinstance(last, str) and last.strip() else None,
+        "last_name":  last.strip()  if isinstance(last,  str) and last.strip()  else None,
         "rating": rating,
         "version": version,
         "position": position,
@@ -286,6 +281,7 @@ RX_HREF_CARD_ONLY = re.compile(r'href=[\'\"]/players/(?:25-)?(\d+)[/\'\"]', re.I
 
 async def discover_cards(session: aiohttp.ClientSession, pages: int) -> Dict[str, Optional[str]]:
     """
+    Daily: discover recent cards from /players/new and /players?sort=new
     Returns dict: { card_id (str) : player_slug (str|None) }
     """
     out: Dict[str, Optional[str]] = {}
@@ -303,8 +299,6 @@ async def discover_cards(session: aiohttp.ClientSession, pages: int) -> Dict[str
             for m in RX_HREF_SLUG_CARD.finditer(doc):
                 slug, cid = m.group(1), m.group(2)
                 out[cid] = slug
-
-            # don't overwrite existing slug with None
             for m in RX_HREF_CARD_ONLY.finditer(doc):
                 cid = m.group(1)
                 out.setdefault(cid, None)
@@ -318,12 +312,41 @@ async def discover_cards(session: aiohttp.ClientSession, pages: int) -> Dict[str
     await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
+async def discover_full_catalog(session: aiohttp.ClientSession, pages: int) -> Dict[str, Optional[str]]:
+    """
+    One-off: discover the full catalog from /players?page=1..pages
+    """
+    out: Dict[str, Optional[str]] = {}
+    sem = asyncio.Semaphore(DISCOVERY_CONC)
+
+    async def fetch_page(p: int):
+        url = FULL_LISTING_URL.format(p)
+        async with sem:
+            html = await http_get_text(session, url)
+            if not html:
+                log.info("🔍 %s: no HTML", url)
+                return
+            doc = unescape(html)
+            before = len(out)
+
+            for m in RX_HREF_SLUG_CARD.finditer(doc):
+                slug, cid = m.group(1), m.group(2)
+                out[cid] = slug
+            for m in RX_HREF_CARD_ONLY.finditer(doc):
+                cid = m.group(1)
+                out.setdefault(cid, None)
+
+            log.info("📚 %s: +%d cards (total %d)", url, len(out) - before, len(out))
+
+    tasks = [fetch_page(p) for p in range(1, pages + 1)]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    return out
+
 # ================== BULK ENRICHMENT ================== #
 async def get_all_card_ids(conn: asyncpg.Connection) -> List[str]:
-    """Get all card IDs from the database"""
     rows = await conn.fetch("SELECT card_id FROM public.fut_players ORDER BY card_id")
     card_ids = [r["card_id"] for r in rows]
-    log.info(f"📊 Found {len(card_ids)} total players in database")
+    log.info("📊 Found %d total players in database", len(card_ids))
     return card_ids
 
 async def bulk_enrich_all(conn: asyncpg.Connection) -> None:
@@ -332,18 +355,12 @@ async def bulk_enrich_all(conn: asyncpg.Connection) -> None:
     """
     card_ids = await get_all_card_ids(conn)
     total_cards = len(card_ids)
-    
     if total_cards == 0:
         log.info("No cards found to enrich")
         return
-    
-    # Process in batches
-    processed = 0
-    failed = 0
-    
+
     write_conn = await asyncpg.connect(DATABASE_URL)
-    
-    # Build dynamic UPDATE that keys by card_id and only fills NULLs (COALESCE)
+
     sql = """
         UPDATE public.fut_players
         SET position    = COALESCE($1, position),
@@ -370,49 +387,40 @@ async def bulk_enrich_all(conn: asyncpg.Connection) -> None:
         arg_count += 1
     sql += " WHERE card_id = $%d" % (arg_count + 1)
 
+    processed = failed = 0
+
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=REQUEST_TIMEOUT),
             connector=aiohttp.TCPConnector(limit=CONCURRENCY * 2, ttl_dns_cache=300)
         ) as session:
-            
-            # Process in batches
             for i in range(0, total_cards, BULK_BATCH_SIZE):
                 batch = card_ids[i:i + BULK_BATCH_SIZE]
                 batch_num = (i // BULK_BATCH_SIZE) + 1
                 total_batches = (total_cards + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
-                
-                log.info(f"🔄 Processing batch {batch_num}/{total_batches} ({len(batch)} cards)")
-                
-                # Fetch metadata for batch with controlled concurrency
+                log.info("🔄 Processing batch %d/%d (%d cards)", batch_num, total_batches, len(batch))
+
                 sem = asyncio.Semaphore(CONCURRENCY)
-                
+
                 async def process_card(card_id: str):
                     async with sem:
                         return card_id, await fetch_meta_with_retry(session, card_id)
-                
-                # Get all metadata for this batch
-                batch_results = await asyncio.gather(
-                    *[process_card(card_id) for card_id in batch],
+
+                results = await asyncio.gather(
+                    *[process_card(cid) for cid in batch],
                     return_exceptions=True
                 )
-                
-                # Prepare database updates
-                db_updates = []
-                batch_processed = 0
-                batch_failed = 0
-                
-                for result in batch_results:
+
+                updates, ok, bad = [], 0, 0
+                for result in results:
                     if isinstance(result, Exception):
-                        batch_failed += 1
+                        bad += 1
                         continue
-                        
-                    card_id, meta = result
+                    cid, meta = result
                     if not meta:
-                        batch_failed += 1
+                        bad += 1
                         continue
-                    
-                    # Build args for database update
+
                     args = [
                         meta.get("position"),
                         meta.get("club"),
@@ -422,45 +430,40 @@ async def bulk_enrich_all(conn: asyncpg.Connection) -> None:
                         meta.get("rating"),
                         meta.get("version"),
                         meta.get("image_url"),
-                        meta.get("player_slug"),  # Keep existing slug
-                        meta.get("player_url"),   # Keep existing url
+                        meta.get("player_slug"),  # unchanged (we keep existing)
+                        meta.get("player_url"),
                     ]
                     if HAS_NICK:  args.append(meta.get("nickname"))
                     if HAS_FIRST: args.append(meta.get("first_name"))
                     if HAS_LAST:  args.append(meta.get("last_name"))
-                    args.append(card_id)  # WHERE card_id=...
-                    
-                    db_updates.append(tuple(args))
-                    batch_processed += 1
-                
-                # Execute database updates for this batch
-                if db_updates:
+                    args.append(cid)
+                    updates.append(tuple(args))
+                    ok += 1
+
+                if updates:
                     try:
-                        await write_conn.executemany(sql, db_updates)
-                        log.info(f"💾 Updated {len(db_updates)} records in batch {batch_num}")
+                        await write_conn.executemany(sql, updates)
+                        log.info("💾 Updated %d records in batch %d", len(updates), batch_num)
                     except Exception as e:
-                        log.error(f"❌ Database update failed for batch {batch_num}: {e}")
-                        batch_failed += len(db_updates)
-                        batch_processed -= len(db_updates)
-                
-                processed += batch_processed
-                failed += batch_failed
-                
-                # Progress logging
+                        log.error("❌ Database update failed for batch %d: %s", batch_num, e)
+                        bad += len(updates)
+                        ok -= len(updates)
+
+                processed += ok
+                failed += bad
                 progress = (processed + failed) / total_cards * 100
-                log.info(f"📈 Progress: {processed}/{total_cards} processed ({progress:.1f}%), {failed} failed")
-                
-                # Delay between batches to be respectful
-                if i + BULK_BATCH_SIZE < total_cards:  # Don't delay after last batch
-                    log.info(f"⏳ Waiting {BATCH_DELAY}s before next batch...")
+                log.info("📈 Progress: %d/%d processed (%.1f%%), %d failed", processed, total_cards, progress, failed)
+
+                if i + BULK_BATCH_SIZE < total_cards:
+                    log.info("⏳ Waiting %.1fs before next batch…", BATCH_DELAY)
                     await asyncio.sleep(BATCH_DELAY)
-    
+
     finally:
         await write_conn.close()
-    
-    log.info(f"✅ Bulk enrichment complete: {processed} updated, {failed} failed out of {total_cards} total")
 
-# ================== UPSERT & ENRICH ================== #
+    log.info("✅ Bulk enrichment complete: %d updated, %d failed out of %d total", processed, failed, total_cards)
+
+# ================== UPSERT ================== #
 async def upsert_new(conn: asyncpg.Connection, discovered: Dict[str, Optional[str]]) -> List[str]:
     """Insert missing card_ids; return the list of newly inserted card_ids."""
     if not discovered:
@@ -492,22 +495,19 @@ async def upsert_new(conn: asyncpg.Connection, discovered: Dict[str, Optional[st
     )
     return new_ids
 
-# ================== ONE CYCLE ================== #
-async def run_once() -> None:
+# ================== RUN MODES ================== #
+async def run_once_daily() -> None:
+    """Normal daily run: discover 'new' pages, upsert, then bulk enrich."""
     conn = await get_db()
     try:
         await preflight(conn)
-
-        # 1) Discover new cards
-        discovered: Dict[str, Optional[str]] = {}
+        discovered = {}
         try:
             async with aiohttp.ClientSession() as session:
                 discovered = await discover_cards(session, NEW_PAGES)
         except Exception as e:
             log.error("❌ Discovery failed: %s", e)
 
-        # 2) Upsert new cards
-        added = []
         try:
             added = await upsert_new(conn, discovered)
             if added:
@@ -517,13 +517,38 @@ async def run_once() -> None:
         except Exception as e:
             log.error("❌ Upsert failed: %s", e)
 
-        # 3) Bulk enrich ALL players (this is the new behavior)
         try:
-            log.info("🔄 Starting bulk enrichment of all players...")
+            log.info("🔄 Starting bulk enrichment of all players…")
             await bulk_enrich_all(conn)
         except Exception as e:
             log.error("❌ Bulk enrichment failed: %s", e)
+    finally:
+        await conn.close()
 
+async def run_full_build() -> None:
+    """One-off full build: scan all catalog pages, upsert everything, then bulk enrich."""
+    conn = await get_db()
+    try:
+        await preflight(conn)
+        discovered = {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                log.info("📚 Starting full catalog discovery over %d pages…", FULL_PAGES)
+                discovered = await discover_full_catalog(session, FULL_PAGES)
+        except Exception as e:
+            log.error("❌ Full discovery failed: %s", e)
+
+        try:
+            added = await upsert_new(conn, discovered)
+            log.info("🆕 Upsert complete. New rows inserted: %d", len(added))
+        except Exception as e:
+            log.error("❌ Upsert (full) failed: %s", e)
+
+        try:
+            log.info("🔄 Starting bulk enrichment of all players…")
+            await bulk_enrich_all(conn)
+        except Exception as e:
+            log.error("❌ Bulk enrichment failed: %s", e)
     finally:
         await conn.close()
 
@@ -569,7 +594,7 @@ async def main_loop():
 
     while not shutdown_evt.is_set():
         log.info("🚦 Cycle start")
-        await run_once()
+        await run_once_daily()
         log.info("✅ Cycle complete")
         await sleep_until_19_uk()
 
@@ -580,7 +605,8 @@ async def main_loop():
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--now", action="store_true", help="Run discovery+bulk enrichment once and exit")
+    ap.add_argument("--now", action="store_true", help="Run daily discovery+bulk enrichment once and exit")
+    ap.add_argument("--full", action="store_true", help="Run one-off full catalog build (335 pages by default)")
     ap.add_argument("--bulk-only", action="store_true", help="Skip discovery, only do bulk enrichment")
     args = ap.parse_args()
 
@@ -592,8 +618,10 @@ if __name__ == "__main__":
                 await bulk_enrich_all(conn)
             finally:
                 await conn.close()
+        elif args.full:
+            await run_full_build()
         elif args.now:
-            await run_once()
+            await run_once_daily()
         else:
             await main_loop()
 
