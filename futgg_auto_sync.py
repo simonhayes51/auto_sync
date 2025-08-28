@@ -25,14 +25,14 @@ LISTING_URLS = [
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
 
-NEW_PAGES          = int(os.getenv("NEW_PAGES", "5"))           # pages per listing group
-REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))
-CONCURRENCY        = int(os.getenv("CONCURRENCY", "24"))        # HTTP concurrency
+NEW_PAGES          = int(os.getenv("NEW_PAGES", "5"))            # pages per listing group
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))     # seconds
+CONCURRENCY        = int(os.getenv("CONCURRENCY", "24"))         # HTTP concurrency
 DISCOVERY_CONC     = int(os.getenv("DISCOVERY_CONCURRENCY", "8"))
 UPDATE_CHUNK_SIZE  = int(os.getenv("UPDATE_CHUNK_SIZE", "100"))
 
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/3.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/3.1)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -143,7 +143,6 @@ def pick_name(nick, first, last) -> Optional[str]:
         return nick.strip()
     if isinstance(first, str) and first.strip() and isinstance(last, str) and last.strip():
         return f"{first.strip()} {last.strip()}"
-    # final fallback to whatever is available
     if isinstance(first, str) and first.strip():
         return first.strip()
     if isinstance(last, str) and last.strip():
@@ -433,6 +432,32 @@ async def enrich_new(conn: asyncpg.Connection, card_ids: List[str]) -> None:
     await write_conn.close()
     log.info("✅ Enrichment done. Wrote %d row(s).", written)
 
+# ---- One-off enrichment for rows missing data (used right after first run) ---- #
+async def enrich_missing_once(conn: asyncpg.Connection, limit: int = 2000) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT card_id
+        FROM public.fut_players
+        WHERE card_id ~ '^[0-9]+$'
+          AND (
+            name IS NULL OR name = '' OR
+            rating IS NULL OR
+            position IS NULL OR position = '' OR
+            club IS NULL OR club = '' OR
+            league IS NULL OR league = '' OR
+            nation IS NULL OR nation = '' OR
+            image_url IS NULL OR image_url = '' OR
+            player_slug IS NULL OR player_slug = '' OR
+            player_url IS NULL OR player_url = ''
+          )
+        LIMIT $1
+        """,
+        limit
+    )
+    if not rows:
+        return
+    await enrich_new(conn, [r["card_id"] for r in rows])
+
 # ================== ONE CYCLE ================== #
 async def run_once() -> None:
     conn = await get_db()
@@ -458,11 +483,16 @@ async def run_once() -> None:
         except Exception as e:
             log.error("❌ Upsert failed: %s", e)
 
-        # 3) Enrich only newly inserted
+        # 3) Enrich only newly inserted, then one-off fill for any existing empties
         try:
             await enrich_new(conn, added)
         except Exception as e:
-            log.error("❌ Enrich failed: %s", e)
+            log.error("❌ Enrich(new) failed: %s", e)
+
+        try:
+            await enrich_missing_once(conn, limit=2000)
+        except Exception as e:
+            log.error("❌ Enrich-missing failed: %s", e)
 
     finally:
         await conn.close()
