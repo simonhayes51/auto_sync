@@ -209,14 +209,17 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
     
     log.info(f"Name extraction for {card_id}: first='{first}', last='{last}', nick='{nick}', final='{name}'")
 
-    # position
+    # position - simplified logic
     pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId") or (data.get("meta") or {}).get("position")
     if isinstance(pos_raw, int):
         position = POSITION_MAP.get(pos_raw) or str(pos_raw)
+        # Debug for unmapped positions
+        if pos_raw not in POSITION_MAP:
+            log.warning(f"Unmapped position {pos_raw} for card {card_id}")
     else:
         position = pos_raw if isinstance(pos_raw, str) and pos_raw.strip() else None
 
-    # club/league/nation - FIXED: Check nested objects first
+    # club/league/nation - FIXED: Check nested objects first, with special handling for Icons/Heroes
     def _lbl(block):
         if isinstance(block, dict):
             v = block.get("name") or block.get("slug")
@@ -225,8 +228,8 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
             return block.strip() or None
         return None
 
-    # FIXED: Try nested objects first, then fallback to original logic
-    club   = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
+    # FIXED: Try nested objects first - club.name should be "HERO", not the slug
+    club = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
     league = _lbl(data.get("league")) or _lbl(data.get("uniqueLeagueSlug"))
     nation = _lbl(data.get("nation")) or _lbl(data.get("uniqueNationSlug")) or _lbl(data.get("country"))
     
@@ -263,9 +266,14 @@ async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
         "image_url": image_url,
     }
     
-    # Debug: Count non-null fields
+    # Debug: Count non-null fields and log position issues
     filled_fields = sum(1 for v in result.values() if v is not None)
-    log.info(f"Card {card_id} extracted {filled_fields}/11 fields: {result}")
+    
+    # Special logging for position issues
+    if position is None and pos_raw is not None:
+        log.warning(f"Position mapping failed for {card_id}: pos_raw={pos_raw} (type: {type(pos_raw)})")
+    
+    log.info(f"Card {card_id} extracted {filled_fields}/11 fields: name='{name}', position='{position}', club='{club}'")
     
     return result
 
