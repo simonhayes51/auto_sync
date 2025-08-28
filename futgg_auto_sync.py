@@ -7,7 +7,7 @@ import asyncpg
 import aiohttp
 import logging
 import signal
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from html import unescape
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List, Set, Tuple
@@ -24,11 +24,11 @@ NEW_URLS  = [
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
 
-NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))         # pages per URL
-REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))  # seconds
+NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))
+REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.7)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.8)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -96,7 +96,7 @@ def normalize_name(obj, *keys) -> Optional[str]:
         s = obj.strip()
         return s or None
     if isinstance(obj, dict):
-        for k in keys or ("name", "shortName", "longName", "fullName"):
+        for k in keys or ("name", "shortName", "LongName", "fullName"):
             v = obj.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
@@ -108,8 +108,8 @@ def pick_first(d: dict, keys: List[str]):
             return d[k]
     return None
 
-# Robust numeric-id extractor: works for "25-231443", "231443", or any string ending with digits
-_RE_NUMERIC_ID_TAIL = re.compile(r'(^|-)(' r'\d+' r')$')  # captures digits at end optionally after a dash
+# Numeric ID extraction: works for "25-231443", "231443", or any string ending with digits
+_RE_NUMERIC_ID_TAIL = re.compile(r'(^|-)(\d+)$')
 _RE_ANY_DIGITS_AT_END = re.compile(r'(\d+)$')
 def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
     if not card_id:
@@ -120,17 +120,21 @@ def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
     m2 = _RE_ANY_DIGITS_AT_END.search(card_id)
     return m2.group(1) if m2 else None
 
-def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[datetime]]:
+def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[str]]:
+    """
+    Returns: (price, is_objective, is_untradeable, is_extinct, price_updated_at_text)
+    price_updated_at_text is ISO text or None to be cast in SQL (::timestamptz).
+    """
     price = None
     is_objective = None
     is_untradeable = None
     is_extinct = None
-    updated_at = None
+    updated_at_text = None
 
     if not isinstance(payload, dict):
-        return price, is_objective, is_untradeable, is_extinct, updated_at
+        return price, is_objective, is_untradeable, is_extinct, updated_at_text
 
-    # Legacy LCPrice (ps/xbox)
+    # Legacy LCPrice
     try:
         ps = (payload.get("ps") or {}).get("LCPrice")
         xb = (payload.get("xbox") or {}).get("LCPrice")
@@ -149,14 +153,12 @@ def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool
         if cp.get("price") is not None:
             price = int(cp["price"])
         if cp.get("priceUpdatedAt"):
-            try:
-                updated_at = datetime.fromisoformat(cp["priceUpdatedAt"].replace("Z", "+00:00"))
-            except Exception:
-                updated_at = None
+            # keep as text; let SQL cast to timestamptz
+            updated_at_text = str(cp["priceUpdatedAt"])
     except Exception:
         pass
 
-    return price, is_objective, is_untradeable, is_extinct, updated_at
+    return price, is_objective, is_untradeable, is_extinct, updated_at_text
 
 def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
     if not isinstance(data, dict):
@@ -277,7 +279,7 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: Set[int]) ->
     if not to_insert:
         return []
 
-    rows: List[Tuple[str, str]] = [(cid, f"https://www.fut.gg/players/{extract_numeric_id(cid)}/") for cid in to_insert]
+    rows = [(cid, f"https://www.fut.gg/players/{extract_numeric_id(cid)}/") for cid in to_insert]
     await conn.executemany(
         """
         INSERT INTO public.fut_players (card_id, player_url)
@@ -303,18 +305,25 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         batch: List[Tuple[
             Optional[int], Optional[str], Optional[str], Optional[str], Optional[str],
             Optional[str], Optional[int], Optional[str], Optional[str], Optional[str],
-            Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[datetime],
-            datetime, int
+            Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[str],
+            int
         ]] = []
         skipped_bad = 0
+        skipped_missing = 0
 
         for cid in card_ids:
+            # Ensure the row still exists and has an id
+            if cid not in id_by_card:
+                skipped_missing += 1
+                continue
+
             numeric_id = extract_numeric_id(cid)
             if not numeric_id:
                 skipped_bad += 1
                 continue
+
             try:
-                (price, is_obj, is_untrad, is_ext, price_ts), meta = await asyncio.gather(
+                (price, is_obj, is_untrad, is_ext, price_ts_text), meta = await asyncio.gather(
                     fetch_price(session, numeric_id),
                     fetch_meta(session, numeric_id)
                 )
@@ -340,16 +349,16 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 is_obj,
                 is_untrad,
                 is_ext,
-                price_ts,
-                datetime.now(timezone.utc),
+                price_ts_text,   # TEXT → cast in SQL
                 id_by_card[cid]
             ))
 
         if not batch:
-            log.info("ℹ️ Nothing to enrich for given batch. (Skipped %d malformed card_id row(s))", skipped_bad)
+            log.info("ℹ️ Nothing to enrich for given batch. (Skipped %d malformed, %d missing rows)", skipped_bad, skipped_missing)
             return
 
         try:
+            # created_at set in SQL to avoid tz adapter issues
             await conn.executemany(
                 """
                 UPDATE public.fut_players
@@ -367,9 +376,9 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                     is_objective     = COALESCE($12, is_objective),
                     is_untradeable   = COALESCE($13, is_untradeable),
                     is_extinct       = COALESCE($14, is_extinct),
-                    price_updated_at = COALESCE($15, price_updated_at),
-                    created_at       = $16
-                WHERE id = $17
+                    price_updated_at = COALESCE($15::timestamptz, price_updated_at),
+                    created_at       = NOW() AT TIME ZONE 'UTC'
+                WHERE id = $16
                 """,
                 batch
             )
@@ -377,7 +386,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             log.error("❌ DB update failed for batch of %d: %s", len(batch), e)
             return
 
-    log.info("✅ Enriched %d player(s). Skipped %d malformed card_id row(s).", len(batch), skipped_bad)
+    log.info("✅ Enriched %d player(s). Skipped %d malformed card_id, %d missing rows.", len(batch), skipped_bad, skipped_missing)
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
     """
@@ -425,7 +434,7 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
             await enrich_by_card_ids(conn, card_ids)
         except Exception as e:
             log.error("❌ Enrich step failed during backfill: %s", e)
-            await asyncio.sleep(1)  # continue loop; try next chunk
+            await asyncio.sleep(1)
 
 # ------------------ One-cycle task ------------------ #
 async def run_once() -> None:
@@ -495,7 +504,7 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            pass  # Windows etc.
+            pass
 
     while not shutdown.is_set():
         try:
