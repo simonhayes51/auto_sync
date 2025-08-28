@@ -29,7 +29,7 @@ NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))
 REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.9)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/2.0)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -121,18 +121,18 @@ def extract_numeric_id(card_id: Optional[str]) -> Optional[str]:
     m2 = _RE_ANY_DIGITS_AT_END.search(card_id)
     return m2.group(1) if m2 else None
 
-def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[str]]:
+def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[datetime]]:
     """
-    Returns: (price, is_objective, is_untradeable, is_extinct, price_updated_at_text)
+    Returns: (price, is_objective, is_untradeable, is_extinct, price_updated_at_dt)
     """
     price = None
     is_objective = None
     is_untradeable = None
     is_extinct = None
-    updated_at_text = None
+    updated_at_dt: Optional[datetime] = None
 
     if not isinstance(payload, dict):
-        return price, is_objective, is_untradeable, is_extinct, updated_at_text
+        return price, is_objective, is_untradeable, is_extinct, updated_at_dt
 
     # Legacy LCPrice
     try:
@@ -147,17 +147,24 @@ def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool
     try:
         d = payload.get("data") or payload
         cp = d.get("currentPrice") or {}
+        # flags (accept either key casing just in case)
         if "isObjective" in cp:   is_objective   = bool(cp.get("isObjective"))
         if "isUntradeable" in cp: is_untradeable = bool(cp.get("isUntradeable"))
+        if "IsUntradeable" in cp: is_untradeable = bool(cp.get("IsUntradeable"))
         if "isExtinct" in cp:     is_extinct     = bool(cp.get("isExtinct"))
+        # price
         if cp.get("price") is not None:
             price = int(cp["price"])
+        # timestamp → aware UTC datetime
         if cp.get("priceUpdatedAt"):
-            updated_at_text = str(cp["priceUpdatedAt"])
+            try:
+                updated_at_dt = datetime.fromisoformat(str(cp["priceUpdatedAt"]).replace("Z", "+00:00"))
+            except Exception:
+                updated_at_dt = None
     except Exception:
         pass
 
-    return price, is_objective, is_untradeable, is_extinct, updated_at_text
+    return price, is_objective, is_untradeable, is_extinct, updated_at_dt
 
 def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
     if not isinstance(data, dict):
@@ -304,7 +311,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         batch: List[Tuple[
             Optional[int], Optional[str], Optional[str], Optional[str], Optional[str],
             Optional[str], Optional[int], Optional[str], Optional[str], Optional[str],
-            Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[str],
+            Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[datetime],
             int
         ]] = []
         skipped_bad = 0
@@ -321,7 +328,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 continue
 
             try:
-                (price, is_obj, is_untrad, is_ext, price_ts_text), meta = await asyncio.gather(
+                (price, is_obj, is_untrad, is_ext, price_ts_dt), meta = await asyncio.gather(
                     fetch_price(session, numeric_id),
                     fetch_meta(session, numeric_id)
                 )
@@ -347,7 +354,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 is_obj,
                 is_untrad,
                 is_ext,
-                price_ts_text,   # TEXT → cast in SQL
+                price_ts_dt,   # datetime or None
                 id_by_card[cid]
             ))
 
@@ -373,7 +380,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                     is_objective     = COALESCE($12, is_objective),
                     is_untradeable   = COALESCE($13, is_untradeable),
                     is_extinct       = COALESCE($14, is_extinct),
-                    price_updated_at = COALESCE($15::timestamptz, price_updated_at),
+                    price_updated_at = COALESCE($15, price_updated_at),
                     created_at       = NOW() AT TIME ZONE 'UTC'
                 WHERE id = $16
                 """,
