@@ -7,7 +7,7 @@ import asyncpg
 import aiohttp
 import logging
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List, Set, Tuple
@@ -25,11 +25,13 @@ NEW_URLS  = [
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
 
-NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))
-REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
+NEW_PAGES          = int(os.getenv("NEW_PAGES", "5"))           # discovery pages per URL
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))    # seconds
+BACKFILL_LIMIT     = int(os.getenv("BACKFILL_LIMIT", "300"))    # rows per backfill query
+UPDATE_CHUNK_SIZE  = int(os.getenv("UPDATE_CHUNK_SIZE", "100")) # rows per DB executemany chunk
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/2.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/2.2)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -147,15 +149,12 @@ def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool
     try:
         d = payload.get("data") or payload
         cp = d.get("currentPrice") or {}
-        # flags (accept either key casing just in case)
         if "isObjective" in cp:   is_objective   = bool(cp.get("isObjective"))
         if "isUntradeable" in cp: is_untradeable = bool(cp.get("isUntradeable"))
         if "IsUntradeable" in cp: is_untradeable = bool(cp.get("IsUntradeable"))
         if "isExtinct" in cp:     is_extinct     = bool(cp.get("isExtinct"))
-        # price
         if cp.get("price") is not None:
             price = int(cp["price"])
-        # timestamp → aware UTC datetime
         if cp.get("priceUpdatedAt"):
             try:
                 updated_at_dt = datetime.fromisoformat(str(cp["priceUpdatedAt"]).replace("Z", "+00:00"))
@@ -215,7 +214,7 @@ def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
 # ------------------ HTTP ------------------ #
 async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
-        async with session.get(url, timeout=REQUEST_TO, headers=UA_HEADERS) as resp:
+        async with session.get(url, timeout=REQUEST_TIMEOUT, headers=UA_HEADERS) as resp:
             if resp.status != 200:
                 log.debug("GET %s -> %s", url, resp.status)
                 return None
@@ -226,7 +225,7 @@ async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[st
 
 async def fetch_price(session: aiohttp.ClientSession, numeric_id: str):
     try:
-        async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
+        async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TIMEOUT, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return (None, None, None, None, None)
             payload = await resp.json()
@@ -238,7 +237,7 @@ async def fetch_price(session: aiohttp.ClientSession, numeric_id: str):
 
 async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str) -> Dict[str, Optional[str]]:
     try:
-        async with session.get(META_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
+        async with session.get(META_API.format(numeric_id), timeout=REQUEST_TIMEOUT, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return {k: None for k in ("name","rating","version","image_url","player_slug","position","club","nation","league")}
             data = await resp.json()
@@ -308,7 +307,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         return
 
     async with aiohttp.ClientSession() as session:
-        batch: List[Tuple[
+        sub_batch: List[Tuple[
             Optional[int], Optional[str], Optional[str], Optional[str], Optional[str],
             Optional[str], Optional[int], Optional[str], Optional[str], Optional[str],
             Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[datetime],
@@ -316,6 +315,42 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         ]] = []
         skipped_bad = 0
         skipped_missing = 0
+        written_total = 0
+
+        async def flush():
+            nonlocal written_total, sub_batch
+            if not sub_batch:
+                return
+            try:
+                await conn.executemany(
+                    """
+                    UPDATE public.fut_players
+                    SET price            = COALESCE($1,  price),
+                        position         = COALESCE($2,  position),
+                        club             = COALESCE($3,  club),
+                        nation           = COALESCE($4,  nation),
+                        league           = COALESCE($5,  league),
+                        name             = COALESCE($6,  name),
+                        rating           = COALESCE($7,  rating),
+                        version          = COALESCE($8,  version),
+                        image_url        = COALESCE($9,  image_url),
+                        player_slug      = COALESCE($10, player_slug),
+                        player_url       = COALESCE($11, player_url),
+                        is_objective     = COALESCE($12, is_objective),
+                        is_untradeable   = COALESCE($13, is_untradeable),
+                        is_extinct       = COALESCE($14, is_extinct),
+                        price_updated_at = COALESCE($15, price_updated_at),
+                        created_at       = NOW() AT TIME ZONE 'UTC'
+                    WHERE id = $16
+                    """,
+                    sub_batch
+                )
+                written_total += len(sub_batch)
+                log.info("💾 Enriched chunk of %d (running total %d)", len(sub_batch), written_total)
+            except Exception as e:
+                log.error("❌ DB update failed for chunk of %d: %s", len(sub_batch), e)
+            finally:
+                sub_batch = []
 
         for cid in card_ids:
             if cid not in id_by_card:
@@ -339,7 +374,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
             player_slug = meta.get("player_slug")
             pretty_url = f"https://www.fut.gg/players/{numeric_id}/" + (f"{player_slug}/" if player_slug else "")
 
-            batch.append((
+            sub_batch.append((
                 price,
                 meta.get("position"),
                 meta.get("club"),
@@ -358,39 +393,14 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 id_by_card[cid]
             ))
 
-        if not batch:
-            log.info("ℹ️ Nothing to enrich for given batch. (Skipped %d malformed, %d missing rows)", skipped_bad, skipped_missing)
-            return
+            if len(sub_batch) >= UPDATE_CHUNK_SIZE:
+                await flush()
 
-        try:
-            await conn.executemany(
-                """
-                UPDATE public.fut_players
-                SET price            = COALESCE($1,  price),
-                    position         = COALESCE($2,  position),
-                    club             = COALESCE($3,  club),
-                    nation           = COALESCE($4,  nation),
-                    league           = COALESCE($5,  league),
-                    name             = COALESCE($6,  name),
-                    rating           = COALESCE($7,  rating),
-                    version          = COALESCE($8,  version),
-                    image_url        = COALESCE($9,  image_url),
-                    player_slug      = COALESCE($10, player_slug),
-                    player_url       = COALESCE($11, player_url),
-                    is_objective     = COALESCE($12, is_objective),
-                    is_untradeable   = COALESCE($13, is_untradeable),
-                    is_extinct       = COALESCE($14, is_extinct),
-                    price_updated_at = COALESCE($15, price_updated_at),
-                    created_at       = NOW() AT TIME ZONE 'UTC'
-                WHERE id = $16
-                """,
-                batch
-            )
-        except Exception as e:
-            log.error("❌ DB update failed for batch of %d: %s", len(batch), e)
-            return
+        # flush remainder
+        await flush()
 
-    log.info("✅ Enriched %d player(s). Skipped %d malformed card_id, %d missing rows.", len(batch), skipped_bad, skipped_missing)
+    log.info("✅ Enrichment done. Wrote %d row(s). Skipped %d malformed card_id, %d missing rows.",
+             written_total, skipped_bad, skipped_missing)
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
     total = 0
@@ -413,8 +423,9 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
                     image_url IS NULL OR image_url = '' OR
                     player_slug IS NULL OR player_slug = ''
                   )
-                LIMIT 1000
-                """
+                LIMIT $1
+                """,
+                BACKFILL_LIMIT
             )
         except Exception as e:
             log.error("❌ Backfill query failed: %s", e)
@@ -511,7 +522,7 @@ async def sleep_until_19_uk() -> None:
     log.info("🕖 Next new-player check scheduled for %s", target.isoformat())
     await asyncio.sleep(sleep_s)
 
-async def main() -> None:
+async def main_loop() -> None:
     # handle SIGTERM/SIGINT
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -537,9 +548,30 @@ async def main() -> None:
     if health_task:
         health_task.cancel()
 
+# ------------------ CLI ------------------ #
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--now", action="store_true", help="Run discovery+enrich+backfill once, then exit")
+    ap.add_argument("--backfill-only", action="store_true", help="Run only the backfill to completion, then exit")
+    args = ap.parse_args()
+
+    async def _run():
+        if args.backfill_only:
+            conn = await get_db()
+            try:
+                await preflight_check(conn)
+                await backfill_missing_meta(conn)
+            finally:
+                await conn.close()
+            return
+        if args.now:
+            await run_once()
+            return
+        await main_loop()
+
     try:
-        asyncio.run(main())
+        asyncio.run(_run())
     except Exception as e:
         print(f"FATAL: {e}", file=sys.stderr, flush=True)
         raise
