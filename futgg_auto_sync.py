@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Tuple
 
 # ------------------ CONFIG ------------------ #
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -23,10 +23,11 @@ NEW_URLS  = [
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
 
-NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))  # pages per URL
-REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))
+NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))         # pages per URL
+REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))  # seconds
+
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.2)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.3)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -57,7 +58,6 @@ logging.basicConfig(
 for h in logging.getLogger().handlers:
     h.addFilter(RateLimitFilter())
 log = logging.getLogger("new_players_sync")
-
 print(f"▶️ Starting: {os.path.basename(__file__)} | LOG_LEVEL={LOG_LEVEL}", flush=True)
 
 # ------------------ DB ------------------ #
@@ -65,28 +65,27 @@ async def get_db() -> asyncpg.Connection:
     return await asyncpg.connect(DATABASE_URL)
 
 async def preflight_check(conn: asyncpg.Connection) -> None:
-    """Ensure UNIQUE constraint or index exists for card_id (needed for ON CONFLICT)."""
-    q = """
-    SELECT 1
-    FROM pg_constraint c
-    JOIN pg_class t ON t.oid = c.conrelid
-    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
-    WHERE t.relname = 'fut_players'
-      AND c.contype = 'u'
-      AND a.attname = 'card_id'
-    UNION ALL
-    SELECT 1
-    FROM pg_indexes
-    WHERE tablename = 'fut_players'
-      AND indexdef ILIKE '%%UNIQUE%%(card_id%%)'
-    LIMIT 1;
-    """
-    ok = await conn.fetchval(q)
-    if not ok:
+    """Ensure table exists in 'public', and UNIQUE index on card_id exists."""
+    db = await conn.fetchval("SELECT current_database()")
+    user = await conn.fetchval("SELECT current_user")
+    schema = await conn.fetchval("SHOW search_path")
+    table_exists = await conn.fetchval("SELECT to_regclass('public.fut_players')")
+    if not table_exists:
+        raise RuntimeError(f"Table public.fut_players NOT found. db={db} user={user} search_path={schema}")
+
+    idx = await conn.fetchval("""
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname='public'
+          AND tablename='fut_players'
+          AND indexname='fut_players_card_id_key'
+    """)
+    if not idx:
         raise RuntimeError(
-            "UNIQUE constraint on fut_players(card_id) is missing. "
-            "Run the provided SQL to add it before starting this worker."
+            f"UNIQUE index fut_players_card_id_key NOT found on public.fut_players. "
+            f"db={db} user={user} search_path={schema}"
         )
+    log.info("✅ Preflight OK: db=%s | user=%s | search_path=%s | unique index present", db, user, schema)
 
 # ------------------ Helpers ------------------ #
 RX_HREF = re.compile(r'href=[\'\"]/players/(\d+)(?:/[^\'\"]*)?[\'\"]')
@@ -136,7 +135,7 @@ def extract_price(payload: dict) -> Optional[int]:
             return int(cp["price"])
     except Exception:
         pass
-    # data.prices.ps.lowest pattern (defensive)
+    # Defensive: data.prices.ps.lowest / .price / .LCPrice
     try:
         d = payload.get("data") or {}
         prices = d.get("prices") or {}
@@ -233,8 +232,9 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: Set[int]) ->
     if not numeric_ids:
         return []
     candidates = [f"25-{i}" for i in numeric_ids]
+
     have_rows = await conn.fetch(
-        "SELECT card_id FROM fut_players WHERE card_id = ANY($1::text[])",
+        "SELECT card_id FROM public.fut_players WHERE card_id = ANY($1::text[])",
         candidates
     )
     have = {r["card_id"] for r in have_rows}
@@ -242,10 +242,10 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: Set[int]) ->
     if not to_insert:
         return []
 
-    rows = [(cid, f"https://www.fut.gg/players/{cid.split('-')[1]}/") for cid in to_insert]
+    rows: List[Tuple[str, str]] = [(cid, f"https://www.fut.gg/players/{cid.split('-')[1]}/") for cid in to_insert]
     await conn.executemany(
         """
-        INSERT INTO fut_players (card_id, player_url)
+        INSERT INTO public.fut_players (card_id, player_url)
         VALUES ($1, $2)
         ON CONFLICT (card_id) DO NOTHING
         """,
@@ -257,7 +257,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
     if not card_ids:
         return
     rows = await conn.fetch(
-        "SELECT id, card_id FROM fut_players WHERE card_id = ANY($1::text[])",
+        "SELECT id, card_id FROM public.fut_players WHERE card_id = ANY($1::text[])",
         card_ids
     )
     id_by_card = {r["card_id"]: r["id"] for r in rows}
@@ -265,7 +265,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         return
 
     async with aiohttp.ClientSession() as session:
-        batch = []
+        batch: List[Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], datetime, int]] = []
         for cid in card_ids:
             numeric_id = cid.split("-")[1]
             price, meta = await asyncio.gather(
@@ -285,7 +285,7 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
 
         await conn.executemany(
             """
-            UPDATE fut_players
+            UPDATE public.fut_players
             SET price      = COALESCE($1, price),
                 position   = COALESCE($2, position),
                 club       = COALESCE($3, club),
@@ -303,7 +303,7 @@ async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
     rows = await conn.fetch(
         """
         SELECT id, card_id
-        FROM fut_players
+        FROM public.fut_players
         WHERE card_id IS NOT NULL
           AND (
             name IS NULL OR name = '' OR
