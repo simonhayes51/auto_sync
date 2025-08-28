@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import asyncpg
 import aiohttp
@@ -13,11 +14,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 PRICE_API = "https://www.fut.gg/api/fut/player-prices/25/{}"
 META_API  = "https://www.fut.gg/api/fut/player-item-definitions/25/{}"
-NEW_URL   = "https://www.fut.gg/players/new/?page={}"  # HTML pages
+NEW_URLS  = [
+    "https://www.fut.gg/players/new/?page={}",     # primary
+    "https://www.fut.gg/players/?sort=new&page={}" # fallback list view
+]
 
-NEW_PAGES     = 3            # How many /players/new pages to scan
-REQUEST_TO    = 12           # HTTP timeout (s)
-UA            = {"User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.0)"}
+NEW_PAGES     = int(os.getenv("NEW_PAGES", "5"))   # pages to scan per URL
+REQUEST_TO    = 15
+UA_HEADERS    = {
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.1)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://www.fut.gg/players/new/"
+}
+
+BATCH_SIZE = 100
 
 # ------------------ LOGGING ------------------ #
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -28,8 +41,10 @@ async def get_db():
     return await asyncpg.connect(DATABASE_URL)
 
 # ------------------ HELPERS ------------------ #
-ID_HREF = re.compile(r'href="\/players\/(\d+)\/?[^"]*"')
-ID_DATA = re.compile(r'\/players\/(\d+)')
+# Robust ID extraction patterns
+RX_HREF = re.compile(r'href=[\'\"]/players/(\d+)(?:/[^\'\"]*)?[\'\"]')
+RX_DATA = re.compile(r'data-player-id=[\'\"](\d+)[\'\"]')
+RX_ANY  = re.compile(r'/players/(\d+)(?:/|\b)')
 
 def normalize_name(obj, *keys):
     if obj is None:
@@ -44,10 +59,10 @@ def normalize_name(obj, *keys):
                 return v.strip()
     return None
 
-# ------------------ FETCHERS ------------------ #
+# ------------------ HTTP ------------------ #
 async def http_get_text(session: aiohttp.ClientSession, url: str) -> str | None:
     try:
-        async with session.get(url, timeout=REQUEST_TO, headers=UA) as resp:
+        async with session.get(url, timeout=REQUEST_TO, headers=UA_HEADERS) as resp:
             if resp.status != 200:
                 log.debug(f"GET {url} -> {resp.status}")
                 return None
@@ -58,7 +73,7 @@ async def http_get_text(session: aiohttp.ClientSession, url: str) -> str | None:
 
 async def fetch_price(session: aiohttp.ClientSession, numeric_id: str) -> int | None:
     try:
-        async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TO, headers=UA) as resp:
+        async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -70,13 +85,13 @@ async def fetch_price(session: aiohttp.ClientSession, numeric_id: str) -> int | 
 async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str):
     """Return dict(name, position, club, nation, league)."""
     try:
-        async with session.get(META_API.format(numeric_id), timeout=REQUEST_TO, headers=UA) as resp:
+        async with session.get(META_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
                 return {"name": None, "position": None, "club": None, "nation": None, "league": None}
             data = await resp.json()
 
-            name = (data.get("name") or
-                    normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
+            name = (data.get("name")
+                    or normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
 
             position = data.get("position") or data.get("bestPosition") or data.get("primaryPosition")
             if isinstance(position, dict):
@@ -103,40 +118,49 @@ async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str):
     except Exception:
         return {"name": None, "position": None, "club": None, "nation": None, "league": None}
 
-# ------------------ NEW PLAYERS DISCOVERY ------------------ #
+# ------------------ DISCOVERY ------------------ #
 async def discover_new_player_ids(session: aiohttp.ClientSession, pages: int = NEW_PAGES) -> set[int]:
-    """Scrape /players/new/?page=1..pages, collect numeric IDs from <a href="/players/{id}/...">."""
+    """
+    Scrape multiple URLs & pages, extract numeric IDs via several patterns.
+    Logs how many IDs found per page to help diagnose.
+    """
     found: set[int] = set()
-    for page in range(1, pages + 1):
-        url = NEW_URL.format(page)
-        html = await http_get_text(session, url)
-        if not html:
-            continue
-        html = unescape(html)
 
-        for m in ID_HREF.finditer(html):
-            try:
-                found.add(int(m.group(1)))
-            except Exception:
-                pass
-        for m in ID_DATA.finditer(html):
-            try:
-                found.add(int(m.group(1)))
-            except Exception:
-                pass
+    for base in NEW_URLS:
+        for page in range(1, pages + 1):
+            url = base.format(page)
+            html = await http_get_text(session, url)
+            if not html:
+                log.info(f"🔍 {url}: no HTML")
+                continue
+
+            html = unescape(html)
+            before = len(found)
+
+            for rx in (RX_HREF, RX_DATA, RX_ANY):
+                for m in rx.finditer(html):
+                    try:
+                        found.add(int(m.group(1)))
+                    except Exception:
+                        pass
+
+            added = len(found) - before
+            log.info(f"🔎 {url}: +{added} ids (total {len(found)})")
+
     return found
 
-# ------------------ UPSERT + ENRICH NEW PLAYERS ------------------ #
+# ------------------ UPSERT / ENRICH ------------------ #
 async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: set[int]) -> list[str]:
-    """Insert any missing players. Returns a list of *card_id* strings ("25-{id}") that were newly inserted."""
+    """Insert any missing players. Returns list of new card_ids ("25-{id}")."""
     if not numeric_ids:
         return []
-
     candidates = [f"25-{i}" for i in numeric_ids]
-    have_rows = await conn.fetch("SELECT card_id FROM fut_players WHERE card_id = ANY($1::text[]);", candidates)
+    have_rows = await conn.fetch(
+        "SELECT card_id FROM fut_players WHERE card_id = ANY($1::text[])",
+        candidates
+    )
     have = {r["card_id"] for r in have_rows}
     to_insert = [cid for cid in candidates if cid not in have]
-
     if not to_insert:
         return []
 
@@ -151,14 +175,13 @@ async def upsert_new_players(conn: asyncpg.Connection, numeric_ids: set[int]) ->
     )
     return to_insert
 
-async def enrich_just_added(conn: asyncpg.Connection, just_added_card_ids: list[str]):
-    """Fetch name/meta/price for newly inserted card_ids only."""
-    if not just_added_card_ids:
+async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: list[str]):
+    """Fetch name/meta/price for the given card_ids."""
+    if not card_ids:
         return
-
     rows = await conn.fetch(
-        "SELECT id, card_id FROM fut_players WHERE card_id = ANY($1::text[]);",
-        just_added_card_ids
+        "SELECT id, card_id FROM fut_players WHERE card_id = ANY($1::text[])",
+        card_ids
     )
     id_by_card = {r["card_id"]: r["id"] for r in rows}
     if not id_by_card:
@@ -166,13 +189,12 @@ async def enrich_just_added(conn: asyncpg.Connection, just_added_card_ids: list[
 
     async with aiohttp.ClientSession() as session:
         batch = []
-        for cid in just_added_card_ids:
+        for cid in card_ids:
             numeric_id = cid.split("-")[1]
             price, meta = await asyncio.gather(
                 fetch_price(session, numeric_id),
                 fetch_meta(session, numeric_id)
             )
-
             batch.append((
                 price,
                 meta.get("position"),
@@ -180,7 +202,7 @@ async def enrich_just_added(conn: asyncpg.Connection, just_added_card_ids: list[
                 meta.get("nation"),
                 meta.get("league"),
                 meta.get("name"),
-                datetime.now(timezone.utc),  # keep using created_at
+                datetime.now(timezone.utc),
                 id_by_card[cid]
             ))
 
@@ -199,19 +221,53 @@ async def enrich_just_added(conn: asyncpg.Connection, just_added_card_ids: list[
             batch
         )
 
+async def backfill_missing_meta(conn: asyncpg.Connection):
+    """
+    For existing rows with missing name/position/club/nation/league, fetch meta (and price).
+    Runs even if zero new players were found.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, card_id
+        FROM fut_players
+        WHERE card_id IS NOT NULL
+          AND (
+            name   IS NULL OR name = '' OR
+            position IS NULL OR position = '' OR
+            club     IS NULL OR club = '' OR
+            nation   IS NULL OR nation = '' OR
+            league   IS NULL OR league = ''
+          )
+        LIMIT 1000
+        """
+    )
+    if not rows:
+        log.info("ℹ️ No rows need meta backfill.")
+        return
+
+    card_ids = [r["card_id"] for r in rows]
+    log.info(f"🧩 Backfilling meta for {len(card_ids)} existing players...")
+    await enrich_by_card_ids(conn, card_ids)
+
 # ------------------ ONE-CYCLE TASK ------------------ #
 async def run_once():
     conn = await get_db()
     try:
+        # 1) Discover & insert any new players
         async with aiohttp.ClientSession() as session:
             new_ids = await discover_new_player_ids(session, pages=NEW_PAGES)
         added_card_ids = await upsert_new_players(conn, new_ids)
+
         if added_card_ids:
             log.info(f"🆕 Inserted {len(added_card_ids)} new players.")
-            await enrich_just_added(conn, added_card_ids)
+            await enrich_by_card_ids(conn, added_card_ids)
             log.info("✅ Enriched newly added players.")
         else:
-            log.info("ℹ️ No new players found.")
+            log.info("ℹ️ No new players found from discovery.")
+
+        # 2) Always try to backfill missing meta on existing rows
+        await backfill_missing_meta(conn)
+
     finally:
         await conn.close()
 
