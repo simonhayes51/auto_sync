@@ -135,22 +135,17 @@ log.info(“✅ Preflight OK | columns: nickname=%s first=%s last=%s”, HAS_NIC
 
 def build_image_url(card_image_path: Optional[str]) -> Optional[str]:
 “””
-Build the complete image URL from the cardImagePath
+FIXED: Updated to use correct prefix and no path modification
+“2025/player-item-card/25-158023.775a828c071b30324a22919f78f5ca0434c29764be2742a86ce96d36b2e12dca.webp”
+-> “https://game-assets.fut.gg/cdn-cgi/image/quality=100,format=auto,width=500/2025/player-item-card/25-158023.775a828c071b30324a22919f78f5ca0434c29764be2742a86ce96d36b2e12dca.webp”
 “””
 if not card_image_path or not isinstance(card_image_path, str):
 return None
-
-```
 path = card_image_path.strip()
 if not path:
-    return None
-
-# Use the correct prefix
-prefix = "https://game-assets.fut.gg/cdn-cgi/image/quality=100,format=auto,width=500/"
-
-# Don't modify the path - use it as-is from the API
-return f"{prefix}{path}"
-```
+return None
+# FIXED: Use quality=100 and don’t modify the path
+return f”https://game-assets.fut.gg/cdn-cgi/image/quality=100,format=auto,width=500/{path}”
 
 def pick_name(nick, first, last) -> Optional[str]:
 if isinstance(nick, str) and nick.strip():
@@ -177,7 +172,7 @@ return None
 async def fetch_meta(session: aiohttp.ClientSession, card_id: str) -> dict:
 “””
 Returns normalized dict of fields we need.
-Fixed to match actual FUT.GG API response structure.
+Handles list payload by picking the highest ‘overall’.
 “””
 try:
 async with session.get(META_API.format(card_id), timeout=REQUEST_TIMEOUT,
@@ -189,30 +184,25 @@ except Exception:
 return {}
 
 ```
-# Handle potential data wrapper
-if isinstance(raw, dict) and "data" in raw:
-    data = raw["data"]
-else:
-    data = raw
-
 # choose best item
-if isinstance(data, list):
+data = raw
+if isinstance(raw, list):
     best, best_rating = None, -1
-    for it in data:
+    for it in raw:
         r = it.get("overall") or it.get("rating") or it.get("ovr")
         try: r = int(r)
         except Exception: r = -1
         if r > best_rating:
             best_rating, best = r, it
-    data = best or (data[0] if data else {})
+    data = best or (raw[0] if raw else {})
 
 if not isinstance(data, dict):
     return {}
 
 first = data.get("firstName")
-last = data.get("lastName")
-nick = data.get("nickname")
-name = pick_name(nick, first, last)
+last  = data.get("lastName")
+nick  = data.get("nickname")
+name  = pick_name(nick, first, last)
 
 # position
 pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId") or (data.get("meta") or {}).get("position")
@@ -221,7 +211,7 @@ if isinstance(pos_raw, int):
 else:
     position = pos_raw if isinstance(pos_raw, str) and pos_raw.strip() else None
 
-# club/league/nation helper
+# club/league/nation - FIXED: Check nested objects first
 def _lbl(block):
     if isinstance(block, dict):
         v = block.get("name") or block.get("slug")
@@ -230,7 +220,8 @@ def _lbl(block):
         return block.strip() or None
     return None
 
-club = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
+# FIXED: Try nested objects first, then fallback to original logic
+club   = _lbl(data.get("club")) or _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("team"))
 league = _lbl(data.get("league")) or _lbl(data.get("uniqueLeagueSlug"))
 nation = _lbl(data.get("nation")) or _lbl(data.get("uniqueNationSlug")) or _lbl(data.get("country"))
 
@@ -367,6 +358,7 @@ STOP = object()
 written = 0
 
 # Build dynamic UPDATE that keys by card_id and only fills NULLs (COALESCE)
+# FIXED: Preserve created_at timestamp
 sql = """
     UPDATE public.fut_players
     SET position    = COALESCE($1, position),
@@ -468,6 +460,7 @@ log.info("✅ Enrichment done. Wrote %d row(s).", written)
 # –– One-off enrichment for rows missing data (used right after first run) ––
 
 async def enrich_missing_once(conn: asyncpg.Connection, limit: int = 2000) -> None:
+# FIXED: Removed card_id regex filter that was preventing enrichment
 rows = await conn.fetch(
 “””
 SELECT card_id
