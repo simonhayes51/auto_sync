@@ -14,11 +14,28 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List, Set
 from aiohttp import web  # health server
 
-# ================== CONFIG ==================
+# Add startup debugging
 
+print(“🚀 Script starting…”, flush=True)
+try:
 DATABASE_URL = os.getenv(“DATABASE_URL”)
+print(f”📊 DATABASE_URL exists: {bool(DATABASE_URL)}”, flush=True)
+
+```
 if not DATABASE_URL:
-raise RuntimeError(“DATABASE_URL is not set”)
+    print("❌ DATABASE_URL is not set!", flush=True)
+    sys.exit(1)
+
+PORT = os.getenv("PORT", "8080")
+print(f"🌐 PORT: {PORT}", flush=True)
+print("✅ Environment check passed", flush=True)
+```
+
+except Exception as e:
+print(f”💥 Startup error: {e}”, flush=True)
+sys.exit(1)
+
+# ================== CONFIG ==================
 
 META_API = “https://www.fut.gg/api/fut/player-item-definitions/25/{}”
 LISTING_URLS = [
@@ -609,6 +626,7 @@ log.info(“🕖 Next new-player check scheduled for %s”, target.isoformat())
 await asyncio.sleep((target - now).total_seconds())
 
 async def main_loop():
+print(“🔄 Starting main loop…”, flush=True)
 loop = asyncio.get_running_loop()
 for s in (signal.SIGTERM, signal.SIGINT):
 try:
@@ -619,7 +637,13 @@ pass
 ```
 health_task = None
 if os.getenv("PORT"):
-    health_task = await start_health()
+    print("🏥 Starting health server...", flush=True)
+    try:
+        health_task = await start_health()
+        print("✅ Health server started successfully", flush=True)
+    except Exception as e:
+        print(f"❌ Health server failed to start: {e}", flush=True)
+        raise
 
 while not shutdown_evt.is_set():
     log.info("🚦 Cycle start")
@@ -634,17 +658,34 @@ if health_task:
 # ================== CLI ==================
 
 if **name** == “**main**”:
+print(“🎯 Main execution starting…”, flush=True)
 import argparse
 ap = argparse.ArgumentParser()
 ap.add_argument(”–now”, action=“store_true”, help=“Run discovery+insert+enrich once and exit”)
 args = ap.parse_args()
+print(f”📝 Arguments: –now={args.now}”, flush=True)
 
 ```
 async def _runner():
-    if args.now:
-        await run_once()
-    else:
-        await main_loop()
+    try:
+        if args.now:
+            print("🏃 Running once and exiting...", flush=True)
+            await run_once()
+        else:
+            print("🔁 Starting main loop...", flush=True)
+            await main_loop()
+    except Exception as e:
+        print(f"💥 Runner error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
 
-asyncio.run(_runner())
+print("🚀 Starting asyncio runner...", flush=True)
+try:
+    asyncio.run(_runner())
+except Exception as e:
+    print(f"💥 Asyncio error: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 ```
