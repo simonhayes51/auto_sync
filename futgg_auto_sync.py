@@ -27,7 +27,7 @@ NEW_PAGES   = int(os.getenv("NEW_PAGES", "5"))         # pages per URL
 REQUEST_TO  = int(os.getenv("REQUEST_TIMEOUT", "15"))  # seconds
 
 UA_HEADERS  = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.3)",
+    "User-Agent": "Mozilla/5.0 (compatible; NewPlayersSync/1.5)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -35,10 +35,11 @@ UA_HEADERS  = {
     "Referer": "https://www.fut.gg/players/new/"
 }
 
-# ------------------ LOGGING (rate-limited) ------------------ #
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "300"))  # identical messages throttled within this window
+LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "300"))
+LOG_FULL_PAYLOADS = os.getenv("LOG_FULL_PAYLOADS") == "1"
 
+# ------------------ LOGGING (rate-limited) ------------------ #
 class RateLimitFilter(logging.Filter):
     _last = {}
     def filter(self, record: logging.LogRecord) -> bool:
@@ -65,7 +66,6 @@ async def get_db() -> asyncpg.Connection:
     return await asyncpg.connect(DATABASE_URL)
 
 async def preflight_check(conn: asyncpg.Connection) -> None:
-    """Ensure table exists in 'public', and UNIQUE index on card_id exists."""
     db = await conn.fetchval("SELECT current_database()")
     user = await conn.fetchval("SELECT current_user")
     schema = await conn.fetchval("SHOW search_path")
@@ -76,15 +76,11 @@ async def preflight_check(conn: asyncpg.Connection) -> None:
     idx = await conn.fetchval("""
         SELECT indexname
         FROM pg_indexes
-        WHERE schemaname='public'
-          AND tablename='fut_players'
+        WHERE schemaname='public' AND tablename='fut_players'
           AND indexname='fut_players_card_id_key'
     """)
     if not idx:
-        raise RuntimeError(
-            f"UNIQUE index fut_players_card_id_key NOT found on public.fut_players. "
-            f"db={db} user={user} search_path={schema}"
-        )
+        raise RuntimeError("UNIQUE index fut_players_card_id_key missing on public.fut_players")
     log.info("✅ Preflight OK: db=%s | user=%s | search_path=%s | unique index present", db, user, schema)
 
 # ------------------ Helpers ------------------ #
@@ -105,48 +101,108 @@ def normalize_name(obj, *keys) -> Optional[str]:
                 return v.strip()
     return None
 
-def extract_price(payload: dict) -> Optional[int]:
+def pick_first(d: dict, keys: List[str]):
+    for k in keys:
+        if k in d and d[k] not in (None, "", []):
+            return d[k]
+    return None
+
+def extract_price_and_flags(payload: dict) -> Tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool], Optional[datetime]]:
+    price = None
+    is_objective = None
+    is_untradeable = None
+    is_extinct = None
+    updated_at = None
+
     if not isinstance(payload, dict):
-        return None
-    # Legacy shape
+        return price, is_objective, is_untradeable, is_extinct, updated_at
+
+    # Legacy LCPrice (ps/xbox)
     try:
         ps = (payload.get("ps") or {}).get("LCPrice")
         xb = (payload.get("xbox") or {}).get("LCPrice")
-        if ps: return int(ps)
-        if xb: return int(xb)
+        if ps: price = int(ps)
+        elif xb: price = int(xb)
     except Exception:
         pass
-    # GraphQL-ish: data.currentPrice.price
+
+    # GraphQL-ish currentPrice
     try:
-        d = payload.get("data") or {}
+        d = payload.get("data") or payload
         cp = d.get("currentPrice") or {}
-        if cp.get("isExtinct") is True:
-            return None
-        if "price" in cp and cp["price"] is not None:
-            return int(cp["price"])
+        if "isObjective" in cp:   is_objective   = bool(cp.get("isObjective"))
+        if "isUntradeable" in cp: is_untradeable = bool(cp.get("isUntradeable"))
+        if "isExtinct" in cp:     is_extinct     = bool(cp.get("isExtinct"))
+        if cp.get("price") is not None:
+            price = int(cp["price"])
+        if cp.get("priceUpdatedAt"):
+            try:
+                updated_at = datetime.fromisoformat(cp["priceUpdatedAt"].replace("Z", "+00:00"))
+            except Exception:
+                updated_at = None
     except Exception:
         pass
-    # Top-level currentPrice
+
+    return price, is_objective, is_untradeable, is_extinct, updated_at
+
+def extract_meta_fields(data: dict) -> Dict[str, Optional[str]]:
+    """
+    Return: name, rating(int->str), version, image_url, player_slug, position, club, nation, league
+    Works defensively across possible shapes.
+    """
+    if not isinstance(data, dict):
+        return {k: None for k in ("name","rating","version","image_url","player_slug","position","club","nation","league")}
+
+    # Name
+    name = (data.get("name")
+            or normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
+
+    # Rating
+    rating_val = pick_first(data, ["rating", "overall", "overallRating", "ovr"])
     try:
-        cp = payload.get("currentPrice") or {}
-        if cp.get("isExtinct") is True:
-            return None
-        if "price" in cp and cp["price"] is not None:
-            return int(cp["price"])
+        rating = int(rating_val) if rating_val is not None else None
     except Exception:
-        pass
-    # Defensive: data.prices.ps.lowest / .price / .LCPrice
-    try:
-        d = payload.get("data") or {}
-        prices = d.get("prices") or {}
-        for k in ("ps", "xbox", "pc"):
-            v = prices.get(k) or {}
-            for key in ("lowest", "LCPrice", "price"):
-                if key in v and v[key] is not None:
-                    return int(v[key])
-    except Exception:
-        pass
-    return None
+        rating = None
+
+    # Version / card type
+    version = pick_first(data, ["version", "cardType", "rarity", "program", "itemType"])
+
+    # Image URL
+    image_url = (pick_first(data, ["imageUrl", "imageURL", "imgUrl", "imgURL"])
+                 or (isinstance(data.get("image"), dict) and pick_first(data["image"], ["url", "href"])))
+
+    # Slug
+    player_slug = pick_first(data, ["slug", "seoName", "urlName", "pathSegment"])
+
+    # Position / club / nation / league
+    position = data.get("position") or data.get("bestPosition") or data.get("primaryPosition")
+    if isinstance(position, dict):
+        position = normalize_name(position, "code", "name")
+    meta = data.get("meta") or data.get("item") or {}
+
+    club   = normalize_name(data.get("club")   or data.get("team"),   "name", "shortName") \
+             or normalize_name(meta.get("club"), "name", "shortName")
+    nation = normalize_name(data.get("nation") or data.get("country"), "name", "shortName") \
+             or normalize_name(meta.get("nation"), "name", "shortName")
+    league = normalize_name(data.get("league"), "name", "shortName") \
+             or normalize_name(meta.get("league"), "name", "shortName")
+    if not position and isinstance(meta.get("position"), dict):
+        position = normalize_name(meta.get("position"), "code", "name")
+    elif not position:
+        position = meta.get("position")
+
+    # Cast rating to str? Your table defined rating INT — we’ll keep INT in DB.
+    return {
+        "name": (name or "").strip() or None,
+        "rating": rating,
+        "version": (version or "").strip() or None,
+        "image_url": (image_url or "").strip() or None,
+        "player_slug": (player_slug or "").strip() or None,
+        "position": (position or "").strip() or None,
+        "club": (club or "").strip() or None,
+        "nation": (nation or "").strip() or None,
+        "league": (league or "").strip() or None,
+    }
 
 # ------------------ HTTP ------------------ #
 async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
@@ -160,50 +216,29 @@ async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[st
         log.debug("GET %s exception: %s", url, e)
         return None
 
-async def fetch_price(session: aiohttp.ClientSession, numeric_id: str) -> Optional[int]:
+async def fetch_price(session: aiohttp.ClientSession, numeric_id: str):
     try:
         async with session.get(PRICE_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
-                return None
+                return (None, None, None, None, None)
             payload = await resp.json()
-            return extract_price(payload)
+            if LOG_FULL_PAYLOADS:
+                log.debug("FUT.GG price payload for %s: %s", numeric_id, payload)
+            return extract_price_and_flags(payload)
     except Exception:
-        return None
+        return (None, None, None, None, None)
 
 async def fetch_meta(session: aiohttp.ClientSession, numeric_id: str) -> Dict[str, Optional[str]]:
     try:
         async with session.get(META_API.format(numeric_id), timeout=REQUEST_TO, headers={"User-Agent": UA_HEADERS["User-Agent"]}) as resp:
             if resp.status != 200:
-                return {"name": None, "position": None, "club": None, "nation": None, "league": None}
+                return {k: None for k in ("name","rating","version","image_url","player_slug","position","club","nation","league")}
             data = await resp.json()
-
-            name = (data.get("name") or
-                    normalize_name(data.get("player") or data.get("item"), "name", "fullName"))
-
-            position = data.get("position") or data.get("bestPosition") or data.get("primaryPosition")
-            if isinstance(position, dict):
-                position = normalize_name(position, "code", "name")
-
-            club   = normalize_name(data.get("club")   or data.get("team"),   "name", "shortName")
-            nation = normalize_name(data.get("nation") or data.get("country"), "name", "shortName")
-            league = normalize_name(data.get("league"), "name", "shortName")
-
-            meta = data.get("meta") or data.get("item") or {}
-            if isinstance(meta.get("position"), dict) and not position:
-                position = normalize_name(meta.get("position"), "code", "name")
-            club   = club   or normalize_name(meta.get("club")  , "name", "shortName")
-            nation = nation or normalize_name(meta.get("nation"), "name", "shortName")
-            league = league or normalize_name(meta.get("league"), "name", "shortName")
-
-            return {
-                "name": (name or "").strip() or None,
-                "position": (position or "").strip() or None,
-                "club": (club or "").strip() or None,
-                "nation": (nation or "").strip() or None,
-                "league": (league or "").strip() or None,
-            }
+            if LOG_FULL_PAYLOADS:
+                log.debug("FUT.GG meta payload for %s: %s", numeric_id, data)
+            return extract_meta_fields(data)
     except Exception:
-        return {"name": None, "position": None, "club": None, "nation": None, "league": None}
+        return {k: None for k in ("name","rating","version","image_url","player_slug","position","club","nation","league")}
 
 # ------------------ Discovery ------------------ #
 async def discover_new_player_ids(session: aiohttp.ClientSession, pages: int) -> Set[int]:
@@ -265,13 +300,22 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
         return
 
     async with aiohttp.ClientSession() as session:
-        batch: List[Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], datetime, int]] = []
+        batch: List[Tuple[
+            Optional[int], Optional[str], Optional[str], Optional[str], Optional[str],
+            Optional[str], Optional[int], Optional[str], Optional[str], Optional[str],
+            Optional[str], Optional[bool], Optional[bool], Optional[bool], Optional[datetime],
+            datetime, int
+        ]] = []
         for cid in card_ids:
             numeric_id = cid.split("-")[1]
-            price, meta = await asyncio.gather(
+            (price, is_obj, is_untrad, is_ext, price_ts), meta = await asyncio.gather(
                 fetch_price(session, numeric_id),
                 fetch_meta(session, numeric_id)
             )
+            # If we obtained a slug, we can refine player_url
+            player_slug = meta.get("player_slug")
+            pretty_url = f"https://www.fut.gg/players/{numeric_id}/" + (f"{player_slug}/" if player_slug else "")
+
             batch.append((
                 price,
                 meta.get("position"),
@@ -279,48 +323,77 @@ async def enrich_by_card_ids(conn: asyncpg.Connection, card_ids: List[str]) -> N
                 meta.get("nation"),
                 meta.get("league"),
                 meta.get("name"),
-                datetime.now(timezone.utc),  # write to created_at
+                meta.get("rating"),
+                meta.get("version"),
+                meta.get("image_url"),
+                player_slug,
+                pretty_url,
+                is_obj,
+                is_untrad,
+                is_ext,
+                price_ts,
+                datetime.now(timezone.utc),  # created_at (per your preference)
                 id_by_card[cid]
             ))
 
         await conn.executemany(
             """
             UPDATE public.fut_players
-            SET price      = COALESCE($1, price),
-                position   = COALESCE($2, position),
-                club       = COALESCE($3, club),
-                nation     = COALESCE($4, nation),
-                league     = COALESCE($5, league),
-                name       = COALESCE($6, name),
-                created_at = $7
-            WHERE id = $8
+            SET price            = COALESCE($1,  price),
+                position         = COALESCE($2,  position),
+                club             = COALESCE($3,  club),
+                nation           = COALESCE($4,  nation),
+                league           = COALESCE($5,  league),
+                name             = COALESCE($6,  name),
+                rating           = COALESCE($7,  rating),
+                version          = COALESCE($8,  version),
+                image_url        = COALESCE($9,  image_url),
+                player_slug      = COALESCE($10, player_slug),
+                player_url       = COALESCE($11, player_url),
+                is_objective     = COALESCE($12, is_objective),
+                is_untradeable   = COALESCE($13, is_untradeable),
+                is_extinct       = COALESCE($14, is_extinct),
+                price_updated_at = COALESCE($15, price_updated_at),
+                created_at       = $16
+            WHERE id = $17
             """,
             batch
         )
     log.info("✅ Enriched %d player(s).", len(card_ids))
 
 async def backfill_missing_meta(conn: asyncpg.Connection) -> None:
-    rows = await conn.fetch(
-        """
-        SELECT id, card_id
-        FROM public.fut_players
-        WHERE card_id IS NOT NULL
-          AND (
-            name IS NULL OR name = '' OR
-            position IS NULL OR position = '' OR
-            club IS NULL OR club = '' OR
-            nation IS NULL OR nation = '' OR
-            league IS NULL OR league = ''
-          )
-        LIMIT 1000
-        """
-    )
-    if not rows:
-        log.info("ℹ️ No rows need meta backfill.")
-        return
-    card_ids = [r["card_id"] for r in rows]
-    log.info("🧩 Backfilling meta for %d existing players…", len(card_ids))
-    await enrich_by_card_ids(conn, card_ids)
+    total = 0
+    while True:
+        rows = await conn.fetch(
+            """
+            SELECT id, card_id
+            FROM public.fut_players
+            WHERE card_id IS NOT NULL
+              AND (
+                name IS NULL OR name = '' OR
+                position IS NULL OR position = '' OR
+                club IS NULL OR club = '' OR
+                nation IS NULL OR nation = '' OR
+                league IS NULL OR league = '' OR
+                rating IS NULL OR
+                version IS NULL OR version = '' OR
+                image_url IS NULL OR image_url = '' OR
+                player_slug IS NULL OR player_slug = ''
+              )
+            LIMIT 1000
+            """
+        )
+        if not rows:
+            if total == 0:
+                log.info("ℹ️ No rows need meta backfill.")
+            else:
+                log.info("✅ Backfill complete (%d players updated).", total)
+            return
+
+        card_ids = [r["card_id"] for r in rows]
+        total += len(card_ids)
+        log.info("🧩 Backfilling meta for %d players (running total %d)…", len(card_ids), total)
+        await enrich_by_card_ids(conn, card_ids)
 
 # ------------------ One-cycle task ------------------ #
 async def run_once() -> None:
@@ -374,7 +447,6 @@ if __name__ == "__main__":
     if args.now:
         asyncio.run(run_once())
     else:
-        # Run once immediately, then schedule daily at 19:00 UK
         try:
             asyncio.run(run_once())
         finally:
