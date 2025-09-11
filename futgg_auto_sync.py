@@ -19,7 +19,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-META_API = "https://www.fut.gg/api/fut/player-item-definitions/25/{}"
+META_API = "https://www.fut.gg/api/fut/player-item-definitions/26/{}"
 LISTING_URLS = [
     "https://www.fut.gg/players/new/?page={}",
     "https://www.fut.gg/players/?sort=new&page={}",
@@ -212,8 +212,8 @@ def parse_player_data(raw: dict, card_id: str) -> dict:
     }
 
 # ================== DISCOVERY ================== #
-RX_HREF_SLUG_CARD = re.compile(r'href=[\'\"]/players/([0-9a-z\-]+)/25-(\d+)', re.I)
-RX_HREF_CARD_ONLY = re.compile(r'href=[\'\"]/players/(?:25-)?(\d+)', re.I)
+RX_HREF_SLUG_CARD = re.compile(r'href=[\'\"]/players/([0-9a-z\-]+)/26-(\d+)', re.I)
+RX_HREF_CARD_ONLY = re.compile(r'href=[\'\"]/players/(?:26-)?(\d+)', re.I)
 
 async def http_get_text(session, url):
     try:
