@@ -33,8 +33,8 @@ def parse_alt_text(alt_text):
 def extract_card_id(image_url: str):
     """Extract card_id from FUT.GG image URL"""
     try:
-        # Example: https://game-assets.fut.gg/.../futgg-player-item-card/"25-100855415"
-        return image_url.split("/")[-1].replace('"', '').replace('25-', '')
+        # Example: https://game-assets.fut.gg/.../futgg-player-item-card/"26-100855415"
+        return image_url.split("/")[-1].replace('"', '').replace('26-', '')
     except:
         return None
 
