@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # FUT.GG player pages
 FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
 
-# Railway DB URL
+# Railway DB URL 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
