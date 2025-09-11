@@ -10,7 +10,8 @@ from typing import Optional, Tuple, List, Dict
 
 # ---- Config -------------------------------------------------
 SEASON = "26"
-FUTGG_BASE_URL = f"https://www.fut.gg/{SEASON}/players/?page={{}}"
+FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
+DEF_API = "https://www.fut.gg/api/fut/player-item-definitions/{season}/{card_id}/"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -21,7 +22,7 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
 # Match ".../26-247333.webp" (or 25-....) and capture season + id
-CARD_ID_RE = re.compile(r"/(?P<season>\d{2})-(?P<id>\d+)\b")
+IMG_SEASON_ID_RE = re.compile(r"/(?P<season>\d{2})-(?P<id>\d+)\b")
 
 
 # ---- Helpers ------------------------------------------------
@@ -41,15 +42,6 @@ def parse_alt_text(alt_text: str) -> Tuple[str, Optional[int], str]:
     return alt_text.strip(), None, ""
 
 
-def parse_season_and_id(url: str) -> Tuple[Optional[str], Optional[str]]:
-    if not url:
-        return None, None
-    m = CARD_ID_RE.search(url)
-    if not m:
-        return None, None
-    return m.group("season"), m.group("id")
-
-
 def pick_from_srcset(img_tag) -> Optional[str]:
     """Prefer the highest-res candidate from srcset; else src/data-src."""
     if not img_tag:
@@ -57,28 +49,47 @@ def pick_from_srcset(img_tag) -> Optional[str]:
     srcset = (img_tag.get("srcset") or "").strip()
     if srcset:
         try:
-            # take the last candidate (usually largest width)
             return srcset.split(",")[-1].split(" ")[0].strip()
         except Exception:
             pass
     return img_tag.get("src") or img_tag.get("data-src")
 
 
+def parse_img_season_id(url: str) -> Tuple[Optional[str], Optional[str]]:
+    if not url:
+        return None, None
+    m = IMG_SEASON_ID_RE.search(url)
+    if not m:
+        return None, None
+    return m.group("season"), m.group("id")
+
+
+def href_card_id(href: str) -> Optional[str]:
+    """
+    /players/231443/erling-haaland/  -> "231443"
+    /players/231443/ -> "231443"
+    """
+    if not href:
+        return None
+    parts = [p for p in href.split("/") if p]
+    # Expect: ['players', '<id>', '<slug?>']
+    if len(parts) >= 2 and parts[0] == "players" and parts[1].isdigit():
+        return parts[1]
+    return None
+
+
 def get_detail_image_url(player_url: str) -> Optional[str]:
     """
-    Fetch the player's detail page and return the main card image (season-correct if available).
-    Tries <meta property="og:image"> first, then a prominent <img>.
+    Fetch player detail page; prefer <meta property="og:image"> then a prominent <img>.
     """
     try:
         r = SESSION.get(player_url, timeout=20)
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-
         og = soup.select_one('meta[property="og:image"]')
         if og and og.get("content"):
             return og["content"]
-
         img = soup.select_one('img[alt][src*="-"]')
         if img:
             from_srcset = pick_from_srcset(img)
@@ -90,9 +101,26 @@ def get_detail_image_url(player_url: str) -> Optional[str]:
     return None
 
 
+def is_fc26_by_def_api(card_id: str) -> bool:
+    """
+    Check FC26 definitions API. If 200, we treat this card_id as FC26.
+    """
+    try:
+        url = DEF_API.format(season=SEASON, card_id=card_id)
+        r = SESSION.get(url, timeout=15)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def fetch_players_from_page(page_number: int) -> List[Dict]:
     """
-    Scrape one seasoned fut.gg list page. Only returns FC26 tiles; fixes 25 thumbnails.
+    Scrape the generic /players/ list page, but only return FC26 cards.
+    Strategy:
+      - iterate anchors under /players/
+      - get card_id from href (authoritative)
+      - verify FC26 via definitions API
+      - ensure image URL is season 26 (fix via detail page if needed)
     """
     url = FUTGG_BASE_URL.format(page_number)
     print(f"🌐 Fetching: {url}")
@@ -108,49 +136,60 @@ def fetch_players_from_page(page_number: int) -> List[Dict]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Only FC26 links
-    cards = soup.select(f'a[href^="/{SEASON}/players/"]')
+    # Generic anchors (seasonless)
+    cards = soup.select('a[href^="/players/"]')
 
-    players = []
+    players: List[Dict] = []
     for a in cards:
         try:
-            img = a.select_one("img[alt]")
-            if not img:
-                continue
-
-            img_url = pick_from_srcset(img) or ""
-            alt_text = img.get("alt", "").strip()
-            name, rating, version = parse_alt_text(alt_text)
-            if not rating:
-                continue
-
             href = a.get("href") or ""
-            player_url = f"https://www.fut.gg{href}"  # already /26/players/...
-            parts = [p for p in href.split("/") if p]  # 0=26,1=players,2=id,3=slug
-            player_slug = parts[3] if len(parts) >= 4 else None
+            cid = href_card_id(href)
+            if not cid:
+                continue
 
-            season, card_id = parse_season_and_id(img_url)
+            # Must be FC26:
+            if not is_fc26_by_def_api(cid):
+                continue
 
-            # If grid gave a 25 image (or unknown), fix it from the detail page
-            if season != SEASON:
+            img = a.select_one("img[alt]") or a.find("img")
+            img_url = pick_from_srcset(img) if img else ""
+
+            # If grid shows FC25 or unknown season, fix via detail page:
+            season_in_img, _ = parse_img_season_id(img_url) if img_url else (None, None)
+            player_url = f"https://www.fut.gg{href}" if href.startswith("/") else href
+
+            if season_in_img != SEASON:
                 fixed = get_detail_image_url(player_url)
                 if fixed:
                     img_url = fixed
-                    season, card_id = parse_season_and_id(img_url)
+                    season_in_img, _ = parse_img_season_id(img_url)
 
-            # Still not FC26 or no id? Skip.
-            if season != SEASON or not card_id:
+            # If still not a 26 image, we keep the row (since FC26 is confirmed by API),
+            # but we prefer to only store 26 images. If not 26, skip to be strict:
+            if season_in_img != SEASON:
+                # Strict mode: skip if we couldn't obtain a 26 image
                 continue
+
+            alt_text = (img.get("alt", "").strip() if img else "") or ""
+            name, rating, version = parse_alt_text(alt_text)
+            # If rating missing in alt, leave as None-safe skip
+            if not rating:
+                # Some tiles might not have rating in alt; still skip to keep DB clean
+                continue
+
+            # Optional slug
+            parts = [p for p in href.split("/") if p]
+            player_slug = parts[2] if len(parts) >= 3 else None
 
             players.append({
                 "name": name,
                 "rating": rating,
                 "version": version,
-                "image_url": img_url,
+                "image_url": img_url,                # validated 26-<id>.webp
                 "created_at": datetime.now(timezone.utc),
                 "player_slug": player_slug,
-                "player_url": player_url,   # contains /26/… now
-                "card_id": card_id,
+                "player_url": player_url,            # seasonless URL (site’s canonical)
+                "card_id": cid,
             })
         except Exception as e:
             print(f"⚠️ Failed to parse card: {e}")
@@ -177,7 +216,7 @@ async def sync_players():
     page = 1
     empty_streak = 0
 
-    # paginate until two consecutive empty pages (guards against a stray empty page)
+    # paginate until two consecutive empty pages
     while True:
         players = fetch_players_from_page(page)
         if not players:
@@ -190,10 +229,9 @@ async def sync_players():
             all_players.extend(players)
             print(f"📦 Page {page}: +{len(players)} (total {len(all_players)})")
         page += 1
-        await asyncio.sleep(0.6)  # be nice to the site
+        await asyncio.sleep(0.5)  # be nice to the site
 
     print(f"🔍 Total players fetched: {len(all_players)}")
-
     if not all_players:
         print("⚠️ No players fetched; aborting DB write.")
         return
@@ -205,10 +243,7 @@ async def sync_players():
         return
 
     try:
-        # Make sure our ON CONFLICT target exists
         await ensure_unique_index(conn)
-
-        # Upsert by (name, rating, player_url) so /26-... creates a new row vs /25-...
         stmt = """
         INSERT INTO fut_players
             (name, rating, version, image_url, created_at, player_slug, player_url, card_id)
@@ -221,8 +256,6 @@ async def sync_players():
             player_slug= EXCLUDED.player_slug,
             card_id    = EXCLUDED.card_id;
         """
-
-        # Batch insert for speed
         await conn.executemany(stmt, [
             (
                 p["name"], p["rating"], p["version"], p["image_url"],
@@ -230,7 +263,7 @@ async def sync_players():
             )
             for p in all_players
         ])
-        print(f"🎯 Upserted {len(all_players)} players (FC26 only).")
+        print(f"🎯 Upserted {len(all_players)} players (FC26 only, verified by API).")
     finally:
         await conn.close()
 
