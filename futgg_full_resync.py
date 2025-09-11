@@ -118,7 +118,7 @@ async def sync_players():
     for p in all_players:
         try:
             await conn.execute("""
-                INSERT INTO fut_players (name, rating, version, image_url, created, player_slug, player_url, card_id)
+                INSERT INTO fut_players (name, rating, version, image_url, created_at, player_slug, player_url, card_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (name, rating)
                 DO UPDATE SET version=$3, image_url=$4, created_at=$5, player_slug=$6, player_url=$7, card_id=$8
