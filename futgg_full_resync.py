@@ -6,31 +6,21 @@ import asyncpg
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List, Dict
 
 # ---- Config -------------------------------------------------
 FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-})
+SESSION.headers.update({"User-Agent": UA})
 
 # Example image chunk contains ".../26-247333" or ".../25-247333"
-IMG_SEASON_ID_RE = re.compile(r"/(?P<season>\d{2})-(?P<id>\d+)\b")
+CARD_ID_RE = re.compile(r"\b(\d{2})-(\d+)\b")
 
-
-# ----------------- Helpers -----------------
 def parse_alt_text(alt_text: str):
     """
     FUT.GG <img alt="Erling Haaland - 91 - Gold Rare">
@@ -47,83 +37,27 @@ def parse_alt_text(alt_text: str):
     # fallback
     return alt_text.strip(), None, ""
 
-
-def parse_img_season_id(url: str) -> Tuple[Optional[str], Optional[str]]:
-    if not url:
-        return None, None
-    m = IMG_SEASON_ID_RE.search(url)
-    if not m:
-        return None, None
-    return m.group("season"), m.group("id")
-
-
-def pick_from_srcset(img_tag) -> Optional[str]:
-    """Prefer highest-res candidate from srcset; else src/data-src."""
-    if not img_tag:
+def extract_card_id(img_url: str):
+    """
+    Pull the numeric card_id from image URL parts like .../26-247333...
+    Returns just the id (e.g. "247333")
+    """
+    if not img_url:
         return None
-    srcset = (img_tag.get("srcset") or "").strip()
-    if srcset:
-        try:
-            return srcset.split(",")[-1].split(" ")[0].strip()
-        except Exception:
-            pass
-    return img_tag.get("src") or img_tag.get("data-src")
+    m = CARD_ID_RE.search(img_url)
+    if m:
+        return m.group(2)  # numeric id
+    # fallback: take digits from the filename tail
+    tail = (img_url.split("/")[-1] or "").strip('"')
+    digits = "".join(ch for ch in tail if ch.isdigit())
+    return digits or None
 
-
-def href_card_id(href: str) -> Optional[str]:
+def fetch_players_from_page(page_number: int):
     """
-    /players/231443/erling-haaland/  -> "231443"
-    /players/231443/ -> "231443"
-    """
-    if not href:
-        return None
-    parts = [p for p in href.split("/") if p]
-    if len(parts) >= 2 and parts[0] == "players" and parts[1].isdigit():
-        return parts[1]
-    return None
-
-
-def fetch_player_detail(player_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Load player detail page and return (image_url, image_alt) for the main card.
-    We try <meta property="og:image"> first (URL only), then a prominent <img>.
-    """
-    try:
-        r = SESSION.get(player_url, timeout=20)
-        if r.status_code != 200:
-            return None, None
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # 1) og:image (URL only)
-        og = soup.select_one('meta[property="og:image"]')
-        og_url = og.get("content") if og and og.get("content") else None
-
-        # 2) main image tag (get URL + alt if possible)
-        img = soup.select_one('img[alt][src*="-"]') or soup.find("img", src=True)
-        img_url = None
-        img_alt = None
-        if img:
-            img_url = pick_from_srcset(img) or img.get("src") or img.get("data-src")
-            img_alt = img.get("alt")
-
-        # Prefer explicit <img> (has alt); fallback to og:image for URL
-        final_url = img_url or og_url
-        final_alt = img_alt
-
-        return final_url, final_alt
-    except Exception:
-        return None, None
-
-
-# ----------------- Scraper -----------------
-def fetch_players_from_page(page_number: int) -> List[Dict]:
-    """
-    Scrape the generic /players/ list page, but only keep FC26 cards.
-    We follow each tile's link once to ensure we store a 26-image URL.
+    Scrape one fut.gg list page.
     """
     url = FUTGG_BASE_URL.format(page_number)
     print(f"🌐 Fetching: {url}")
-
     try:
         resp = SESSION.get(url, timeout=20)
     except Exception as e:
@@ -136,44 +70,30 @@ def fetch_players_from_page(page_number: int) -> List[Dict]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Broad: anchors under /players/ with an <img alt=...> (your original approach)
+    # Be resilient to Tailwind class churn: anchor with /players/ path and an <img alt=...>
     cards = soup.select('a[href^="/players/"]')
 
     players = []
     for a in cards:
         try:
-            img = a.select_one("img[alt]") or a.find("img")
-            alt_text = (img.get("alt", "").strip() if img else "") or ""
-            tile_img_url = pick_from_srcset(img) if img else ""
+            img = a.select_one("img[alt]")
+            if not img:
+                continue
 
-            # player href + card id
+            alt_text = img.get("alt", "").strip()
+            img_url = img.get("src") or img.get("data-src") or ""
+            name, rating, version = parse_alt_text(alt_text)
+            if not rating:
+                continue
+
             href = a.get("href") or ""
             player_url = f"https://www.fut.gg{href}" if href.startswith("/") else href
+
+            # slug: /players/<id>/<slug>/
             parts = [p for p in href.split("/") if p]
             player_slug = parts[2] if len(parts) >= 3 else None
-            card_id_from_href = href_card_id(href)
 
-            # Load the player page to get the canonical image and confirm season
-            detail_img_url, detail_img_alt = fetch_player_detail(player_url)
-            if not detail_img_url:
-                # if detail failed, skip (keeps DB clean)
-                continue
-
-            season, _ = parse_img_season_id(detail_img_url)
-            if season != "26":
-                # Not FC26 — skip it
-                continue
-
-            # prefer alt from detail page; fallback to tile alt
-            alt_for_parse = (detail_img_alt or alt_text).strip()
-            name, rating, version = parse_alt_text(alt_for_parse)
-            if not rating:
-                # if alt didn’t include rating, we can still keep name; but to match your original, skip
-                continue
-
-            # If we couldn't parse card_id from the image URL, fallback to href id
-            _, card_id_from_img = parse_img_season_id(detail_img_url)
-            card_id = card_id_from_img or card_id_from_href
+            card_id = extract_card_id(img_url)
             if not card_id:
                 continue
 
@@ -181,10 +101,10 @@ def fetch_players_from_page(page_number: int) -> List[Dict]:
                 "name": name,
                 "rating": rating,
                 "version": version,
-                "image_url": detail_img_url,          # guaranteed 26-<id>.webp
+                "image_url": img_url,
                 "created_at": datetime.now(timezone.utc),
                 "player_slug": player_slug,
-                "player_url": player_url,             # seasonless canonical path
+                "player_url": player_url,
                 "card_id": card_id,
             })
         except Exception as e:
@@ -193,8 +113,6 @@ def fetch_players_from_page(page_number: int) -> List[Dict]:
 
     return players
 
-
-# ----------------- DB -----------------
 async def ensure_unique_index(conn: asyncpg.Connection):
     """
     Ensure a unique index exists on (name, rating, player_url) so ON CONFLICT works.
@@ -204,7 +122,6 @@ async def ensure_unique_index(conn: asyncpg.Connection):
       ON fut_players(name, rating, player_url);
     """
     await conn.execute(ddl)
-
 
 async def sync_players():
     print(f"\n🚀 Starting FULL RESYNC at {datetime.now(timezone.utc)} UTC")
@@ -225,7 +142,7 @@ async def sync_players():
             all_players.extend(players)
             print(f"📦 Page {page}: +{len(players)} (total {len(all_players)})")
         page += 1
-        await asyncio.sleep(0.4)  # be nice to the site
+        await asyncio.sleep(0.6)  # be nice to the site
 
     print(f"🔍 Total players fetched: {len(all_players)}")
 
@@ -243,7 +160,7 @@ async def sync_players():
         # Make sure our ON CONFLICT target exists
         await ensure_unique_index(conn)
 
-        # Upsert by (name, rating, player_url)
+        # Upsert by (name, rating, player_url) so /26-... creates a new row vs /25-...
         stmt = """
         INSERT INTO fut_players
             (name, rating, version, image_url, created_at, player_slug, player_url, card_id)
@@ -265,10 +182,9 @@ async def sync_players():
             )
             for p in all_players
         ])
-        print(f"🎯 Upserted {len(all_players)} players (FC26 only).")
+        print(f"🎯 Upserted {len(all_players)} players.")
     finally:
         await conn.close()
-
 
 if __name__ == "__main__":
     asyncio.run(sync_players())
