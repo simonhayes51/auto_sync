@@ -76,7 +76,7 @@ def fetch_players_from_page(page_number):
                 "rating": rating,
                 "version": version,
                 "image_url": img_url,
-                "updated_at": datetime.now(timezone.utc),
+                "created_at": datetime.now(timezone.utc),
                 "player_slug": player_slug,
                 "player_url": player_url,
                 "card_id": card_id
@@ -118,11 +118,11 @@ async def sync_players():
     for p in all_players:
         try:
             await conn.execute("""
-                INSERT INTO fut_players (name, rating, version, image_url, updated_at, player_slug, player_url, card_id)
+                INSERT INTO fut_players (name, rating, version, image_url, created, player_slug, player_url, card_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (name, rating)
-                DO UPDATE SET version=$3, image_url=$4, updated_at=$5, player_slug=$6, player_url=$7, card_id=$8
-            """, p["name"], p["rating"], p["version"], p["image_url"], p["updated_at"], p["player_slug"], p["player_url"], p["card_id"])
+                DO UPDATE SET version=$3, image_url=$4, created_at=$5, player_slug=$6, player_url=$7, card_id=$8
+            """, p["name"], p["rating"], p["version"], p["image_url"], p["created_at"], p["player_slug"], p["player_url"], p["card_id"])
         except Exception as e:
             print(f"⚠️ Failed to save {p['name']}: {e}")
 
