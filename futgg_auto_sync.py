@@ -48,7 +48,7 @@ LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "300"))
 # optional columns
 HAS_NICK = HAS_FIRST = HAS_LAST = HAS_ALT = False
 
-# ================== POSITION MAP ================== #
+# ================== POSITION MAP ================== # 
 POSITION_MAP = {
     0: "GK", 1: "GK", 2: "GK",
     3: "RB", 4: "RB",
