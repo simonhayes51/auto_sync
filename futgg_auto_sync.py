@@ -1,4 +1,4 @@
-# scripts/futgg_meta_sync.py 
+# scripts/futgg_meta_sync.py
 import os
 import re
 import sys
