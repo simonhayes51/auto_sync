@@ -1,4 +1,4 @@
-# scripts/sync_futgg_players.py
+# scripts/sync_futgg_players.py 
 import os
 import re
 import asyncio
