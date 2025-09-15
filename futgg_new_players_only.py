@@ -1,4 +1,4 @@
-# scripts/futgg_new_players_only.py
+# scripts/futgg_new_players_only.py 
 import os
 import re
 import asyncio
