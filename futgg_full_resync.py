@@ -18,21 +18,22 @@ if not DATABASE_URL:
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
-# Example image chunk contains ".../26-247333" or ".../25-247333"
+# e.g. ".../26-247333" or ".../25-247333"
 CARD_ID_RE = re.compile(r"\b(\d{2})-(\d+)\b")
 
 def parse_alt_text(alt_text: str):
     """
     FUT.GG <img alt="Erling Haaland - 91 - Gold Rare">
     Returns (name, rating, version)
+    Split on ' - ' (with spaces) so names containing '-' aren’t mangled.
     """
     if not alt_text:
         return "", None, ""
-    parts = [p.strip() for p in alt_text.split("-")]
+    parts = [p.strip() for p in alt_text.split(" - ")]
     if len(parts) >= 2 and parts[1].isdigit():
         name = parts[0]
         rating = int(parts[1])
-        version = "-".join(parts[2:]).strip() if len(parts) > 2 else ""
+        version = " - ".join(parts[2:]).strip() if len(parts) > 2 else ""
         return name, rating, version
     # fallback
     return alt_text.strip(), None, ""
@@ -40,22 +41,25 @@ def parse_alt_text(alt_text: str):
 def extract_card_id(img_url: str):
     """
     Pull the numeric card_id from image URL parts like .../26-247333...
-    Returns just the id (e.g. "247333")
+    Returns just the id (e.g. 247333) as int if possible.
     """
     if not img_url:
         return None
     m = CARD_ID_RE.search(img_url)
     if m:
-        return m.group(2)  # numeric id
+        try:
+            return int(m.group(2))
+        except ValueError:
+            pass
     # fallback: take digits from the filename tail
     tail = (img_url.split("/")[-1] or "").strip('"')
     digits = "".join(ch for ch in tail if ch.isdigit())
-    return digits or None
+    try:
+        return int(digits) if digits else None
+    except ValueError:
+        return None
 
 def fetch_players_from_page(page_number: int):
-    """
-    Scrape one fut.gg list page.
-    """
     url = FUTGG_BASE_URL.format(page_number)
     print(f"🌐 Fetching: {url}")
     try:
@@ -69,8 +73,6 @@ def fetch_players_from_page(page_number: int):
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Be resilient to Tailwind class churn: anchor with /players/ path and an <img alt=...>
     cards = soup.select('a[href^="/players/"]')
 
     players = []
@@ -98,6 +100,7 @@ def fetch_players_from_page(page_number: int):
                 continue
 
             players.append({
+                "card_id": card_id,
                 "name": name,
                 "rating": rating,
                 "version": version,
@@ -105,7 +108,6 @@ def fetch_players_from_page(page_number: int):
                 "created_at": datetime.now(timezone.utc),
                 "player_slug": player_slug,
                 "player_url": player_url,
-                "card_id": card_id,
             })
         except Exception as e:
             print(f"⚠️ Failed to parse card: {e}")
@@ -113,13 +115,13 @@ def fetch_players_from_page(page_number: int):
 
     return players
 
-async def ensure_unique_index(conn: asyncpg.Connection):
+async def ensure_card_id_unique(conn: asyncpg.Connection):
     """
-    Ensure a unique index exists on (name, rating, player_url) so ON CONFLICT works.
+    Ensure a unique index exists on card_id so ON CONFLICT(card_id) works.
     """
     ddl = """
-    CREATE UNIQUE INDEX IF NOT EXISTS fut_players_name_rating_url_uniq
-      ON fut_players(name, rating, player_url);
+    CREATE UNIQUE INDEX IF NOT EXISTS fut_players_card_id_key
+      ON public.fut_players(card_id);
     """
     await conn.execute(ddl)
 
@@ -129,7 +131,7 @@ async def sync_players():
     page = 1
     empty_streak = 0
 
-    # paginate until two consecutive empty pages (guards against a stray empty page)
+    # paginate until two consecutive empty pages
     while True:
         players = fetch_players_from_page(page)
         if not players:
@@ -142,10 +144,9 @@ async def sync_players():
             all_players.extend(players)
             print(f"📦 Page {page}: +{len(players)} (total {len(all_players)})")
         page += 1
-        await asyncio.sleep(0.6)  # be nice to the site
+        await asyncio.sleep(0.6)
 
     print(f"🔍 Total players fetched: {len(all_players)}")
-
     if not all_players:
         print("⚠️ No players fetched; aborting DB write.")
         return
@@ -158,27 +159,29 @@ async def sync_players():
 
     try:
         # Make sure our ON CONFLICT target exists
-        await ensure_unique_index(conn)
+        await ensure_card_id_unique(conn)
 
-        # Upsert by (name, rating, player_url) so /26-... creates a new row vs /25-...
+        # Upsert by card_id (the immutable identifier)
         stmt = """
-        INSERT INTO fut_players
-            (name, rating, version, image_url, created_at, player_slug, player_url, card_id)
+        INSERT INTO public.fut_players
+            (card_id, name, rating, version, image_url, created_at, player_slug, player_url)
         VALUES
-            ($1,   $2,     $3,      $4,        $5,         $6,          $7,         $8)
-        ON CONFLICT (name, rating, player_url) DO UPDATE
-        SET version    = EXCLUDED.version,
-            image_url  = EXCLUDED.image_url,
-            created_at = EXCLUDED.created_at,
-            player_slug= EXCLUDED.player_slug,
-            card_id    = EXCLUDED.card_id;
+            ($1,      $2,   $3,     $4,      $5,        $6,         $7,          $8)
+        ON CONFLICT (card_id) DO UPDATE
+        SET name        = EXCLUDED.name,
+            rating      = EXCLUDED.rating,
+            version     = EXCLUDED.version,
+            image_url   = EXCLUDED.image_url,
+            created_at  = EXCLUDED.created_at,
+            player_slug = EXCLUDED.player_slug,
+            player_url  = EXCLUDED.player_url;
         """
 
-        # Batch insert for speed
+        # Batch insert for speed – tuple order MUST match stmt
         await conn.executemany(stmt, [
             (
-                p["name"], p["rating"], p["version"], p["image_url"],
-                p["created_at"], p["player_slug"], p["player_url"], p["card_id"]
+                p["card_id"], p["name"], p["rating"], p["version"], p["image_url"],
+                p["created_at"], p["player_slug"], p["player_url"]
             )
             for p in all_players
         ])
