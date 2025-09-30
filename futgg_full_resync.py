@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
 # ---- Config -------------------------------------------------
-FUTGG_BASE_URL = "https://www.fut.gg/players/new/?page={}"
+FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
