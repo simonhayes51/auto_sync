@@ -354,14 +354,14 @@ def parse_api_payload(raw: dict) -> dict:
     # club/league/nation: FUT.GG often gives "uniqueClubSlug":"112139-al-nassr"
     # Sometimes you'll get dicts in other endpoints, so we support both.
     def _lbl(block):
-    if isinstance(block, dict):
-        v = block.get("name") or block.get("slug")
-        v = safe_text(v)
-        return pretty_slug(v) if v else None
-    if isinstance(block, str):
-        v = safe_text(block)
-        return pretty_slug(v) if v else None
-    return None
+        if isinstance(block, dict):
+            v = block.get("name") or block.get("slug")
+            v = safe_text(v)
+            return pretty_slug(v) if v else None
+        if isinstance(block, str):
+            v = safe_text(block)
+            return pretty_slug(v) if v else None
+        return None
 
     club   = _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("club")) or _lbl(data.get("team"))
     league = _lbl(data.get("uniqueLeagueSlug")) or _lbl(data.get("league"))
