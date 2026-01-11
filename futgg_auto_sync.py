@@ -19,39 +19,31 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# FUT.GG "game" code (you showed examples for 26)
 GAME = os.getenv("GAME", "26").strip()
 
 META_API = f"https://www.fut.gg/api/fut/player-item-definitions/{GAME}/{{}}"
 
-# Daily discovery sources (newest cards)
 NEW_LISTING_URLS = [
     "https://www.fut.gg/players/new/?page={}",
     "https://www.fut.gg/players/?sort=new&page={}",
 ]
-
-# Full one-off build source (all players pages)
 FULL_LISTING_URLS = [
     "https://www.fut.gg/players/?page={}",
 ]
 
-# How many pages to scan
-NEW_PAGES  = int(os.getenv("NEW_PAGES", "5"))         # daily scan pages
-FULL_PAGES = int(os.getenv("FULL_PAGES", "335"))      # one-off full build pages
+NEW_PAGES  = int(os.getenv("NEW_PAGES", "5"))
+FULL_PAGES = int(os.getenv("FULL_PAGES", "335"))
 
 REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "20"))
 CONCURRENCY       = int(os.getenv("CONCURRENCY", "12"))
 DISCOVERY_CONC    = int(os.getenv("DISCOVERY_CONCURRENCY", "8"))
-UPDATE_CHUNK_SIZE = int(os.getenv("UPDATE_CHUNK_SIZE", "250"))
-
-# Rate limiting / politeness
-RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "0.05"))  # delay per request
-BATCH_DELAY      = float(os.getenv("BATCH_DELAY", "1.0"))         # delay between batches
-BULK_BATCH_SIZE  = int(os.getenv("BULK_BATCH_SIZE", "80"))        # ids per batch
-MAX_RETRIES      = int(os.getenv("MAX_RETRIES", "3"))
+BULK_BATCH_SIZE   = int(os.getenv("BULK_BATCH_SIZE", "80"))
+BATCH_DELAY       = float(os.getenv("BATCH_DELAY", "1.0"))
+RATE_LIMIT_DELAY  = float(os.getenv("RATE_LIMIT_DELAY", "0.05"))
+MAX_RETRIES       = int(os.getenv("MAX_RETRIES", "3"))
 
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/4.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/5.0)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -66,7 +58,7 @@ LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "250"))
 HAS_NICK = False
 HAS_FIRST = False
 HAS_LAST = False
-HAS_ALT = False  # altposition
+HAS_ALT = False
 
 # ================== POSITION MAP ================== #
 POSITION_MAP = {
@@ -123,13 +115,17 @@ async def preflight(conn: asyncpg.Connection) -> None:
     if not tbl:
         raise RuntimeError("Table public.fut_players not found")
 
-    idx = await conn.fetchval("""
-        SELECT indexname FROM pg_indexes
-        WHERE schemaname='public' AND tablename='fut_players'
-          AND indexname='fut_players_card_id_key'
+    # must have unique on card_id
+    constraint = await conn.fetchval("""
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'public.fut_players'::regclass
+          AND contype IN ('p','u')
+          AND pg_get_constraintdef(oid) ILIKE '%(card_id)%'
+        LIMIT 1
     """)
-    if not idx:
-        raise RuntimeError("Unique index fut_players_card_id_key on (card_id) is required")
+    if not constraint:
+        raise RuntimeError("A UNIQUE constraint/index on fut_players(card_id) is required")
 
     cols = {
         r["column_name"]
@@ -143,31 +139,15 @@ async def preflight(conn: asyncpg.Connection) -> None:
     HAS_LAST  = "last_name" in cols
     HAS_ALT   = "altposition" in cols
 
-    # Confirm card_id type (warn only)
-    card_id_type = await conn.fetchval("""
-        SELECT data_type
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='fut_players' AND column_name='card_id'
-    """)
-    if card_id_type and card_id_type.lower() not in ("bigint", "integer"):
-        log.warning("⚠️ card_id column type is %s (expected BIGINT). Script assumes BIGINT/INT.", card_id_type)
-
     log.info("✅ Preflight OK | columns: nickname=%s first=%s last=%s altposition=%s", HAS_NICK, HAS_FIRST, HAS_LAST, HAS_ALT)
 
 # ================== HELPERS ================== #
 def build_image_url(path: Optional[str]) -> Optional[str]:
-    """
-    FUT.GG API now often returns:
-      - futggCardImagePath: "2026/futgg-player-item-card/26-20801.<hash>.webp"
-      - cardImagePath:      "2026/player-item-card/26-20801.<hash>.webp"
-    We'll accept any relative path and prefix it.
-    """
     if not path or not isinstance(path, str):
         return None
     p = path.strip()
     if not p:
         return None
-    # If it's a full URL already, return as-is
     if p.startswith("http://") or p.startswith("https://"):
         return p
     return f"https://game-assets.fut.gg/cdn-cgi/image/quality=90,format=auto,width=500/{p}"
@@ -191,10 +171,6 @@ def map_position(pos_raw) -> Optional[str]:
     return None
 
 def map_alt_positions(ids) -> Optional[str]:
-    """
-    alternativePositionIds: [12,18,25] -> "RM,CAM,ST"
-    stored as comma-separated string in altposition column
-    """
     if not isinstance(ids, list) or not ids:
         return None
     out = []
@@ -205,10 +181,6 @@ def map_alt_positions(ids) -> Optional[str]:
     return ",".join(out) if out else None
 
 def pick_named_block(block) -> Optional[str]:
-    """
-    Your requirement: take ONLY the "name" inside objects like:
-      uniqueClubSlug: {"slug":"...","name":"Inter Miami CF"}
-    """
     if isinstance(block, dict):
         v = block.get("name")
         if isinstance(v, str) and v.strip():
@@ -229,19 +201,11 @@ async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[st
         return None
 
 def parse_player_data(raw: dict) -> dict:
-    """
-    Normalise FUT.GG player-item-definitions response.
-    It may be:
-      - {"data": {...}}
-      - {...}
-      - list[...] (rare)
-    """
     data = raw
     if isinstance(raw, dict) and "data" in raw and isinstance(raw["data"], (dict, list)):
         data = raw["data"]
 
     if isinstance(data, list):
-        # pick best "overall"
         best = None
         best_rating = -1
         for it in data:
@@ -265,19 +229,15 @@ def parse_player_data(raw: dict) -> dict:
     nick = data.get("nickname")
     name = pick_name(nick, first, last)
 
-    # Position and alt positions
     pos_raw = data.get("position") or data.get("positionId") or data.get("primaryPositionId")
     position = map_position(pos_raw)
 
-    alt_ids = data.get("alternativePositionIds") or []
-    altposition = map_alt_positions(alt_ids)
+    altposition = map_alt_positions(data.get("alternativePositionIds") or [])
 
-    # Club/League/Nation (name only, as requested)
     club   = pick_named_block(data.get("uniqueClubSlug")) or pick_named_block(data.get("club"))
     league = pick_named_block(data.get("uniqueLeagueSlug")) or pick_named_block(data.get("league"))
     nation = pick_named_block(data.get("uniqueNationSlug")) or pick_named_block(data.get("nation")) or pick_named_block(data.get("country"))
 
-    # Rating
     rating = None
     try:
         rv = data.get("overall") or data.get("rating") or data.get("overallRating") or data.get("ovr")
@@ -285,7 +245,6 @@ def parse_player_data(raw: dict) -> dict:
     except Exception:
         rating = None
 
-    # Version / rarity-like label
     version = data.get("version") or data.get("program") or data.get("cardType") or data.get("rarityName")
     if isinstance(version, dict):
         version = version.get("name")
@@ -294,7 +253,6 @@ def parse_player_data(raw: dict) -> dict:
     else:
         version = None
 
-    # Image
     img = data.get("futggCardImagePath") or data.get("cardImagePath") or data.get("imagePath")
     image_url = build_image_url(img)
 
@@ -340,14 +298,10 @@ async def fetch_meta_with_retry(session: aiohttp.ClientSession, card_id: int) ->
     return {}
 
 # ================== DISCOVERY ================== #
-# We build regex based on GAME, e.g. /players/<slug>/26-20801/
 RX_HREF_SLUG_CARD = re.compile(rf'href=[\'\"]/players/([0-9a-z\-]+)/{re.escape(GAME)}-(\d+)[/\'\"]', re.IGNORECASE)
 RX_HREF_CARD_ONLY = re.compile(rf'href=[\'\"]/players/(?:{re.escape(GAME)}-)?(\d+)[/\'\"]', re.IGNORECASE)
 
 async def discover_cards(session: aiohttp.ClientSession, pages: int, bases: List[str]) -> Dict[int, Optional[str]]:
-    """
-    Returns dict: { card_id (int) : player_slug (str|None) }
-    """
     out: Dict[int, Optional[str]] = {}
     sem = asyncio.Semaphore(DISCOVERY_CONC)
 
@@ -376,11 +330,11 @@ async def discover_cards(session: aiohttp.ClientSession, pages: int, bases: List
     await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
-# ================== UPSERT ================== #
+# ================== INSERT/UPSERT (FIXED FOR name NOT NULL) ================== #
 async def upsert_new(conn: asyncpg.Connection, discovered: Dict[int, Optional[str]]) -> List[int]:
     """
-    Insert missing card_ids; return list of newly inserted card_ids.
-    card_id is BIGINT, so we use bigint[] in query.
+    Because name is NOT NULL, we must fetch meta before inserting.
+    This inserts fully-populated rows (at least name), then allows enrichment for the rest.
     """
     if not discovered:
         return []
@@ -392,49 +346,118 @@ async def upsert_new(conn: asyncpg.Connection, discovered: Dict[int, Optional[st
         ids
     )
     have = {int(r["card_id"]) for r in have_rows}
-
     new_ids = [cid for cid in ids if cid not in have]
     if not new_ids:
         return []
 
-    rows: List[Tuple[int, Optional[str], str]] = []
-    for cid in new_ids:
-        slug = discovered.get(cid)
-        if slug:
-            url = f"https://www.fut.gg/players/{slug}/{GAME}-{cid}/"
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, connect=REQUEST_TIMEOUT),
+        connector=aiohttp.TCPConnector(limit=CONCURRENCY * 2, ttl_dns_cache=300)
+    ) as session:
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def build_row(cid: int):
+            async with sem:
+                meta = await fetch_meta_with_retry(session, cid)
+
+            slug = discovered.get(cid)
+            url = f"https://www.fut.gg/players/{slug}/{GAME}-{cid}/" if slug else f"https://www.fut.gg/players/{GAME}-{cid}/"
+
+            # name must not be null: fallback to slug if API fails
+            name = meta.get("name") or (slug.replace("-", " ").title() if isinstance(slug, str) and slug else f"Unknown {cid}")
+
+            row = {
+                "card_id": cid,
+                "player_slug": slug,
+                "player_url": url,
+                "name": name,
+                "rating": meta.get("rating"),
+                "version": meta.get("version"),
+                "position": meta.get("position"),
+                "altposition": meta.get("altposition"),
+                "club": meta.get("club"),
+                "league": meta.get("league"),
+                "nation": meta.get("nation"),
+                "image_url": meta.get("image_url"),
+                "nickname": meta.get("nickname"),
+                "first_name": meta.get("first_name"),
+                "last_name": meta.get("last_name"),
+            }
+            return row
+
+        rows = await asyncio.gather(*(build_row(cid) for cid in new_ids), return_exceptions=True)
+
+    inserts = []
+    for r in rows:
+        if isinstance(r, Exception):
+            continue
+        inserts.append(r)
+
+    if not inserts:
+        return []
+
+    # Build INSERT dynamically depending on optional columns
+    columns = ["card_id", "player_slug", "player_url", "name", "rating", "version", "position", "club", "league", "nation", "image_url", "created_at"]
+    if HAS_ALT:
+        columns.insert(columns.index("position") + 1, "altposition")
+    if HAS_NICK:
+        columns.append("nickname")
+    if HAS_FIRST:
+        columns.append("first_name")
+    if HAS_LAST:
+        columns.append("last_name")
+
+    # Build VALUES args list
+    values = []
+    for row in inserts:
+        args = []
+        for c in columns:
+            if c == "created_at":
+                args.append(datetime.utcnow())
+            else:
+                args.append(row.get(c))
+        values.append(tuple(args))
+
+    placeholders = ", ".join(f"${i}" for i in range(1, len(columns) + 1))
+    col_sql = ", ".join(columns)
+
+    # Upsert: insert new row; if conflict, update missing fields
+    # (name stays NOT NULL; we do COALESCE to avoid overwriting good data)
+    set_parts = []
+    for c in columns:
+        if c == "card_id":
+            continue
+        if c == "created_at":
+            set_parts.append("created_at = COALESCE(public.fut_players.created_at, EXCLUDED.created_at)")
         else:
-            url = f"https://www.fut.gg/players/{GAME}-{cid}/"
-        rows.append((cid, slug, url))
+            set_parts.append(f"{c} = COALESCE(public.fut_players.{c}, EXCLUDED.{c})")
+    set_sql = ", ".join(set_parts)
 
     await conn.executemany(
         f"""
-        INSERT INTO public.fut_players (card_id, player_slug, player_url)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (card_id) DO NOTHING
+        INSERT INTO public.fut_players ({col_sql})
+        VALUES ({placeholders})
+        ON CONFLICT (card_id) DO UPDATE
+        SET {set_sql}
         """,
-        rows
+        values
     )
+
     return new_ids
 
-# ================== ENRICHMENT ================== #
+# ================== ENRICH MISSING ================== #
 async def get_missing_card_ids(conn: asyncpg.Connection, limit: int = 5000) -> List[int]:
-    """
-    Only enrich rows where *any* core fields are missing/null.
-    """
     rows = await conn.fetch(
         """
         SELECT card_id
         FROM public.fut_players
         WHERE
-          (name IS NULL OR name = '' OR
-           rating IS NULL OR
+          (rating IS NULL OR
            position IS NULL OR position = '' OR
            club IS NULL OR club = '' OR
            league IS NULL OR league = '' OR
            nation IS NULL OR nation = '' OR
-           image_url IS NULL OR image_url = '' OR
-           player_slug IS NULL OR player_slug = '' OR
-           player_url IS NULL OR player_url = '')
+           image_url IS NULL OR image_url = '')
         ORDER BY card_id
         LIMIT $1
         """,
@@ -443,14 +466,9 @@ async def get_missing_card_ids(conn: asyncpg.Connection, limit: int = 5000) -> L
     return [int(r["card_id"]) for r in rows]
 
 async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tuple[int, int]:
-    """
-    Enrich specific card_ids, update by card_id.
-    Returns: (updated, failed)
-    """
     if not card_ids:
         return (0, 0)
 
-    # Load existing slug/url so we never blank them
     existing = await conn.fetch(
         "SELECT card_id, player_slug, player_url FROM public.fut_players WHERE card_id = ANY($1::bigint[])",
         card_ids
@@ -459,7 +477,6 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
 
     write_conn = await asyncpg.connect(DATABASE_URL)
 
-    # Build UPDATE with COALESCE so we only fill blanks
     sql = """
         UPDATE public.fut_players
         SET position    = COALESCE($1, position),
@@ -487,7 +504,6 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
     if HAS_LAST:
         sql += f", last_name = COALESCE(${arg_count + 1}, last_name)"
         arg_count += 1
-
     sql += f" WHERE card_id = ${arg_count + 1}"
 
     updated = 0
@@ -502,10 +518,6 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
             total = len(card_ids)
             for i in range(0, total, BULK_BATCH_SIZE):
                 batch = card_ids[i:i + BULK_BATCH_SIZE]
-                batch_num = (i // BULK_BATCH_SIZE) + 1
-                total_batches = (total + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
-                log.info("🧩 Enrich batch %d/%d (%d cards)", batch_num, total_batches, len(batch))
-
                 sem = asyncio.Semaphore(CONCURRENCY)
 
                 async def work(cid: int):
@@ -527,12 +539,7 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
 
                     slug_existing, url_existing = info.get(cid, (None, None))
                     slug = slug_existing
-                    url = url_existing
-                    if not url:
-                        if slug:
-                            url = f"https://www.fut.gg/players/{slug}/{GAME}-{cid}/"
-                        else:
-                            url = f"https://www.fut.gg/players/{GAME}-{cid}/"
+                    url = url_existing or (f"https://www.fut.gg/players/{slug}/{GAME}-{cid}/" if slug else f"https://www.fut.gg/players/{GAME}-{cid}/")
 
                     args = [
                         meta.get("position"),
@@ -555,14 +562,14 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
                     if HAS_LAST:
                         args.append(meta.get("last_name"))
 
-                    args.append(cid)  # WHERE card_id = ...
+                    args.append(cid)
                     updates.append(tuple(args))
 
                 if updates:
                     try:
                         await write_conn.executemany(sql, updates)
                         updated += len(updates)
-                        log.info("💾 Wrote %d updates (total updated %d, failed %d)", len(updates), updated, failed)
+                        log.info("💾 Enriched %d rows (total updated %d, failed %d)", len(updates), updated, failed)
                     except Exception as e:
                         log.error("❌ DB update failed for this batch: %s", e)
                         failed += len(updates)
@@ -575,13 +582,8 @@ async def enrich_card_ids(conn: asyncpg.Connection, card_ids: List[int]) -> Tupl
 
     return (updated, failed)
 
-# ================== ONE CYCLE ================== #
+# ================== RUN ONCE ================== #
 async def run_once(mode: str) -> None:
-    """
-    mode:
-      - "daily": scan NEW_PAGES from NEW_LISTING_URLS, insert new, then enrich missing/null rows
-      - "full":  scan FULL_PAGES from FULL_LISTING_URLS, insert lots, then enrich missing/null rows
-    """
     conn = await get_db()
     try:
         await preflight(conn)
@@ -595,34 +597,25 @@ async def run_once(mode: str) -> None:
             pages = NEW_PAGES
             log.info("🆕 DAILY: scanning %d pages", pages)
 
-        discovered: Dict[int, Optional[str]] = {}
         async with aiohttp.ClientSession() as session:
             discovered = await discover_cards(session, pages, bases)
 
         added = await upsert_new(conn, discovered)
-        if added:
-            log.info("🆕 Inserted %d new players.", len(added))
-        else:
-            log.info("ℹ️ No new players to insert.")
+        log.info("🆕 Inserted %d new players.", len(added))
 
-        # Enrich missing/null rows (this will include newly inserted)
-        # Loop until no missing remain (or until cap)
+        # Fill remaining missing meta until done (or no progress)
         total_updated = 0
         total_failed = 0
-
         while True:
             missing = await get_missing_card_ids(conn, limit=5000)
             log.info("🧾 missing_meta=%d", len(missing))
             if not missing:
                 break
-
             updated, failed = await enrich_card_ids(conn, missing)
             total_updated += updated
             total_failed += failed
-
-            # If we're making no progress, stop to avoid endless looping
             if updated == 0 and failed > 0:
-                log.warning("⚠️ No progress in last pass (updated=0). Stopping enrichment loop.")
+                log.warning("⚠️ No progress in last pass. Stopping loop.")
                 break
 
         log.info("✅ Done. Total updated=%d | total failed=%d", total_updated, total_failed)
@@ -683,8 +676,8 @@ async def main_loop():
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--now", action="store_true", help="Run DAILY discovery + enrich once and exit")
-    ap.add_argument("--full", action="store_true", help="Run FULL build (FULL_PAGES) + enrich once and exit")
+    ap.add_argument("--now", action="store_true", help="Run DAILY once and exit")
+    ap.add_argument("--full", action="store_true", help="Run FULL build once and exit")
     args = ap.parse_args()
 
     async def _runner():
