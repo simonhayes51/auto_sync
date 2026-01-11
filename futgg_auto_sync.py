@@ -294,6 +294,41 @@ async def fetch_meta_with_retry(session: aiohttp.ClientSession, card_id: int) ->
                 return {}
     return {}
 
+def pretty_slug(value: Optional[str]) -> Optional[str]:
+    """
+    Converts:
+      '2-aston-villa' -> 'Aston Villa'
+      '73-paris-sg'   -> 'Paris Saint Germain' (override)
+      'major-league-soccer' -> 'Major League Soccer'
+      'argentina' -> 'Argentina'
+    """
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+
+    # Drop numeric prefix: "123-foo-bar" -> "foo-bar"
+    s = re.sub(r"^\d+-", "", s)
+
+    # Replace separators with spaces
+    s = s.replace("_", " ").replace("-", " ").strip()
+    if not s:
+        return None
+
+    # Common overrides (add more as you find them)
+    overrides = {
+        "paris sg": "Paris Saint Germain",
+        "psg": "Paris Saint Germain",
+    }
+    key = s.lower()
+    if key in overrides:
+        return overrides[key]
+
+    # Title case (keeps simple)
+    return " ".join(w[:1].upper() + w[1:].lower() for w in s.split())
+
 def parse_api_payload(raw: dict) -> dict:
     """
     FUT.GG API returns {"data": {...}} for this endpoint.
@@ -319,10 +354,14 @@ def parse_api_payload(raw: dict) -> dict:
     # club/league/nation: FUT.GG often gives "uniqueClubSlug":"112139-al-nassr"
     # Sometimes you'll get dicts in other endpoints, so we support both.
     def _lbl(block):
-        if isinstance(block, dict):
-            v = block.get("name") or block.get("slug")
-            return safe_text(v)
-        return safe_text(block)
+    if isinstance(block, dict):
+        v = block.get("name") or block.get("slug")
+        v = safe_text(v)
+        return pretty_slug(v) if v else None
+    if isinstance(block, str):
+        v = safe_text(block)
+        return pretty_slug(v) if v else None
+    return None
 
     club   = _lbl(data.get("uniqueClubSlug")) or _lbl(data.get("club")) or _lbl(data.get("team"))
     league = _lbl(data.get("uniqueLeagueSlug")) or _lbl(data.get("league"))
