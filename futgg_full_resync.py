@@ -15,6 +15,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
+PROXY_URL = os.getenv("PROXY_URL")
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": UA,
@@ -23,6 +25,9 @@ SESSION.headers.update({
     "Referer": "https://www.fut.gg/players/",
     "Origin": "https://www.fut.gg",
 })
+if PROXY_URL:
+    SESSION.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    print("🌐 Routing fut.gg requests through PROXY_URL", flush=True)
 
 # e.g. ".../26-247333" or ".../25-247333"
 CARD_ID_RE = re.compile(r"\b(\d{2})-(\d+)\b")
