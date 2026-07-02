@@ -39,9 +39,11 @@ BULK_BATCH_SIZE    = int(os.getenv("BULK_BATCH_SIZE", "50"))
 MAX_RETRIES        = int(os.getenv("MAX_RETRIES", "3"))
 
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FutGGMetaSync/3.1)",
-    "Accept": "application/json,text/html",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.fut.gg/players/",
+    "Origin": "https://www.fut.gg",
 }
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

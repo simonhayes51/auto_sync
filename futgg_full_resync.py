@@ -9,14 +9,20 @@ from datetime import datetime, timezone
 
 # ---- Config -------------------------------------------------
 FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA})
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.fut.gg/players/",
+    "Origin": "https://www.fut.gg",
+})
 
 # e.g. ".../26-247333" or ".../25-247333"
 CARD_ID_RE = re.compile(r"\b(\d{2})-(\d+)\b")
