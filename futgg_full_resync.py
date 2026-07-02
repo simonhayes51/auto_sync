@@ -1,4 +1,4 @@
-# scripts/sync_futgg_players.py
+# scripts/sync_futgg_players.py 
 import os
 import re
 import asyncio
@@ -7,9 +7,8 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
-# ---------------- Config ----------------
-GAME = os.getenv("GAME", "26").strip()  # FC26 default
-BASE_URL = f"https://www.fut.gg/players/?page={{}}"
+# ---- Config -------------------------------------------------
+FUTGG_BASE_URL = "https://www.fut.gg/players/?page={}"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -19,119 +18,120 @@ if not DATABASE_URL:
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
-# Match: /players/<player_slug>/<GAME>-<card_id>/
-HREF_RE = re.compile(rf'^/players/([^/]+)/{re.escape(GAME)}-(\d+)/?$', re.IGNORECASE)
+# e.g. ".../26-247333" or ".../25-247333"
+CARD_ID_RE = re.compile(r"\b(\d{2})-(\d+)\b")
 
-# Optional fallback if FUTGG returns /players/<GAME>-<card_id>/
-HREF_CARD_ONLY_RE = re.compile(rf'^/players/(?:{re.escape(GAME)}-)?(\d+)/?$', re.IGNORECASE)
-
-# Try to parse "Name - 91 - Gold Rare" if present, but do NOT require it
 def parse_alt_text(alt_text: str):
+    """
+    FUT.GG <img alt="Erling Haaland - 91 - Gold Rare">
+    Returns (name, rating, version)
+    Split on ' - ' (with spaces) so names containing '-' aren’t mangled.
+    """
     if not alt_text:
-        return None, None, None
+        return "", None, ""
     parts = [p.strip() for p in alt_text.split(" - ")]
     if len(parts) >= 2 and parts[1].isdigit():
         name = parts[0]
         rating = int(parts[1])
-        version = " - ".join(parts[2:]).strip() if len(parts) > 2 else None
+        version = " - ".join(parts[2:]).strip() if len(parts) > 2 else ""
         return name, rating, version
-    return alt_text.strip() or None, None, None
+    # fallback
+    return alt_text.strip(), None, ""
+
+def extract_card_id(img_url: str):
+    """
+    Pull the numeric card_id from image URL parts like .../26-247333...
+    Returns just the id (e.g. 247333) as int if possible.
+    """
+    if not img_url:
+        return None
+    m = CARD_ID_RE.search(img_url)
+    if m:
+        try:
+            return int(m.group(2))
+        except ValueError:
+            pass
+    # fallback: take digits from the filename tail
+    tail = (img_url.split("/")[-1] or "").strip('"')
+    digits = "".join(ch for ch in tail if ch.isdigit())
+    try:
+        return int(digits) if digits else None
+    except ValueError:
+        return None
 
 def fetch_players_from_page(page_number: int):
-    url = BASE_URL.format(page_number)
+    url = FUTGG_BASE_URL.format(page_number)
     print(f"🌐 Fetching: {url}")
-
     try:
-        resp = SESSION.get(url, timeout=25)
+        resp = SESSION.get(url, timeout=20)
     except Exception as e:
         print(f"⚠️ Request failed: {e}")
         return []
 
     if resp.status_code != 200:
-        print(f"⚠️ Failed page {page_number}: status={resp.status_code}")
+        print(f"⚠️ Failed to fetch page {page_number}: status={resp.status_code}")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    anchors = soup.select('a[href^="/players/"]')
+    cards = soup.select('a[href^="/players/"]')
 
-    players = {}
-    for a in anchors:
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-
-        m = HREF_RE.match(href)
-        card_id = None
-        player_slug = None
-
-        if m:
-            player_slug = m.group(1)
-            card_id = m.group(2)
-        else:
-            m2 = HREF_CARD_ONLY_RE.match(href)
-            if m2:
-                card_id = m2.group(1)
-                player_slug = None
-            else:
+    players = []
+    for a in cards:
+        try:
+            img = a.select_one("img[alt]")
+            if not img:
                 continue
 
-        # Pull whatever we can from img, but don't depend on it
-        img = a.select_one("img")
-        img_url = None
-        name = None
-        rating = None
-        version = None
+            alt_text = img.get("alt", "").strip()
+            img_url = img.get("src") or img.get("data-src") or ""
+            name, rating, version = parse_alt_text(alt_text)
+            if not rating:
+                continue
 
-        if img:
-            img_url = img.get("src") or img.get("data-src") or None
-            alt_text = (img.get("alt") or "").strip()
-            n, r, v = parse_alt_text(alt_text)
-            name, rating, version = n, r, v
+            href = a.get("href") or ""
+            player_url = f"https://www.fut.gg{href}" if href.startswith("/") else href
 
-        # Construct the canonical player_url
-        if player_slug:
-            player_url = f"https://www.fut.gg/players/{player_slug}/{GAME}-{card_id}/"
-        else:
-            player_url = f"https://www.fut.gg/players/{GAME}-{card_id}/"
+            # slug: /players/<id>/<slug>/
+            parts = [p for p in href.split("/") if p]
+            player_slug = parts[2] if len(parts) >= 3 else None
 
-        players[card_id] = {
-            "card_id": int(card_id),
-            "name": name,             # may be None; enrichment script fills this
-            "rating": rating,         # may be None
-            "version": version,       # may be None
-            "image_url": img_url,     # may be None
-            "created_at": datetime.now(timezone.utc),
-            "player_slug": player_slug,
-            "player_url": player_url,
-        }
+            card_id = extract_card_id(img_url)
+            if not card_id:
+                continue
 
-    return list(players.values())
+            players.append({
+                "card_id": card_id,
+                "name": name,
+                "rating": rating,
+                "version": version,
+                "image_url": img_url,
+                "created_at": datetime.now(timezone.utc),
+                "player_slug": player_slug,
+                "player_url": player_url,
+            })
+        except Exception as e:
+            print(f"⚠️ Failed to parse card: {e}")
+            continue
 
-async def ensure_unique(conn: asyncpg.Connection):
-    # Ensures ON CONFLICT(card_id) works
-    await conn.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_indexes
-                WHERE schemaname='public'
-                  AND tablename='fut_players'
-                  AND indexdef ILIKE '%UNIQUE%'
-                  AND indexdef ILIKE '%(card_id)%'
-            ) THEN
-                CREATE UNIQUE INDEX fut_players_card_id_key ON public.fut_players(card_id);
-            END IF;
-        END $$;
-    """)
+    return players
+
+async def ensure_card_id_unique(conn: asyncpg.Connection):
+    """
+    Ensure a unique index exists on card_id so ON CONFLICT(card_id) works.
+    """
+    ddl = """
+    CREATE UNIQUE INDEX IF NOT EXISTS fut_players_card_id_key
+      ON public.fut_players(card_id);
+    """
+    await conn.execute(ddl)
 
 async def sync_players():
-    print(f"\n🚀 Starting FULL RESYNC (GAME={GAME}) at {datetime.now(timezone.utc)} UTC")
+    print(f"\n🚀 Starting FULL RESYNC at {datetime.now(timezone.utc)} UTC")
     all_players = []
     page = 1
     empty_streak = 0
 
-    # Stop when 2 consecutive pages produce 0 parsed cards
+    # paginate until two consecutive empty pages
     while True:
         players = fetch_players_from_page(page)
         if not players:
@@ -143,56 +143,49 @@ async def sync_players():
             empty_streak = 0
             all_players.extend(players)
             print(f"📦 Page {page}: +{len(players)} (total {len(all_players)})")
-
         page += 1
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6)
 
-    print(f"🔍 Total players found: {len(all_players)}")
+    print(f"🔍 Total players fetched: {len(all_players)}")
     if not all_players:
-        print("⚠️ No players fetched; aborting.")
+        print("⚠️ No players fetched; aborting DB write.")
         return
 
-    conn = await asyncpg.connect(DATABASE_URL)
     try:
-        await ensure_unique(conn)
+        conn = await asyncpg.connect(DATABASE_URL)
+    except Exception as e:
+        print(f"❌ DB connection failed: {e}")
+        return
 
-        # IMPORTANT:
-        # Your table currently has NOT NULL constraints on name in some setups.
-        # To avoid failing inserts, we COALESCE name to '' and rating to NULL-safe default.
-        # But ideally: remove NOT NULL from name/rating, and let enrichment fill.
+    try:
+        # Make sure our ON CONFLICT target exists
+        await ensure_card_id_unique(conn)
+
+        # Upsert by card_id (the immutable identifier)
         stmt = """
         INSERT INTO public.fut_players
             (card_id, name, rating, version, image_url, created_at, player_slug, player_url)
         VALUES
             ($1,      $2,   $3,     $4,      $5,        $6,         $7,          $8)
         ON CONFLICT (card_id) DO UPDATE
-        SET name        = COALESCE(EXCLUDED.name, public.fut_players.name),
-            rating      = COALESCE(EXCLUDED.rating, public.fut_players.rating),
-            version     = COALESCE(EXCLUDED.version, public.fut_players.version),
-            image_url   = COALESCE(EXCLUDED.image_url, public.fut_players.image_url),
-            created_at  = public.fut_players.created_at, -- keep original
-            player_slug = COALESCE(EXCLUDED.player_slug, public.fut_players.player_slug),
-            player_url  = COALESCE(EXCLUDED.player_url, public.fut_players.player_url);
+        SET name        = EXCLUDED.name,
+            rating      = EXCLUDED.rating,
+            version     = EXCLUDED.version,
+            image_url   = EXCLUDED.image_url,
+            created_at  = EXCLUDED.created_at,
+            player_slug = EXCLUDED.player_slug,
+            player_url  = EXCLUDED.player_url;
         """
 
-        rows = []
-        for p in all_players:
-            # If your DB still has name NOT NULL, avoid crashing:
-            safe_name = p["name"] if p["name"] else ""
-            rows.append((
-                p["card_id"],
-                safe_name,
-                p["rating"],
-                p["version"],
-                p["image_url"],
-                p["created_at"],
-                p["player_slug"],
-                p["player_url"],
-            ))
-
-        await conn.executemany(stmt, rows)
-        print(f"🎯 Upserted {len(rows)} players into fut_players.")
-        print("✅ Done. Next: run your futgg_auto_sync.py enrichment to fill missing fields.")
+        # Batch insert for speed – tuple order MUST match stmt
+        await conn.executemany(stmt, [
+            (
+                p["card_id"], p["name"], p["rating"], p["version"], p["image_url"],
+                p["created_at"], p["player_slug"], p["player_url"]
+            )
+            for p in all_players
+        ])
+        print(f"🎯 Upserted {len(all_players)} players.")
     finally:
         await conn.close()
 
