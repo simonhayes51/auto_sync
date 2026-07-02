@@ -46,6 +46,8 @@ UA_HEADERS = {
     "Origin": "https://www.fut.gg",
 }
 
+PROXY_URL = os.getenv("PROXY_URL")
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_THROTTLE_MS = int(os.getenv("LOG_THROTTLE_MS", "300"))
 
@@ -89,6 +91,8 @@ for h in logging.getLogger().handlers:
     h.addFilter(_RateLimitFilter())
 log = logging.getLogger("futgg_meta_sync")
 print(f"▶️ Starting: {os.path.basename(__file__)} | LOG_LEVEL={LOG_LEVEL}", flush=True)
+if PROXY_URL:
+    print("🌐 Routing fut.gg requests through PROXY_URL", flush=True)
 
 # ================== DB ================== #
 async def get_db() -> asyncpg.Connection:
@@ -200,7 +204,7 @@ async def fetch_meta_with_retry(session: aiohttp.ClientSession, card_id: str) ->
         try:
             await asyncio.sleep(RATE_LIMIT_DELAY)
             async with session.get(META_API.format(card_id), timeout=REQUEST_TIMEOUT,
-                                   headers=UA_HEADERS) as resp:
+                                   headers=UA_HEADERS, proxy=PROXY_URL) as resp:
                 if resp.status == 429:
                     wait_time = min(2 ** attempt, 30)
                     log.warning(f"Rate limited {card_id}, wait {wait_time}s")
@@ -305,7 +309,7 @@ RX_HREF_CARD_ONLY = re.compile(r'href=[\'\"]/players/(?:26-)?(\d+)', re.I)
 
 async def http_get_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
-        async with session.get(url, timeout=REQUEST_TIMEOUT, headers=UA_HEADERS) as resp:
+        async with session.get(url, timeout=REQUEST_TIMEOUT, headers=UA_HEADERS, proxy=PROXY_URL) as resp:
             if resp.status != 200:
                 return None
             return await resp.text()

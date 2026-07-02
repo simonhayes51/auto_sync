@@ -37,6 +37,8 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
+PROXY_URL = os.getenv("PROXY_URL")
+
 # Setup logging with debug level to see more details
 logger = logging.getLogger("fut-price-sync")
 logger.setLevel(logging.DEBUG)
@@ -146,7 +148,7 @@ async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(url, headers=HEADERS, timeout=15) as resp:
+            async with session.get(url, headers=HEADERS, timeout=15, proxy=PROXY_URL) as resp:
                 text = await resp.text()
 
                 if resp.status == 200:
