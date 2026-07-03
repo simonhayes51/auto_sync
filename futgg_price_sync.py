@@ -58,10 +58,12 @@ SCRAPERAPI_RENDER = os.getenv("SCRAPERAPI_RENDER", "true").lower() not in ("fals
 # a real rendering browser. This fetches the real page instead and reads the
 # price out of the rendered HTML, same as a human browsing would see it.
 SCRAPERAPI_USE_PAGE = os.getenv("SCRAPERAPI_USE_PAGE", "true").lower() not in ("false", "0", "")
-# ScraperAPI's own error told us fut.gg is a "protected domain" needing
-# premium=true or ultra_premium=true - plain premium wasn't enough in
-# testing, so default to the higher tier. Empty string disables this param.
-SCRAPERAPI_PREMIUM_PARAM = os.getenv("SCRAPERAPI_PREMIUM_PARAM", "ultra_premium")
+# ScraperAPI's own error said fut.gg needs premium=true or ultra_premium=true
+# for reliable access, but the current plan doesn't include either (confirmed
+# via explicit 403 "upgrade your plan"), so default to disabled - sending it
+# just fails outright rather than falling back to the basic pool. Set to
+# "premium" or "ultra_premium" via env once/if the plan supports it.
+SCRAPERAPI_PREMIUM_PARAM = os.getenv("SCRAPERAPI_PREMIUM_PARAM", "")
 # The page renders fine but shows loading skeletons - fut.gg's own
 # client-side data fetch hasn't finished when ScraperAPI snapshots it.
 # wait_for_selector tells ScraperAPI to hold off returning the result until
