@@ -55,8 +55,8 @@ def _parse_platform_price(soup: BeautifulSoup, platform: str) -> int:
     return max((_num(x) for x in nums), default=0)
 
 
-async def fetch_one(session: aiohttp.ClientSession, card_id: int, name: str):
-    url = f"https://www.futbin.com/{GAME}/player/{card_id}"
+async def fetch_one(session: aiohttp.ClientSession, card_id, name: str, url: str = None):
+    url = url or f"https://www.futbin.com/{GAME}/player/{card_id}"
     try:
         async with SEM:
             async with session.get(url, headers=HEADERS, timeout=25) as r:
@@ -84,12 +84,30 @@ async def fetch_one(session: aiohttp.ClientSession, card_id: int, name: str):
     if price:
         print(f"   ✅ parsed price: {price}", flush=True)
     else:
-        print(f"   ⚠️ no price parsed - dumping a content sample for inspection:", flush=True)
-        body = soup.find("body")
-        print(f"   {body.get_text(' ', strip=True)[:500] if body else html[:500]}", flush=True)
+        print("   ⚠️ no price parsed - looking for a 'price' marker in the raw HTML:", flush=True)
+        idx = html.lower().find("price")
+        if idx != -1:
+            start = max(0, idx - 200)
+            print(f"   found 'price' at offset {idx}, window: {html[start:idx + 1000]}", flush=True)
+        else:
+            body = soup.find("body")
+            print(f"   no 'price' text anywhere in {len(html)} chars; body sample: {body.get_text(' ', strip=True)[:800] if body else html[:800]}", flush=True)
 
 
 async def main():
+    # If set, test these exact known-good URLs directly instead of guessing
+    # IDs from our own card_id (futbin uses its own independent ID scheme,
+    # confirmed unrelated to fut.gg/EA's definition ID).
+    explicit_urls = os.getenv("FUTBIN_TEST_URLS")
+    if explicit_urls:
+        urls = [u.strip() for u in explicit_urls.split(",") if u.strip()]
+        print(f"🚀 Testing {len(urls)} explicit futbin URL(s)", flush=True)
+        async with aiohttp.ClientSession() as session:
+            for url in urls:
+                await fetch_one(session, "n/a", url, url=url)
+                await asyncio.sleep(1)
+        return
+
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         rows = await conn.fetch(
