@@ -31,8 +31,12 @@ class ExpiredSession(Exception):
     pass
 
 
+_DEBUG_SAMPLES_LEFT = int(os.getenv("EA_DEBUG_SAMPLES", "5"))
+
+
 async def fetch_lowest_bin(session: aiohttp.ClientSession, card_id: int):
     """Lowest active buyNowPrice for a card, or None if no live listings."""
+    global _DEBUG_SAMPLES_LEFT
     url = f"{EA_BASE}/transfermarket"
     params = {"start": 0, "num": 21, "type": "player", "maskedDefId": card_id}
 
@@ -47,9 +51,18 @@ async def fetch_lowest_bin(session: aiohttp.ClientSession, card_id: int):
                     await asyncio.sleep(retry_after)
                     continue
                 if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    print(f"⚠️ Unexpected status {resp.status} for card {card_id}: {body}", flush=True)
                     return None
 
+                raw = await resp.text()
+                if _DEBUG_SAMPLES_LEFT > 0:
+                    _DEBUG_SAMPLES_LEFT -= 1
+                    print(f"🔍 DEBUG raw response for card {card_id}: {raw[:500]}", flush=True)
+
                 data = await resp.json()
+                if not isinstance(data, dict) or "auctionInfo" not in data:
+                    print(f"⚠️ Unexpected response shape for card {card_id} (no auctionInfo key): {raw[:200]}", flush=True)
                 prices = [
                     a["buyNowPrice"]
                     for a in (data.get("auctionInfo") or [])
@@ -104,6 +117,11 @@ async def main():
 
         rows = await conn.fetch("SELECT card_id FROM fut_players WHERE card_id IS NOT NULL")
         card_ids = [int(r["card_id"]) for r in rows]
+
+        limit = os.getenv("EA_SYNC_LIMIT")
+        if limit:
+            card_ids = card_ids[: int(limit)]
+
         total = len(card_ids)
         print(f"📊 {total} cards to price (platform: PS/Xbox shared market)", flush=True)
 
