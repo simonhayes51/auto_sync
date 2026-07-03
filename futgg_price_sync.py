@@ -58,7 +58,13 @@ SCRAPERAPI_RENDER = os.getenv("SCRAPERAPI_RENDER", "true").lower() not in ("fals
 # a real rendering browser. This fetches the real page instead and reads the
 # price out of the rendered HTML, same as a human browsing would see it.
 SCRAPERAPI_USE_PAGE = os.getenv("SCRAPERAPI_USE_PAGE", "true").lower() not in ("false", "0", "")
+# ScraperAPI's own error told us fut.gg is a "protected domain" needing
+# premium=true or ultra_premium=true - empty string disables this param.
+SCRAPERAPI_PREMIUM_PARAM = os.getenv("SCRAPERAPI_PREMIUM_PARAM", "premium")
 _debug_html_samples_left = int(os.getenv("SCRAPERAPI_DEBUG_SAMPLES", "3"))
+# What to search for when picking the debug-dump window - not the exact key
+# name we ultimately parse on, just something likely to sit near it.
+_DEBUG_MARKERS = ["currentPrice", "buyNowPrice", "\"price\"", "eaId"]
 
 # fut.gg embeds this same currentPrice/price shape in the page's hydration
 # data - matches by eaId first so we don't grab a different player's price
@@ -201,6 +207,8 @@ async def fetch_price_from_page(session: aiohttp.ClientSession, card_id: int, pl
     that page's own JS, so hitting it directly never works, however it's fetched."""
     global _debug_html_samples_left
     params = {"api_key": SCRAPERAPI_KEY, "url": player_url, "render": "true"}
+    if SCRAPERAPI_PREMIUM_PARAM:
+        params[SCRAPERAPI_PREMIUM_PARAM] = "true"
     url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -218,7 +226,18 @@ async def fetch_price_from_page(session: aiohttp.ClientSession, card_id: int, pl
 
                 if _debug_html_samples_left > 0:
                     _debug_html_samples_left -= 1
-                    logger.info(f"🔍 {card_id} → raw page sample: {html[:1500]}")
+                    dump_at = None
+                    for marker in _DEBUG_MARKERS:
+                        idx = html.find(marker)
+                        if idx != -1:
+                            dump_at = (marker, idx)
+                            break
+                    if dump_at:
+                        marker, idx = dump_at
+                        start = max(0, idx - 200)
+                        logger.info(f"🔍 {card_id} → found '{marker}' at offset {idx}, window: {html[start:idx + 800]}")
+                    else:
+                        logger.info(f"🔍 {card_id} → none of {_DEBUG_MARKERS} found anywhere in {len(html)} chars; middle sample: {html[len(html)//2:len(html)//2 + 1500]}")
 
                 m = re.search(_PRICE_RE_TEMPLATE.format(card_id=card_id), html)
                 if not m:
@@ -501,7 +520,7 @@ if __name__ == "__main__":
         # Add some startup logging
         logger.info("🚀 FUT Price Sync starting...")
         if SCRAPERAPI_KEY and SCRAPERAPI_USE_PAGE:
-            logger.info("🌐 ScraperAPI: Yes, rendering player pages and parsing price from HTML")
+            logger.info(f"🌐 ScraperAPI: Yes, rendering player pages (premium_param={SCRAPERAPI_PREMIUM_PARAM or 'none'}) and parsing price from HTML")
         elif SCRAPERAPI_KEY:
             logger.info(f"🌐 ScraperAPI: Yes, hitting API URL directly, render={SCRAPERAPI_RENDER}")
         else:
