@@ -49,10 +49,15 @@ PROXY_URL = os.getenv("PROXY_URL")
 # fetching fut.gg directly - it runs a real headless browser to solve
 # Cloudflare's JS challenge, which a plain proxy (PROXY_URL) cannot do.
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+# Toggle so we can A/B test: a raw JSON endpoint may not need (or may choke
+# on) render=true, which is meant for pages that need real JS execution.
+SCRAPERAPI_RENDER = os.getenv("SCRAPERAPI_RENDER", "true").lower() not in ("false", "0", "")
 
 
 def wrap_scraperapi(target_url: str) -> str:
-    params = {"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "true"}
+    params = {"api_key": SCRAPERAPI_KEY, "url": target_url}
+    if SCRAPERAPI_RENDER:
+        params["render"] = "true"
     return "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
 
 # Setup logging with debug level to see more details
@@ -404,7 +409,7 @@ if __name__ == "__main__":
     try:
         # Add some startup logging
         logger.info("🚀 FUT Price Sync starting...")
-        logger.info(f"🌐 ScraperAPI rendering: {'Yes' if SCRAPERAPI_KEY else 'No (direct/proxy fetch)'}")
+        logger.info(f"🌐 ScraperAPI: {'Yes, render=' + str(SCRAPERAPI_RENDER) if SCRAPERAPI_KEY else 'No (direct/proxy fetch)'}")
         logger.info(f"📊 DATABASE_URL configured: {'Yes' if DATABASE_URL else 'No'}")
         logger.info(f"🔗 Using connection: postgresql://postgres:***@shuttle.proxy.rlwy.net:19669/railway")
         
