@@ -104,16 +104,22 @@ async def main():
         cols = await detect_price_columns(conn)
 
         set_parts = []
+        arg_kinds = []  # "text" or "num", one per placeholder before card_id
+        idx = 1
         if cols["has_price"]:
-            set_parts.append("price = $1::text")
+            set_parts.append(f"price = ${idx}")
+            arg_kinds.append("text")
+            idx += 1
         if cols["has_price_num"]:
-            set_parts.append("price_num = $1")
+            set_parts.append(f"price_num = ${idx}")
+            arg_kinds.append("num")
+            idx += 1
         if cols["has_price_updated_at"]:
             set_parts.append("price_updated_at = NOW()")
         if not set_parts:
             raise RuntimeError("❌ fut_players has none of price/price_num/price_updated_at columns")
 
-        update_sql = f"UPDATE fut_players SET {', '.join(set_parts)} WHERE card_id = $2"
+        update_sql = f"UPDATE fut_players SET {', '.join(set_parts)} WHERE card_id = ${idx}"
 
         rows = await conn.fetch("SELECT card_id FROM fut_players WHERE card_id IS NOT NULL")
         card_ids = [int(r["card_id"]) for r in rows]
@@ -135,7 +141,9 @@ async def main():
                     break
 
                 if price is not None:
-                    await conn.execute(update_sql, int(price), card_id)
+                    args = [str(price) if kind == "text" else int(price) for kind in arg_kinds]
+                    args.append(card_id)
+                    await conn.execute(update_sql, *args)
                     updated += 1
                 else:
                     skipped += 1
