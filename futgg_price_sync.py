@@ -4,6 +4,7 @@ import asyncpg
 import logging
 import random
 import os
+import re
 import json
 import urllib.parse
 from typing import Optional, List
@@ -52,6 +53,18 @@ SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 # Toggle so we can A/B test: a raw JSON endpoint may not need (or may choke
 # on) render=true, which is meant for pages that need real JS execution.
 SCRAPERAPI_RENDER = os.getenv("SCRAPERAPI_RENDER", "true").lower() not in ("false", "0", "")
+# The API endpoint requires a signed verify= token minted by JS running on
+# the actual player page - hitting it directly can never work, even through
+# a real rendering browser. This fetches the real page instead and reads the
+# price out of the rendered HTML, same as a human browsing would see it.
+SCRAPERAPI_USE_PAGE = os.getenv("SCRAPERAPI_USE_PAGE", "true").lower() not in ("false", "0", "")
+_debug_html_samples_left = int(os.getenv("SCRAPERAPI_DEBUG_SAMPLES", "3"))
+
+# fut.gg embeds this same currentPrice/price shape in the page's hydration
+# data - matches by eaId first so we don't grab a different player's price
+# off a "related players" widget on the same page.
+_PRICE_RE_TEMPLATE = r'"eaId"\s*:\s*{card_id}\s*,\s*"currentPrice"\s*:\s*\{{[^{{}}]*?"price"\s*:\s*(\d+)'
+_PRICE_RE_FALLBACK = r'"currentPrice"\s*:\s*\{[^{}]*?"price"\s*:\s*(\d+)'
 
 
 def wrap_scraperapi(target_url: str) -> str:
@@ -93,6 +106,25 @@ class DatabaseManager:
         if self.pool:
             await self.pool.close()
             logger.info("🔌 Database connection closed")
+
+    async def get_card_urls(self, limit: Optional[int] = None) -> dict:
+        """Fetch {card_id: player_url} for cards that have a stored player_url."""
+        try:
+            async with self.pool.acquire() as conn:
+                query = f"SELECT {CARD_ID_COLUMN}, player_url FROM {TABLE_NAME} WHERE {CARD_ID_COLUMN} IS NOT NULL AND player_url IS NOT NULL"
+                if limit:
+                    query += f" LIMIT {limit}"
+                rows = await conn.fetch(query)
+                out = {}
+                for row in rows:
+                    try:
+                        out[int(row[CARD_ID_COLUMN])] = row["player_url"]
+                    except (ValueError, TypeError):
+                        continue
+                return out
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch player URLs: {e}")
+            return {}
 
     async def get_card_ids(self, limit: Optional[int] = None) -> List[int]:
         """Fetch all card IDs from the database"""
@@ -163,8 +195,60 @@ class DatabaseManager:
             logger.error(f"❌ Batch update failed: {e}")
             return 0
 
-async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[int]:
+async def fetch_price_from_page(session: aiohttp.ClientSession, card_id: int, player_url: str) -> Optional[int]:
+    """Render the actual player page (via ScraperAPI) and read the price out of
+    its hydration data - the API endpoint requires a verify= token minted by
+    that page's own JS, so hitting it directly never works, however it's fetched."""
+    global _debug_html_samples_left
+    params = {"api_key": SCRAPERAPI_KEY, "url": player_url, "render": "true"}
+    url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.get(url, timeout=60) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:200]
+                    logger.error(f"❌ {card_id} → page fetch status {resp.status}: {body}")
+                    if resp.status in (429, 500, 502, 503):
+                        await asyncio.sleep(random.uniform(2, 4))
+                        continue
+                    return None
+
+                html = await resp.text()
+
+                if _debug_html_samples_left > 0:
+                    _debug_html_samples_left -= 1
+                    logger.info(f"🔍 {card_id} → raw page sample: {html[:1500]}")
+
+                m = re.search(_PRICE_RE_TEMPLATE.format(card_id=card_id), html)
+                if not m:
+                    m = re.search(_PRICE_RE_FALLBACK, html)
+                if m:
+                    price = int(m.group(1))
+                    logger.info(f"✅ {card_id} → {price} (parsed from rendered page)")
+                    return price
+
+                logger.warning(f"⚠️ {card_id} → page fetched OK but no price pattern matched (len={len(html)})")
+                return None
+        except asyncio.TimeoutError:
+            logger.error(f"⏳ Timeout rendering page for {card_id} (attempt {attempt})")
+            await asyncio.sleep(random.uniform(1, 3))
+        except Exception as e:
+            logger.error(f"❌ {card_id} → page render failed: {e}")
+            await asyncio.sleep(random.uniform(1, 2))
+
+    logger.error(f"⏭️ {card_id} → all page-render retries failed")
+    return None
+
+
+async def fetch_price(session: aiohttp.ClientSession, card_id: int, player_url: Optional[str] = None) -> Optional[int]:
     """Fetch price for a single card ID with enhanced debugging"""
+    if SCRAPERAPI_KEY and SCRAPERAPI_USE_PAGE:
+        if player_url:
+            return await fetch_price_from_page(session, card_id, player_url)
+        logger.warning(f"⚠️ {card_id} → no player_url stored, skipping (can't render a page without one)")
+        return None
+
     target_url = f"{API_URL}/{card_id}"
 
     if SCRAPERAPI_KEY:
@@ -239,15 +323,16 @@ async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[
     return None
 
 async def process_batch_concurrent(session: aiohttp.ClientSession, db_manager: DatabaseManager,
-                                   card_ids: List[int]) -> int:
+                                   card_ids: List[int], url_map: Optional[dict] = None) -> int:
     """Process a batch of card IDs concurrently for speed"""
-    
+
     # Create semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    
+    url_map = url_map or {}
+
     async def fetch_with_semaphore(card_id):
         async with semaphore:
-            return await fetch_price(session, card_id)
+            return await fetch_price(session, card_id, url_map.get(card_id))
     
     # Execute all requests concurrently
     tasks = [fetch_with_semaphore(card_id) for card_id in card_ids]
@@ -281,7 +366,13 @@ async def main():
         await db_manager.connect()
         
         # Get all card IDs from database
-        card_ids = await db_manager.get_card_ids()
+        url_map = {}
+        if SCRAPERAPI_KEY and SCRAPERAPI_USE_PAGE:
+            url_map = await db_manager.get_card_urls()
+            card_ids = list(url_map.keys())
+            logger.info(f"📊 {len(card_ids)} cards have a stored player_url (needed for page rendering)")
+        else:
+            card_ids = await db_manager.get_card_ids()
 
         test_limit = os.getenv("PRICE_SYNC_LIMIT")
         if test_limit:
@@ -307,7 +398,7 @@ async def main():
                 
                 logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} cards)")
                 
-                updated_count = await process_batch_concurrent(session, db_manager, batch)
+                updated_count = await process_batch_concurrent(session, db_manager, batch, url_map)
                 total_updated += updated_count
                 processed_cards += len(batch)
                 
@@ -409,7 +500,12 @@ if __name__ == "__main__":
     try:
         # Add some startup logging
         logger.info("🚀 FUT Price Sync starting...")
-        logger.info(f"🌐 ScraperAPI: {'Yes, render=' + str(SCRAPERAPI_RENDER) if SCRAPERAPI_KEY else 'No (direct/proxy fetch)'}")
+        if SCRAPERAPI_KEY and SCRAPERAPI_USE_PAGE:
+            logger.info("🌐 ScraperAPI: Yes, rendering player pages and parsing price from HTML")
+        elif SCRAPERAPI_KEY:
+            logger.info(f"🌐 ScraperAPI: Yes, hitting API URL directly, render={SCRAPERAPI_RENDER}")
+        else:
+            logger.info("🌐 ScraperAPI: No (direct/proxy fetch)")
         logger.info(f"📊 DATABASE_URL configured: {'Yes' if DATABASE_URL else 'No'}")
         logger.info(f"🔗 Using connection: postgresql://postgres:***@shuttle.proxy.rlwy.net:19669/railway")
         
