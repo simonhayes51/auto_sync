@@ -5,10 +5,11 @@ import logging
 import random
 import os
 import json
+import urllib.parse
 from typing import Optional, List
 
 # Configuration - Optimized for speed but stable
-API_URL = "https://www.fut.gg/api/fut/player-prices/25"
+API_URL = "https://www.fut.gg/api/fut/player-prices/26"
 MAX_RETRIES = 3
 BATCH_SIZE = 30  # Reduced slightly for stability
 DELAY_BETWEEN_REQUESTS = 0.1  # Reduced from 0.5s to 0.1s
@@ -38,6 +39,16 @@ HEADERS = {
 }
 
 PROXY_URL = os.getenv("PROXY_URL")
+
+# If set, requests go through ScraperAPI's rendering endpoint instead of
+# fetching fut.gg directly - it runs a real headless browser to solve
+# Cloudflare's JS challenge, which a plain proxy (PROXY_URL) cannot do.
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+
+
+def wrap_scraperapi(target_url: str) -> str:
+    params = {"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "true"}
+    return "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
 
 # Setup logging with debug level to see more details
 logger = logging.getLogger("fut-price-sync")
@@ -144,11 +155,20 @@ class DatabaseManager:
 
 async def fetch_price(session: aiohttp.ClientSession, card_id: int) -> Optional[int]:
     """Fetch price for a single card ID with enhanced debugging"""
-    url = f"{API_URL}/{card_id}"
+    target_url = f"{API_URL}/{card_id}"
+
+    if SCRAPERAPI_KEY:
+        url = wrap_scraperapi(target_url)
+        proxy = None
+        timeout = 60  # rendering a real browser page is much slower than a direct request
+    else:
+        url = target_url
+        proxy = PROXY_URL
+        timeout = 15
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(url, headers=HEADERS, timeout=15, proxy=PROXY_URL) as resp:
+            async with session.get(url, headers=HEADERS, timeout=timeout, proxy=proxy) as resp:
                 text = await resp.text()
 
                 if resp.status == 200:
@@ -252,7 +272,11 @@ async def main():
         
         # Get all card IDs from database
         card_ids = await db_manager.get_card_ids()
-        
+
+        test_limit = os.getenv("PRICE_SYNC_LIMIT")
+        if test_limit:
+            card_ids = card_ids[: int(test_limit)]
+
         if not card_ids:
             logger.warning("⚠️ No card IDs found in database")
             return
@@ -375,6 +399,7 @@ if __name__ == "__main__":
     try:
         # Add some startup logging
         logger.info("🚀 FUT Price Sync starting...")
+        logger.info(f"🌐 ScraperAPI rendering: {'Yes' if SCRAPERAPI_KEY else 'No (direct/proxy fetch)'}")
         logger.info(f"📊 DATABASE_URL configured: {'Yes' if DATABASE_URL else 'No'}")
         logger.info(f"🔗 Using connection: postgresql://postgres:***@shuttle.proxy.rlwy.net:19669/railway")
         
