@@ -81,17 +81,23 @@ async def fetch_one(session: aiohttp.ClientSession, card_id, name: str, url: str
     print(f"   page title: {title.get_text(strip=True) if title else 'none'}", flush=True)
 
     price = _parse_platform_price(soup, "ps")
-    if price:
-        print(f"   ✅ parsed price: {price}", flush=True)
-    else:
-        print("   ⚠️ no price parsed - looking for a 'price' marker in the raw HTML:", flush=True)
-        idx = html.lower().find("price")
-        if idx != -1:
-            start = max(0, idx - 200)
-            print(f"   found 'price' at offset {idx}, window: {html[start:idx + 1000]}", flush=True)
-        else:
-            body = soup.find("body")
-            print(f"   no 'price' text anywhere in {len(html)} chars; body sample: {body.get_text(' ', strip=True)[:800] if body else html[:800]}", flush=True)
+    print(f"   old-heuristic parsed price: {price if price else 'none'} (unverified - may be picking up the wrong number)", flush=True)
+
+    # Ground-truth check: if we know the actual correct price (from manually
+    # checking the real page), find exactly where it appears in the raw HTML
+    # so we can build a parser against real markup instead of a heuristic.
+    expected = os.getenv("FUTBIN_EXPECTED_PRICE")
+    if expected:
+        expected_variants = [expected, f"{int(expected):,}"]
+        found_any = False
+        for variant in expected_variants:
+            idx = html.find(variant)
+            if idx != -1:
+                found_any = True
+                start = max(0, idx - 300)
+                print(f"   🎯 found expected price '{variant}' at offset {idx}, window: {html[start:idx + 300]}", flush=True)
+        if not found_any:
+            print(f"   ⚠️ expected price {expected} not found anywhere in {len(html)} chars of HTML at all (may be injected by client-side JS after load)", flush=True)
 
 
 async def main():
