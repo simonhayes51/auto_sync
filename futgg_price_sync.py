@@ -59,8 +59,17 @@ SCRAPERAPI_RENDER = os.getenv("SCRAPERAPI_RENDER", "true").lower() not in ("fals
 # price out of the rendered HTML, same as a human browsing would see it.
 SCRAPERAPI_USE_PAGE = os.getenv("SCRAPERAPI_USE_PAGE", "true").lower() not in ("false", "0", "")
 # ScraperAPI's own error told us fut.gg is a "protected domain" needing
-# premium=true or ultra_premium=true - empty string disables this param.
-SCRAPERAPI_PREMIUM_PARAM = os.getenv("SCRAPERAPI_PREMIUM_PARAM", "premium")
+# premium=true or ultra_premium=true - plain premium wasn't enough in
+# testing, so default to the higher tier. Empty string disables this param.
+SCRAPERAPI_PREMIUM_PARAM = os.getenv("SCRAPERAPI_PREMIUM_PARAM", "ultra_premium")
+# The page renders fine but shows loading skeletons - fut.gg's own
+# client-side data fetch hasn't finished when ScraperAPI snapshots it.
+# wait_for_selector tells ScraperAPI to hold off returning the result until
+# this element exists, i.e. until real content has replaced the skeleton.
+# Best-effort guess at fut.gg's own section anchor for the PRICES tab, based
+# on the pattern seen in a real page dump (id="playstyles" for that tab).
+# Empty string disables this param if the guess turns out wrong.
+SCRAPERAPI_WAIT_SELECTOR = os.getenv("SCRAPERAPI_WAIT_SELECTOR", "#prices")
 _debug_html_samples_left = int(os.getenv("SCRAPERAPI_DEBUG_SAMPLES", "3"))
 # What to search for when picking the debug-dump window - not the exact key
 # name we ultimately parse on, just something likely to sit near it.
@@ -207,6 +216,8 @@ async def fetch_price_from_page(session: aiohttp.ClientSession, card_id: int, pl
     that page's own JS, so hitting it directly never works, however it's fetched."""
     global _debug_html_samples_left
     params = {"api_key": SCRAPERAPI_KEY, "url": player_url, "render": "true"}
+    if SCRAPERAPI_WAIT_SELECTOR:
+        params["wait_for_selector"] = SCRAPERAPI_WAIT_SELECTOR
     if SCRAPERAPI_PREMIUM_PARAM:
         params[SCRAPERAPI_PREMIUM_PARAM] = "true"
     url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
@@ -520,7 +531,7 @@ if __name__ == "__main__":
         # Add some startup logging
         logger.info("🚀 FUT Price Sync starting...")
         if SCRAPERAPI_KEY and SCRAPERAPI_USE_PAGE:
-            logger.info(f"🌐 ScraperAPI: Yes, rendering player pages (premium_param={SCRAPERAPI_PREMIUM_PARAM or 'none'}) and parsing price from HTML")
+            logger.info(f"🌐 ScraperAPI: Yes, rendering player pages (premium_param={SCRAPERAPI_PREMIUM_PARAM or 'none'}, wait_for_selector={SCRAPERAPI_WAIT_SELECTOR or 'none'}) and parsing price from HTML")
         elif SCRAPERAPI_KEY:
             logger.info(f"🌐 ScraperAPI: Yes, hitting API URL directly, render={SCRAPERAPI_RENDER}")
         else:
