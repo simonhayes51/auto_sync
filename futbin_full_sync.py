@@ -42,7 +42,7 @@ FUTBIN_HREF_RE = re.compile(r"/player/(\d+)/([^/\"'?]+)")
 # live table get used - detected at startup, nothing hardcoded blindly.
 CANDIDATE_COLUMNS = [
     "name", "rating", "version", "position", "altposition",
-    "club", "nation", "league", "image_url",
+    "club", "nation", "league", "image_url", "player_url",
     "price", "price_num", "price_updated_at",
 ]
 
@@ -122,12 +122,18 @@ def parse_row(row):
         if price_div:
             ps_price = _num(price_div.get_text(strip=True))
 
+    # We don't have fut.gg's own URL scheme for cards sourced from futbin,
+    # but player_url is NOT NULL in the schema - futbin's own page is a
+    # genuinely valid, dereferenceable URL for this exact card, not a
+    # meaningless placeholder.
+    player_url = f"https://www.futbin.com/{GAME}/player/{futbin_id}/{slug}" if futbin_id and slug else None
+
     return {
         "futbin_id": futbin_id, "slug": slug, "card_id": card_id,
         "name": name, "rating": rating, "version": version,
         "position": position, "altposition": altposition,
         "club": club, "nation": nation, "league": league,
-        "image_url": image_url, "ps_price": ps_price,
+        "image_url": image_url, "player_url": player_url, "ps_price": ps_price,
     }
 
 
@@ -152,6 +158,22 @@ async def detect_columns(conn: asyncpg.Connection) -> set:
         """
     )
     return {r["column_name"] for r in rows}
+
+
+async def find_unhandled_not_null_columns(conn: asyncpg.Connection, cols_we_write: set) -> list:
+    """Any NOT NULL column with no default that we don't populate would
+    fail exactly like player_url just did - catch all of them upfront
+    instead of discovering them one failed insert at a time."""
+    rows = await conn.fetch(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='fut_players'
+          AND is_nullable = 'NO' AND column_default IS NULL
+          AND column_name <> 'card_id'
+        """
+    )
+    required = {r["column_name"] for r in rows}
+    return sorted(required - cols_we_write)
 
 
 def build_upsert_sql(available: set):
@@ -200,6 +222,14 @@ async def main():
             raise RuntimeError("❌ fut_players has no card_id column - can't upsert")
         upsert_sql, cols = build_upsert_sql(available)
         print(f"📋 Writing columns: card_id, {', '.join(cols)}", flush=True)
+
+        missing_not_null = await find_unhandled_not_null_columns(conn, set(cols) | {"card_id"})
+        if missing_not_null:
+            raise RuntimeError(
+                f"❌ fut_players has NOT NULL column(s) with no default that we don't populate: "
+                f"{missing_not_null} - inserts for new cards will fail on every row. "
+                f"Add handling for these before running the real crawl."
+            )
 
         total_rows = written = skipped_no_card_id = skipped_no_name = 0
 
