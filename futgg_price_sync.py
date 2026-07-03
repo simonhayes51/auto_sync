@@ -11,10 +11,15 @@ from typing import Optional, List
 # Configuration - Optimized for speed but stable
 API_URL = "https://www.fut.gg/api/fut/player-prices/26"
 MAX_RETRIES = 3
-BATCH_SIZE = 30  # Reduced slightly for stability
-DELAY_BETWEEN_REQUESTS = 0.1  # Reduced from 0.5s to 0.1s
-DELAY_BETWEEN_BATCHES = 0.5   # Reduced from 2.0s to 0.5s
-MAX_CONCURRENT_REQUESTS = 15  # Reduced from 20 to 15 for stability
+
+# ScraperAPI's rendering mode is far slower per-request and free/trial plans
+# cap concurrency much lower than a direct fetch would need - default a lot
+# more conservatively when it's in use, but still allow override via env.
+_using_scraperapi = bool(os.getenv("SCRAPERAPI_KEY"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5" if _using_scraperapi else "30"))
+DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "0.1"))
+DELAY_BETWEEN_BATCHES = float(os.getenv("DELAY_BETWEEN_BATCHES", "3" if _using_scraperapi else "0.5"))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3" if _using_scraperapi else "15"))
 
 # Railway PostgreSQL configuration - use the exact Railway DATABASE_URL
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
