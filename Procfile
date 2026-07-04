@@ -1,1 +1,1 @@
-worker: python new_players_sync.py
+worker: python futbin_full_sync.py

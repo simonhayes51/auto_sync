@@ -23,17 +23,10 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-## 4. Start FastAPI Backend
+## 4. Run the futbin sync worker
 ```bash
-uvicorn backend.main:app --reload
+python futbin_full_sync.py --now
 ```
-
-## 5. Test API
-- http://127.0.0.1:8000/api/players → Fetch dummy players.
-- http://127.0.0.1:8000/api/price/101 → Fetch Haaland's data.
-
-## 6. Integrate Dashboard Locally
-Point your React frontend to:
-```
-http://127.0.0.1:8000/api
-```
+`--now` runs a single crawl and exits, for local testing. Without it, the
+script runs forever, doing one full crawl daily at 19:00 UK (this is what
+Railway's `worker` process runs, per the Procfile).
