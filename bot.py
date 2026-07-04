@@ -19,7 +19,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Load cogs
-initial_cogs = ["cogs.data_sync"]
+# cogs.data_sync was a fut.gg-scraping duplicate of the now-removed fut.gg
+# sync scripts (fut.gg blocks scrapers; card sync now happens via the
+# standalone futbin_full_sync.py worker, not a Discord cog) - removed,
+# nothing left to load.
+initial_cogs = []
 
 @bot.event
 async def on_ready():

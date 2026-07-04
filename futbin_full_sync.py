@@ -17,14 +17,27 @@ table first, card_id's existing unique constraint already prevents
 duplicates.
 
 futbin has ~848 listing pages total (confirmed via its own pagination UI).
-Defaults to a small test range - set FUTBIN_PAGE_START/FUTBIN_PAGE_END to
-cover more, or the full 1-848 once this is proven safe at scale.
+Defaults to the full 1-848 range now that this is proven safe at scale -
+set FUTBIN_PAGE_START/FUTBIN_PAGE_END to override with a smaller range
+for local testing.
+
+Deployed as the Railway `worker` process (see Procfile). Since Railway
+workers are expected to run indefinitely rather than exit, this runs the
+full crawl once daily at a fixed time (19:00 UK, matching the old
+futgg_auto_sync.py's schedule) and sleeps between runs - see main_loop()
+at the bottom. Pass --now to run a single crawl immediately and exit,
+which is useful for local testing.
 """
 import os
 import re
+import sys
+import signal
 import asyncio
 import asyncpg
 import aiohttp
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from aiohttp import web  # health server
 from bs4 import BeautifulSoup
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -33,7 +46,7 @@ if not DATABASE_URL:
 
 GAME = os.getenv("FUTBIN_GAME", "26")
 PAGE_START = int(os.getenv("FUTBIN_PAGE_START", "1"))
-PAGE_END = int(os.getenv("FUTBIN_PAGE_END", "3"))  # small default for safe testing
+PAGE_END = int(os.getenv("FUTBIN_PAGE_END", "848"))  # full listing range
 REQUEST_DELAY = float(os.getenv("FUTBIN_REQUEST_DELAY", "1.5"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
@@ -341,7 +354,15 @@ def row_args(row: dict, cols: list):
     return args
 
 
-async def main():
+async def crawl_once():
+    """Run one full crawl of PAGE_START..PAGE_END and upsert everything found.
+
+    Opens and closes its own DB connection rather than holding one open for
+    the process's whole lifetime, since main_loop() only calls this once a
+    day - a connection held open across a ~24h idle gap is exactly the kind
+    of thing that gets silently dropped by the DB/host and would otherwise
+    fail confusingly on the next run.
+    """
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await ensure_new_columns(conn)
@@ -401,5 +422,65 @@ async def main():
         await conn.close()
 
 
+# ================== HEALTH & SCHEDULER ================== #
+# Railway's `worker` process type expects a long-running process, not a
+# one-shot script that exits - a worker that exits immediately (or once a
+# day) looks crashed/restart-looping from Railway's perspective. This loop
+# runs a full crawl once daily and sleeps in between, following the same
+# sleep_until_19_uk()/health-server pattern futgg_auto_sync.py used.
+async def start_health():
+    app = web.Application()
+    app.add_routes([
+        web.get("/", lambda _: web.Response(text="OK")),
+        web.get("/health", lambda _: web.Response(text="OK")),
+    ])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
+    await site.start()
+    return asyncio.create_task(asyncio.Event().wait())
+
+
+shutdown_evt = asyncio.Event()
+
+
+def _sig():
+    shutdown_evt.set()
+
+
+async def sleep_until_19_uk():
+    tz = ZoneInfo("Europe/London")
+    now = datetime.now(tz)
+    target = now.replace(hour=19, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    print(f"🕖 Next crawl at {target.isoformat()}", flush=True)
+    await asyncio.sleep((target - now).total_seconds())
+
+
+async def main_loop():
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(s, _sig)
+        except Exception:
+            pass
+    health = None
+    if os.getenv("PORT"):
+        health = await start_health()
+    while not shutdown_evt.is_set():
+        try:
+            await crawl_once()
+        except Exception as e:
+            print(f"❌ crawl_once() failed, will retry at next scheduled time: {e}", flush=True)
+        await sleep_until_19_uk()
+    if health:
+        health.cancel()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--now" in sys.argv:
+        # Single crawl, then exit - for local testing (mirrors futgg_auto_sync.py's --now flag).
+        asyncio.run(crawl_once())
+    else:
+        asyncio.run(main_loop())
