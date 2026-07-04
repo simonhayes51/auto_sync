@@ -36,7 +36,12 @@ async def sync_players():
 
                         player_href = player_card["href"]
                         player_slug = player_href.split("/")[-1]
-                        player_url = FUTGG_BASE_URL + player_href
+                        # Not a fut.gg player_url - fut.gg is Cloudflare-blocked
+                        # and unreachable, so this would just clobber the real
+                        # futbin link every price/sales/card-image fetch relies
+                        # on. Leave it unset; the DO UPDATE below preserves
+                        # whatever futbin_full_sync.py already put there.
+                        player_url = None
 
                         image_url = player_card.select_one("img")["src"]
                         # Extract card_id from the image URL
@@ -54,7 +59,7 @@ async def sync_players():
                             VALUES ($1, $2, $3, $4, $5, $6, NOW())
                             ON CONFLICT (name, rating)
                             DO UPDATE SET player_slug = EXCLUDED.player_slug,
-                                          player_url = EXCLUDED.player_url,
+                                          player_url = COALESCE(fut_players.player_url, EXCLUDED.player_url),
                                           image_url = EXCLUDED.image_url,
                                           card_id = EXCLUDED.card_id;
                         """, p[0], p[1], p[2], p[3], p[4], p[5])

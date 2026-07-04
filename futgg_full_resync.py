@@ -100,11 +100,18 @@ def fetch_players_from_page(page_number: int):
                 continue
 
             href = a.get("href") or ""
-            player_url = f"https://www.fut.gg{href}" if href.startswith("/") else href
 
             # slug: /players/<id>/<slug>/
             parts = [p for p in href.split("/") if p]
             player_slug = parts[2] if len(parts) >= 3 else None
+
+            # player_url is NOT sourced from fut.gg here - fut.gg is
+            # Cloudflare-blocked and unreachable, so a fut.gg link is
+            # actively wrong: it's futbin_full_sync.py's real futbin link
+            # that every price/sales/card-image fetch depends on, and the
+            # DO UPDATE below preserves whatever is already there instead
+            # of clobbering it with this.
+            player_url = None
 
             card_id = extract_card_id(img_url)
             if not card_id:
@@ -185,7 +192,7 @@ async def sync_players():
             image_url   = EXCLUDED.image_url,
             created_at  = EXCLUDED.created_at,
             player_slug = EXCLUDED.player_slug,
-            player_url  = EXCLUDED.player_url;
+            player_url  = COALESCE(fut_players.player_url, EXCLUDED.player_url);
         """
 
         # Batch insert for speed – tuple order MUST match stmt

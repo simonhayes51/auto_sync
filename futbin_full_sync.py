@@ -38,7 +38,13 @@ REQUEST_DELAY = float(os.getenv("FUTBIN_REQUEST_DELAY", "1.5"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
-IMG_ID_RE = re.compile(r"/players/p(\d+)\.")
+# futbin's cutout image filename is /players/p{id}.png for special cards
+# but /players/{id}.png (no "p") for base gold/silver/bronze cards - the "p"
+# is optional here so base cards aren't silently skipped for having no
+# card_id (they were: every base/common row failed this match, so this
+# script never wrote or refreshed them, leaving them on whatever stale
+# image_url/player_url an old fut.gg-based crawl had set).
+IMG_ID_RE = re.compile(r"/players/p?(\d+)\.")
 FUTBIN_HREF_RE = re.compile(r"/player/(\d+)/([^/\"'?]+)")
 FOOT_RE = re.compile(r"foot-(right|left)", re.I)
 LEADING_INT_RE = re.compile(r"^\s*(\d+)")
