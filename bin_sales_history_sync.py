@@ -42,6 +42,7 @@ import sys
 import signal
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -143,31 +144,43 @@ async def fetch_lowest_bin(session: aiohttp.ClientSession, player_url: str, plat
     return parse_lowest_bin(html, platform)
 
 
-async def _resolve_sales_path(session: aiohttp.ClientSession, player_url: str) -> Optional[str]:
+async def _resolve_sales_path(
+    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int]
+) -> Optional[str]:
     market_url = player_url.rstrip("/") + "/market"
     try:
         async with session.get(market_url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
             if r.status != 200:
+                diag["sales_market_fetch_failed"] += 1
+                diag.setdefault("sales_market_fetch_sample", f"status={r.status} url={market_url}")
                 return None
             html = await r.text()
-    except Exception:
+    except Exception as e:
+        diag["sales_market_fetch_failed"] += 1
+        diag.setdefault("sales_market_fetch_sample", f"exception={e} url={market_url}")
         return None
 
     soup = BeautifulSoup(html, "html.parser")
     a = soup.find("a", class_=re.compile(r"\bmarket-grid-lates-sale-link\b"))
     if not a or not a.get("href"):
+        diag["sales_no_history_link"] += 1
+        diag.setdefault("sales_no_history_link_sample", f"html_len={len(html)} url={market_url}")
         return None
     return a["href"].split("?")[0]
 
 
-async def _sales_url(session: aiohttp.ClientSession, player_url: str, platform: str) -> Optional[str]:
+async def _sales_url(
+    session: aiohttp.ClientSession, player_url: str, platform: str, diag: Dict[str, int]
+) -> Optional[str]:
     fb_plat = "pc" if platform == "pc" else "ps"
-    path = await _resolve_sales_path(session, player_url)
+    path = await _resolve_sales_path(session, player_url, diag)
     if path:
         return f"https://www.futbin.com{path}?platform={fb_plat}"
     if "/player/" in player_url:
+        diag["sales_used_fallback_url"] += 1
         sales_base = player_url.replace("/player/", "/sales/")
         return f"{sales_base}?platform={fb_plat}"
+    diag["sales_no_url_at_all"] += 1
     return None
 
 
@@ -185,27 +198,35 @@ def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional
     return dt
 
 
-def parse_sales_table(html: str, limit: int = 30) -> List[Dict[str, Any]]:
+def parse_sales_table(html: str, diag: Dict[str, int], limit: int = 30) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="auctions-table")
     if not table:
+        diag["sales_no_table"] += 1
+        diag.setdefault("sales_no_table_sample", f"html_len={len(html)} has_auctions_str={'auctions-table' in html}")
         return []
     body = table.find("tbody")
     if not body:
+        diag["sales_no_tbody"] += 1
         return []
 
+    raw_rows = body.find_all("tr")
+    diag["sales_raw_rows"] += len(raw_rows)
+
     sales: List[Dict[str, Any]] = []
-    for row in body.find_all("tr"):
+    for row in raw_rows:
         if len(sales) >= limit:
             break
         tds = row.find_all("td")
         if len(tds) < 5:
+            diag["sales_rows_too_few_tds"] += 1
             continue
 
         date_div = tds[0].find("div")
         icon = date_div.find("i") if date_div else None
         sold = bool(icon and any("fa-check" in c for c in icon.get("class", [])))
         if not sold:
+            diag["sales_rows_not_sold"] += 1
             continue
 
         date_span = date_div.find("span", class_="sales-date-time") if date_div else None
@@ -215,6 +236,8 @@ def parse_sales_table(html: str, limit: int = 30) -> List[Dict[str, Any]]:
         if sold_at is None:
             # Can't dedupe or timestamp this row honestly - skip rather than
             # store a sale with a fabricated/missing sold_at.
+            diag["sales_rows_bad_date"] += 1
+            diag.setdefault("sales_rows_bad_date_sample", repr(date_text))
             continue
 
         # Real column layout confirmed against a live page (Player Sales
@@ -228,6 +251,7 @@ def parse_sales_table(html: str, limit: int = 30) -> List[Dict[str, Any]]:
         ea_tax = _num(tds[3].get_text(strip=True))
         net_price = _num(tds[4].get_text(strip=True))
         if not sold_price:
+            diag["sales_rows_zero_price"] += 1
             continue
 
         sales.append({
@@ -241,18 +265,25 @@ def parse_sales_table(html: str, limit: int = 30) -> List[Dict[str, Any]]:
     return sales
 
 
-async def fetch_sales_history(session: aiohttp.ClientSession, player_url: str, platform: str = "ps") -> List[Dict[str, Any]]:
-    url = await _sales_url(session, player_url, platform)
+async def fetch_sales_history(
+    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int], platform: str = "ps"
+) -> List[Dict[str, Any]]:
+    url = await _sales_url(session, player_url, platform, diag)
     if not url:
         return []
+    diag.setdefault("sales_first_resolved_url", url)
     try:
         async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
             if r.status != 200:
+                diag["sales_page_fetch_failed"] += 1
+                diag.setdefault("sales_page_fetch_sample", f"status={r.status} url={url}")
                 return []
             html = await r.text()
-    except Exception:
+    except Exception as e:
+        diag["sales_page_fetch_failed"] += 1
+        diag.setdefault("sales_page_fetch_sample", f"exception={e} url={url}")
         return []
-    return parse_sales_table(html)
+    return parse_sales_table(html, diag)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +334,7 @@ async def _scrape_one(
     sem: asyncio.Semaphore,
     card_id: int,
     player_url: str,
-    counters: Dict[str, int],
+    diag: Dict[str, Any],
 ) -> None:
     async with sem:
         # --- BIN history: both markets, always insert, never overwrite ---
@@ -316,16 +347,23 @@ async def _scrape_one(
                         "VALUES ($1, $2, $3, NOW())",
                         card_id, platform, bin_price,
                     )
-                counters["bin_ok"] += 1
+                # A successful INSERT doesn't mean a real price was found - a
+                # None scrape result inserts a NULL just as "successfully" as
+                # a real number does, so those are counted separately here
+                # rather than both landing in one misleading "ok" bucket.
+                if bin_price is not None:
+                    diag["bin_price_found"] += 1
+                else:
+                    diag["bin_price_null"] += 1
             except Exception as e:
-                counters["bin_failed"] += 1
+                diag["bin_failed"] += 1
                 log.warning("BIN scrape failed for card_id=%s platform=%s: %s", card_id, platform, e)
 
         # --- Sales history: dedupe on (player_id, sold_at, sold_price) ---
         try:
-            sales = await fetch_sales_history(session, player_url, "ps")
+            sales = await fetch_sales_history(session, player_url, diag, "ps")
         except Exception as e:
-            counters["sales_failed"] += 1
+            diag["sales_failed"] += 1
             log.warning("Sales scrape failed for card_id=%s: %s", card_id, e)
             return
 
@@ -345,11 +383,11 @@ async def _scrape_one(
                 # rowcount is 0 when ON CONFLICT DO NOTHING skipped an existing row.
                 rowcount = int(result.rsplit(" ", 1)[-1])
                 if rowcount == 0:
-                    counters["sales_dupe"] += 1
+                    diag["sales_dupe"] += 1
                 else:
-                    counters["sales_new"] += 1
+                    diag["sales_new"] += 1
             except Exception as e:
-                counters["sales_failed"] += 1
+                diag["sales_failed"] += 1
                 log.warning("Sales insert failed for card_id=%s sold_at=%s: %s", card_id, s["sold_at"], e)
 
 
@@ -368,19 +406,36 @@ async def crawl_once() -> None:
             return
 
         sem = asyncio.Semaphore(HISTORY_CONCURRENCY)
-        counters = {"bin_ok": 0, "bin_failed": 0, "sales_new": 0, "sales_dupe": 0, "sales_failed": 0}
+        diag: Dict[str, Any] = defaultdict(int)
 
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(*[
-                _scrape_one(pool, session, sem, r["card_id"], r["player_url"], counters)
+                _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
                 for r in rows
             ])
 
         log.info(
-            "Run complete. bin_ok=%d bin_failed=%d sales_new=%d sales_dupe=%d sales_failed=%d",
-            counters["bin_ok"], counters["bin_failed"],
-            counters["sales_new"], counters["sales_dupe"], counters["sales_failed"],
+            "Run complete. bin_price_found=%d bin_price_null=%d bin_failed=%d | "
+            "sales_new=%d sales_dupe=%d sales_failed=%d",
+            diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
+            diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
         )
+        # Detailed sales-pipeline breakdown - only printed when something
+        # other than a clean "no history yet" is going on, so a healthy run
+        # doesn't spam the log with a wall of zeros.
+        diagnostic_keys = [
+            "sales_market_fetch_failed", "sales_no_history_link", "sales_used_fallback_url",
+            "sales_no_url_at_all", "sales_page_fetch_failed", "sales_no_table", "sales_no_tbody",
+            "sales_rows_too_few_tds", "sales_rows_not_sold", "sales_rows_bad_date", "sales_rows_zero_price",
+        ]
+        if any(diag.get(k) for k in diagnostic_keys):
+            log.info("Sales pipeline diagnostics: %s", {k: diag[k] for k in diagnostic_keys if diag.get(k)})
+        for sample_key in (
+            "sales_first_resolved_url", "sales_market_fetch_sample", "sales_no_history_link_sample",
+            "sales_page_fetch_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
+        ):
+            if sample_key in diag:
+                log.info("%s: %s", sample_key, diag[sample_key])
     finally:
         await pool.close()
 
