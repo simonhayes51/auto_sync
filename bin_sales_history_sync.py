@@ -337,6 +337,19 @@ async def _scrape_one(
     diag: Dict[str, Any],
 ) -> None:
     async with sem:
+        # This script trusts fut_players.player_url completely - it has no
+        # site of its own to fetch from. If the main futbin_full_sync.py
+        # worker hasn't (re)crawled a given row since before the futbin
+        # migration, that column can still hold an old fut.gg URL, which
+        # 403s on every request (fut.gg blocks scrapers - the whole reason
+        # this project moved to futbin). Catch that up front with zero
+        # requests wasted, instead of taking a market-page fetch + a sales
+        # fetch to eventually surface a generic 403.
+        if "futbin.com" not in player_url:
+            diag["stale_non_futbin_url"] += 1
+            diag.setdefault("stale_non_futbin_url_sample", f"card_id={card_id} url={player_url}")
+            return
+
         # --- BIN history: both markets, always insert, never overwrite ---
         for platform in ("ps", "pc"):
             try:
@@ -415,11 +428,19 @@ async def crawl_once() -> None:
             ])
 
         log.info(
-            "Run complete. bin_price_found=%d bin_price_null=%d bin_failed=%d | "
+            "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
             "sales_new=%d sales_dupe=%d sales_failed=%d",
+            diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
             diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
         )
+        if diag["stale_non_futbin_url"]:
+            log.warning(
+                "%d/%d candidates have a non-futbin.com player_url (e.g. %s) - "
+                "the main futbin_full_sync.py worker hasn't refreshed these rows yet; "
+                "nothing to fix here until it does.",
+                diag["stale_non_futbin_url"], len(rows), diag.get("stale_non_futbin_url_sample"),
+            )
         # Detailed sales-pipeline breakdown - only printed when something
         # other than a clean "no history yet" is going on, so a healthy run
         # doesn't spam the log with a wall of zeros.
