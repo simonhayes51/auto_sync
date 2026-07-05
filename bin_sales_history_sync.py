@@ -65,7 +65,11 @@ if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
 
 HISTORY_INTERVAL_SECONDS = int(os.getenv("HISTORY_INTERVAL_SECONDS", "600"))  # 10 minutes
-HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "6"))
+# Lowered from 6 after the first run against the real Gold Rare population
+# (2463 candidates, up to 4 requests each) got rate-limited (HTTP 429) by
+# futbin - this is client-side politeness, not a hard technical limit.
+HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "3"))
+HISTORY_MAX_RETRIES = int(os.getenv("HISTORY_MAX_RETRIES", "3"))
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
@@ -86,6 +90,42 @@ _GOLD_RARE_WHERE = "rating BETWEEN 75 AND 99 AND version ILIKE 'normal'"
 
 _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
+
+
+async def _get_with_retry(
+    session: aiohttp.ClientSession, url: str, diag: Dict[str, Any]
+) -> "tuple[int, Optional[str]]":
+    """GET with 429-aware backoff retry.
+
+    A run against the real ~2500-card Gold Rare population (up to 4 requests
+    each) got HTTP 429s back from futbin - this is a rate limit, not a hard
+    block like fut.gg's 403, so it's worth backing off and retrying rather
+    than counting the very first 429 as a permanent failure for that player.
+    """
+    backoff = 1.0
+    for attempt in range(HISTORY_MAX_RETRIES + 1):
+        try:
+            async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
+                if r.status == 429:
+                    diag["http_429_hits"] += 1
+                    if attempt < HISTORY_MAX_RETRIES:
+                        retry_after = r.headers.get("Retry-After")
+                        wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
+                        await asyncio.sleep(wait)
+                        backoff *= 2
+                        continue
+                    return 429, None
+                if r.status != 200:
+                    return r.status, None
+                return 200, await r.text()
+        except Exception:
+            if attempt < HISTORY_MAX_RETRIES:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+            diag["http_exceptions"] += 1
+            return 0, None
+    return 0, None
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +183,11 @@ def parse_lowest_bin(html: str, platform: str) -> Optional[int]:
     return None
 
 
-async def fetch_lowest_bin(session: aiohttp.ClientSession, player_url: str, platform: str) -> Optional[int]:
-    try:
-        async with session.get(player_url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
-            if r.status != 200:
-                return None
-            html = await r.text()
-    except Exception:
+async def fetch_lowest_bin(
+    session: aiohttp.ClientSession, player_url: str, platform: str, diag: Dict[str, Any]
+) -> Optional[int]:
+    status, html = await _get_with_retry(session, player_url, diag)
+    if status != 200 or html is None:
         return None
     return parse_lowest_bin(html, platform)
 
@@ -158,16 +196,10 @@ async def _resolve_sales_path(
     session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int]
 ) -> Optional[str]:
     market_url = player_url.rstrip("/") + "/market"
-    try:
-        async with session.get(market_url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
-            if r.status != 200:
-                diag["sales_market_fetch_failed"] += 1
-                diag.setdefault("sales_market_fetch_sample", f"status={r.status} url={market_url}")
-                return None
-            html = await r.text()
-    except Exception as e:
+    status, html = await _get_with_retry(session, market_url, diag)
+    if status != 200 or html is None:
         diag["sales_market_fetch_failed"] += 1
-        diag.setdefault("sales_market_fetch_sample", f"exception={e} url={market_url}")
+        diag.setdefault("sales_market_fetch_sample", f"status={status} url={market_url}")
         return None
 
     soup = BeautifulSoup(html, "html.parser")
@@ -282,16 +314,10 @@ async def fetch_sales_history(
     if not url:
         return []
     diag.setdefault("sales_first_resolved_url", url)
-    try:
-        async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
-            if r.status != 200:
-                diag["sales_page_fetch_failed"] += 1
-                diag.setdefault("sales_page_fetch_sample", f"status={r.status} url={url}")
-                return []
-            html = await r.text()
-    except Exception as e:
+    status, html = await _get_with_retry(session, url, diag)
+    if status != 200 or html is None:
         diag["sales_page_fetch_failed"] += 1
-        diag.setdefault("sales_page_fetch_sample", f"exception={e} url={url}")
+        diag.setdefault("sales_page_fetch_sample", f"status={status} url={url}")
         return []
     return parse_sales_table(html, diag)
 
@@ -363,7 +389,7 @@ async def _scrape_one(
         # --- BIN history: both markets, always insert, never overwrite ---
         for platform in ("ps", "pc"):
             try:
-                bin_price = await fetch_lowest_bin(session, player_url, platform)
+                bin_price = await fetch_lowest_bin(session, player_url, platform, diag)
                 async with pool.acquire() as conn:
                     await conn.execute(
                         "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
@@ -439,10 +465,11 @@ async def crawl_once() -> None:
 
         log.info(
             "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
-            "sales_new=%d sales_dupe=%d sales_failed=%d",
+            "sales_new=%d sales_dupe=%d sales_failed=%d | http_429_hits=%d http_exceptions=%d",
             diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
             diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
+            diag["http_429_hits"], diag["http_exceptions"],
         )
         if diag["stale_non_futbin_url"]:
             log.warning(
