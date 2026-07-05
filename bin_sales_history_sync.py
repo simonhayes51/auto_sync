@@ -8,7 +8,13 @@ exactly as it does today.
 
 Every HISTORY_INTERVAL_SECONDS (default 600 = 10 minutes):
   1. Select every Gold Rare card from fut_players (rating 75-99, version
-     'Rare' - see _GOLD_RARE_WHERE below for the exact filter and why).
+     'Normal' - see _GOLD_RARE_WHERE below; fut_players.version tracks card
+     EDITION (Normal vs TOTW/TOTS/Icon/etc promos), not the separate Rare/
+     Non-Rare cosmetic art style, which was never scraped into this schema
+     at all - confirmed by querying the live data (top values were Normal/
+     normal/TOTW/TOTS/Icon, no "Rare" anywhere). Common and Rare gold cards
+     both show up as "Normal" here, so this is every ordinary (non-promo)
+     gold card, not a Rare-only subset.
   2. For each one, scrape the current lowest BIN (both ps and pc markets)
      and the visible sales history from futbin.com, using the same
      proven parsing approach as backend/app/futbin_client.py - that module
@@ -65,14 +71,18 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
 # "Gold" = rating 75-99 (this app's/futbin's own rarity-tier convention
-# elsewhere - bronze <65, silver 65-74, gold 75+). "Rare" is futbin's own
-# `table-player-revision` label (the same field futbin_full_sync.py already
-# stores as fut_players.version) - ordinary/common gold cards show no
-# revision label at all, only "Rare" ones do, so this is a case-insensitive
-# exact match rather than a substring check to avoid also matching e.g. an
-# "Ones To Watch"/"TOTW" card that happens to contain "rare" nowhere - it
-# doesn't, but exact-match is the safer default for a filter this specific.
-_GOLD_RARE_WHERE = "rating BETWEEN 75 AND 99 AND LOWER(COALESCE(version, '')) = 'rare'"
+# elsewhere - bronze <65, silver 65-74, gold 75+).
+#
+# version was originally assumed to carry a "Rare"/"Non-Rare" cosmetic-style
+# tag - it doesn't. Querying the live data showed the real top values are
+# Normal (2080), TOTW (575), normal lowercase (383), TOTS (240), Icon (128) -
+# version tracks card EDITION (ordinary vs. promo type), and every ordinary
+# gold card shows up as "Normal" regardless of whether it's visually Rare or
+# Non-Rare in-game - that finer distinction was never scraped into this
+# schema. So this matches every ordinary (non-promo) gold card; ILIKE covers
+# the "Normal"/"normal" casing inconsistency seen in the real data (looks
+# like two different crawl eras wrote different casing for the same thing).
+_GOLD_RARE_WHERE = "rating BETWEEN 75 AND 99 AND version ILIKE 'normal'"
 
 _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
