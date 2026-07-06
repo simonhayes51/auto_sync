@@ -65,10 +65,12 @@ if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
 
 HISTORY_INTERVAL_SECONDS = int(os.getenv("HISTORY_INTERVAL_SECONDS", "600"))  # 10 minutes
-# Lowered from 6 after the first run against the real Gold Rare population
-# (2463 candidates, up to 4 requests each) got rate-limited (HTTP 429) by
-# futbin - this is client-side politeness, not a hard technical limit.
-HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "3"))
+# Lowered from 6 to 3 after the first run against the real Gold Rare
+# population (2463 candidates, up to 4 requests each) got rate-limited
+# (HTTP 429) by futbin. With _get_with_retry's backoff now absorbing 429s,
+# nudged back up to 5 to shrink the ~37min crawl time (the real bottleneck
+# on cadence, not the 10min sleep) - watch http_429_hits after this change.
+HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "5"))
 HISTORY_MAX_RETRIES = int(os.getenv("HISTORY_MAX_RETRIES", "3"))
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
