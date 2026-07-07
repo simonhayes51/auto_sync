@@ -1,20 +1,18 @@
 """
 Extends the existing futbin scraper/DB/scheduled-sync setup with a second,
 independent process that builds a historical timeline of BIN prices and
-sales for Gold Rare cards - it does not touch fut_players, futbin_full_sync.py,
-or any API endpoint. It's a separate Railway process (see Procfile's new
-`history_worker` line) so the existing daily full-catalog crawl keeps running
-exactly as it does today.
+sales - it does not touch fut_players, futbin_full_sync.py, or any API
+endpoint. It's a separate Railway process (see Procfile's new
+`history_worker` line) so the existing daily full-catalog crawl keeps
+running exactly as it does today.
 
 Every HISTORY_INTERVAL_SECONDS (default 600 = 10 minutes):
-  1. Select every Gold Rare card from fut_players (rating 75-99, version
-     'Normal' - see _GOLD_RARE_WHERE below; fut_players.version tracks card
-     EDITION (Normal vs TOTW/TOTS/Icon/etc promos), not the separate Rare/
-     Non-Rare cosmetic art style, which was never scraped into this schema
-     at all - confirmed by querying the live data (top values were Normal/
-     normal/TOTW/TOTS/Icon, no "Rare" anywhere). Common and Rare gold cards
-     both show up as "Normal" here, so this is every ordinary (non-promo)
-     gold card, not a Rare-only subset.
+  1. Select the cards worth a timeline, in tiers (see "Tiered coverage"
+     below): every special/promo card + ordinary golds 82+ on every sweep,
+     ordinary golds 75-81 every TIER_B_EVERY'th sweep. Bronze/silver fodder
+     is deliberately excluded - the daily catalog crawl's price is enough
+     there, and spending the request budget on it would collapse sample
+     resolution on the cards that actually trade.
   2. For each one, scrape the current lowest BIN (both ps and pc markets)
      and the visible sales history from futbin.com, using the same
      proven parsing approach as backend/app/futbin_client.py - that module
@@ -80,19 +78,41 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
-# "Gold" = rating 75-99 (this app's/futbin's own rarity-tier convention
-# elsewhere - bronze <65, silver 65-74, gold 75+).
+# ---------------------------------------------------------------------------
+# Tiered coverage
+# ---------------------------------------------------------------------------
+# Originally this scraped only ordinary gold cards (rating 75-99, version
+# 'Normal') - which excluded every special/promo card (TOTW/TOTS/Icon/...),
+# i.e. the most-traded, highest-value segment of the market. Sweeping the
+# whole ~25k-card catalog instead is worse, not better: at the politeness
+# rate futbin tolerates (429s appeared at concurrency 6), a full sweep takes
+# ~10h, collapsing per-card sample resolution to 2-3/day and multiplying
+# ban risk for data that's ~80% illiquid bronze/silver noise.
 #
-# version was originally assumed to carry a "Rare"/"Non-Rare" cosmetic-style
-# tag - it doesn't. Querying the live data showed the real top values are
-# Normal (2080), TOTW (575), normal lowercase (383), TOTS (240), Icon (128) -
-# version tracks card EDITION (ordinary vs. promo type), and every ordinary
-# gold card shows up as "Normal" regardless of whether it's visually Rare or
-# Non-Rare in-game - that finer distinction was never scraped into this
-# schema. So this matches every ordinary (non-promo) gold card; ILIKE covers
-# the "Normal"/"normal" casing inconsistency seen in the real data (looks
-# like two different crawl eras wrote different casing for the same thing).
-_GOLD_RARE_WHERE = "rating BETWEEN 75 AND 99 AND version ILIKE 'normal'"
+# So: tiers, computed at selection time (no schema change, can't drift from
+# the catalog).
+#   Tier A - every sweep: all special/promo cards (version != Normal) plus
+#            ordinary golds rated 82+. The liquid, volatile segment.
+#   Tier B - every TIER_B_EVERY'th sweep (time-anchored, so restarts don't
+#            reset the phase): ordinary golds 75-81 (slow-moving fodder).
+#   Everything else (silver/bronze fodder): the daily futbin_full_sync
+#            catalog crawl already refreshes their price - enough for SBC
+#            purposes; no BIN/sales timeline is worth requests on them.
+#
+# If a sweep gets heavily 429'd during Tier A, Tier B is skipped for that
+# run - when throttled, spend the remaining budget on the data that matters.
+#
+# version tracks card EDITION (Normal vs TOTW/TOTS/Icon/etc) - confirmed by
+# querying live data (top values: Normal 2080, TOTW 575, normal 383, TOTS
+# 240, Icon 128); ILIKE covers the Normal/normal casing split from two
+# different crawl eras.
+TIER_A_WHERE = (
+    "((version IS NOT NULL AND version NOT ILIKE 'normal') "
+    "OR (rating >= 82 AND version ILIKE 'normal'))"
+)
+TIER_B_WHERE = "(rating BETWEEN 75 AND 81 AND version ILIKE 'normal')"
+TIER_B_EVERY = int(os.getenv("TIER_B_EVERY", "4"))
+TIER_B_SKIP_429_THRESHOLD = int(os.getenv("TIER_B_SKIP_429_THRESHOLD", "25"))
 
 _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
@@ -449,17 +469,40 @@ async def _scrape_one(
                 log.warning("Sales insert failed for card_id=%s sold_at=%s: %s", card_id, s["sold_at"], e)
 
 
+async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
+    return await conn.fetch(
+        f"SELECT card_id, player_url FROM fut_players WHERE {where} AND player_url IS NOT NULL"
+    )
+
+
+def _tier_b_due(now_epoch: Optional[int] = None) -> bool:
+    """Time-anchored phase so worker restarts don't reset the rotation."""
+    import time as _time
+    now_epoch = now_epoch if now_epoch is not None else int(_time.time())
+    return (now_epoch // HISTORY_INTERVAL_SECONDS) % TIER_B_EVERY == 0
+
+
+async def _scrape_batch(pool, session, sem, rows, diag) -> None:
+    await asyncio.gather(*[
+        _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
+        for r in rows
+    ])
+
+
 async def crawl_once() -> None:
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=HISTORY_CONCURRENCY + 2)
     try:
         async with pool.acquire() as conn:
             await ensure_tables(conn)
-            rows = await conn.fetch(
-                f"SELECT card_id, player_url FROM fut_players "
-                f"WHERE {_GOLD_RARE_WHERE} AND player_url IS NOT NULL"
-            )
+            tier_a = await _fetch_tier(conn, TIER_A_WHERE)
+            b_due = _tier_b_due()
+            tier_b = await _fetch_tier(conn, TIER_B_WHERE) if b_due else []
 
-        log.info("Gold Rare candidates this run: %d", len(rows))
+        log.info(
+            "Candidates this run: tier_a=%d (specials + golds 82+) tier_b=%d (golds 75-81, due=%s)",
+            len(tier_a), len(tier_b), b_due,
+        )
+        rows = list(tier_a) + list(tier_b)
         if not rows:
             return
 
@@ -467,10 +510,22 @@ async def crawl_once() -> None:
         diag: Dict[str, Any] = defaultdict(int)
 
         async with aiohttp.ClientSession() as session:
-            await asyncio.gather(*[
-                _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
-                for r in rows
-            ])
+            # Hot tier first, always.
+            await _scrape_batch(pool, session, sem, tier_a, diag)
+
+            # Fodder tier only if the sweep isn't being throttled - promo
+            # nights are exactly when 429s spike AND when Tier A freshness
+            # matters most, so a constrained budget goes to A alone.
+            if tier_b:
+                if diag["http_429_hits"] > TIER_B_SKIP_429_THRESHOLD:
+                    diag["tier_b_skipped_throttled"] = len(tier_b)
+                    log.warning(
+                        "Skipping tier B (%d cards) this run: %d 429s during tier A - throttled, "
+                        "keeping remaining budget on the hot tier.",
+                        len(tier_b), diag["http_429_hits"],
+                    )
+                else:
+                    await _scrape_batch(pool, session, sem, tier_b, diag)
 
         log.info(
             "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
@@ -515,9 +570,10 @@ async def crawl_once() -> None:
                 "bin_sales_history_sync",
                 ok=run_ok,
                 detail=(
-                    f"candidates={len(rows)} sales_new={diag['sales_new']} "
-                    f"bin_found={diag['bin_price_found']} bin_failed={diag['bin_failed']} "
-                    f"http_429={diag['http_429_hits']}"
+                    f"tier_a={len(tier_a)} tier_b={len(tier_b)}"
+                    + (f" (skipped, throttled)" if diag.get("tier_b_skipped_throttled") else "")
+                    + f" sales_new={diag['sales_new']} bin_found={diag['bin_price_found']} "
+                    f"bin_failed={diag['bin_failed']} http_429={diag['http_429_hits']}"
                 ),
             )
         if not run_ok:
