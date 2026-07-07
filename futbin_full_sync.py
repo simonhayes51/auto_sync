@@ -382,7 +382,29 @@ async def crawl_once():
                 f"Add handling for these before running the real crawl."
             )
 
-        total_rows = written = skipped_no_card_id = skipped_no_name = 0
+        total_rows = written = skipped_no_card_id = skipped_no_name = card_id_collisions = 0
+
+        # card_id is extracted purely from a CDN image filename
+        # (IMG_ID_RE), with no cross-check against anything else. On a
+        # promo release day, if two distinct new cards briefly share the
+        # same placeholder/"coming soon" artwork before their real cutouts
+        # are uploaded, both rows extract the SAME numeric card_id even
+        # though they're genuinely different cards (e.g. reported live: a
+        # 97 Star Performer and a 97 TOTS of the same player, one visibly
+        # replacing the other after a re-crawl). Since the upsert is
+        # ON CONFLICT (card_id) DO UPDATE, that collision would silently
+        # overwrite one card's entire row with the other's data - not a
+        # skipped row, an actively destroyed one.
+        #
+        # futbin_id (parsed from the player-name link's own href, entirely
+        # independent of any image) is the cross-check: two rows can only
+        # legitimately share a card_id if they're the same real card, which
+        # means the same futbin_id too. Track (card_id -> futbin_id) seen
+        # so far this run; a second row claiming an already-seen card_id
+        # under a DIFFERENT futbin_id is a genuine collision - skip writing
+        # it (don't stomp whatever this run already wrote for that
+        # card_id) and log it loudly rather than silently losing a card.
+        seen_card_ids: dict = {}
 
         async with aiohttp.ClientSession() as session:
             for page in range(PAGE_START, PAGE_END + 1):
@@ -399,6 +421,28 @@ async def crawl_once():
                         # rather than risk an insert failure mid-batch.
                         skipped_no_name += 1
                         continue
+
+                    cid = r["card_id"]
+                    fbid = r.get("futbin_id")
+                    prior = seen_card_ids.get(cid)
+                    if prior is not None and fbid is not None and prior["futbin_id"] is not None and prior["futbin_id"] != fbid:
+                        card_id_collisions += 1
+                        print(
+                            f"⚠️ card_id collision: {cid} claimed by BOTH "
+                            f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
+                            f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
+                            f"keeping the first, skipping this one so it doesn't overwrite it. "
+                            f"Likely a shared placeholder image on a brand-new promo card; should self-resolve "
+                            f"once futbin uploads distinct artwork for each.",
+                            flush=True,
+                        )
+                        continue
+                    if prior is None:
+                        seen_card_ids[cid] = {
+                            "futbin_id": fbid, "name": r.get("name"),
+                            "rating": r.get("rating"), "version": r.get("version"),
+                        }
+
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
                         written += 1
@@ -407,7 +451,8 @@ async def crawl_once():
 
                 print(
                     f"📦 page {page}/{PAGE_END}: {len(rows)} rows "
-                    f"(running totals: written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name})",
+                    f"(running totals: written={written} no_card_id={skipped_no_card_id} "
+                    f"no_name={skipped_no_name} collisions={card_id_collisions})",
                     flush=True,
                 )
                 if rows:
@@ -415,9 +460,17 @@ async def crawl_once():
 
                 await asyncio.sleep(REQUEST_DELAY)
 
+        if card_id_collisions:
+            print(
+                f"⚠️ {card_id_collisions} card_id collision(s) detected this crawl - "
+                f"see warnings above for which cards were affected.",
+                flush=True,
+            )
+
         print(
             f"✅ Done. pages={PAGE_START}-{PAGE_END} total_rows={total_rows} "
-            f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name}",
+            f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name} "
+            f"collisions={card_id_collisions}",
             flush=True,
         )
         # A crawl that parsed zero rows across every page almost certainly
@@ -427,12 +480,26 @@ async def crawl_once():
             conn,
             "futbin_full_sync",
             ok=crawl_ok,
-            detail=f"pages={PAGE_START}-{PAGE_END} rows={total_rows} written={written}",
+            detail=(
+                f"pages={PAGE_START}-{PAGE_END} rows={total_rows} written={written}"
+                + (f" collisions={card_id_collisions}" if card_id_collisions else "")
+            ),
         )
         if not crawl_ok:
             await alert(
                 "futbin_full_sync: full crawl parsed **0 rows** - futbin markup change or "
                 "block? Catalog + daily prices are no longer refreshing."
+            )
+        elif card_id_collisions:
+            # Not a pipeline outage, but real data loss (one card's row was
+            # about to overwrite another's) - worth a page, not just a log
+            # line nobody will read until someone reports a missing card.
+            await alert(
+                f"futbin_full_sync: {card_id_collisions} card_id collision(s) this crawl - "
+                "two different cards resolved to the same card_id (likely a shared placeholder "
+                "image on a brand-new promo release). See worker logs for which cards; affected "
+                "card(s) were skipped rather than overwritten, so check if any are still missing "
+                "from fut_players once futbin uploads distinct artwork."
             )
     finally:
         await conn.close()
