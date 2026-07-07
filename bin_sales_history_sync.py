@@ -57,6 +57,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 from aiohttp import web  # health server, same pattern as futbin_full_sync.py
 
+from monitoring import heartbeat, alert
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bin_sales_history_sync")
 
@@ -494,6 +496,29 @@ async def crawl_once() -> None:
         ):
             if sample_key in diag:
                 log.info("%s: %s", sample_key, diag[sample_key])
+
+        # Heartbeat for /api/ops/freshness. A run where every single scrape
+        # failed (and nothing new landed) is a markup change or a block -
+        # that's the failure mode that silently kills the fair-value data.
+        total_attempted = diag["bin_price_found"] + diag["bin_price_null"] + diag["bin_failed"]
+        run_ok = total_attempted == 0 or diag["bin_failed"] < total_attempted
+        async with pool.acquire() as hb_conn:
+            await heartbeat(
+                hb_conn,
+                "bin_sales_history_sync",
+                ok=run_ok,
+                detail=(
+                    f"candidates={len(rows)} sales_new={diag['sales_new']} "
+                    f"bin_found={diag['bin_price_found']} bin_failed={diag['bin_failed']} "
+                    f"http_429={diag['http_429_hits']}"
+                ),
+            )
+        if not run_ok:
+            await alert(
+                "bin_sales_history_sync: every BIN scrape failed this run "
+                f"(bin_failed={diag['bin_failed']}/{total_attempted}, 429s={diag['http_429_hits']}) - "
+                "futbin markup change or block? Sales/BIN history has stopped growing."
+            )
     finally:
         await pool.close()
 

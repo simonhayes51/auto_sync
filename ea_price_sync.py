@@ -4,6 +4,8 @@ import aiohttp
 import asyncpg
 from datetime import datetime, timezone
 
+from monitoring import heartbeat, alert
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found! Set it in Railway → Variables.")
@@ -132,12 +134,23 @@ async def main():
         print(f"📊 {total} cards to price (platform: PS/Xbox shared market)", flush=True)
 
         updated = skipped = 0
+        session_expired = False
         async with aiohttp.ClientSession() as session:
             for i, card_id in enumerate(card_ids, start=1):
                 try:
                     price = await fetch_lowest_bin(session, card_id)
                 except ExpiredSession:
+                    # This used to just print and stop - prices silently went
+                    # stale until a human happened to notice (review issue C8).
+                    # Now it pages via Discord webhook and records a failing
+                    # heartbeat that /api/ops/freshness surfaces.
+                    session_expired = True
                     print("❌ EA session expired (401) — get a fresh EA_X_UT_SID and restart.", flush=True)
+                    await alert(
+                        "ea_price_sync: **EA session token expired (401)** — price updates have "
+                        "STOPPED. Log into the FUT Web App, grab a fresh `x-ut-sid`, set "
+                        "`EA_X_UT_SID` in Railway and restart the worker."
+                    )
                     break
 
                 if price is not None:
@@ -154,6 +167,16 @@ async def main():
                 await asyncio.sleep(REQUEST_DELAY)
 
         print(f"✅ EA PRICE SYNC complete: {updated} updated, {skipped} skipped", flush=True)
+        await heartbeat(
+            conn,
+            "ea_price_sync",
+            ok=not session_expired,
+            detail=(
+                "EA session expired - price updates stopped"
+                if session_expired
+                else f"updated={updated} skipped={skipped}"
+            ),
+        )
     finally:
         await conn.close()
 
