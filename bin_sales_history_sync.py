@@ -244,11 +244,17 @@ async def _sales_url(
     path = await _resolve_sales_path(session, player_url, diag)
     if path:
         return f"https://www.futbin.com{path}?platform={fb_plat}"
-    if "/player/" in player_url:
-        diag["sales_used_fallback_url"] += 1
-        sales_base = player_url.replace("/player/", "/sales/")
-        return f"{sales_base}?platform={fb_plat}"
-    diag["sales_no_url_at_all"] += 1
+    # No naive "/player/ -> /sales/" fallback: confirmed live that this
+    # collides with unrelated cards for brand-new cards whose /market page
+    # has no "latest sale" link yet - the numeric id does NOT reliably
+    # mean the same card across both URL namespaces, contrary to what this
+    # fallback used to assume. Real incident: a 97 Star Performer Mbappé
+    # and several new TOTW cards each recorded real, internally-consistent
+    # sales (correct EA tax math) for a DIFFERENT, unrelated card, because
+    # this fallback guessed a URL instead of confirming one. No sales data
+    # is a correct "we don't know yet" state; a wrong number silently
+    # accumulated into sales_history forever is not.
+    diag["sales_no_history_link_no_fallback"] += 1
     return None
 
 
