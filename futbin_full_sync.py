@@ -40,6 +40,8 @@ from zoneinfo import ZoneInfo
 from aiohttp import web  # health server
 from bs4 import BeautifulSoup
 
+from monitoring import heartbeat, alert
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
@@ -418,6 +420,20 @@ async def crawl_once():
             f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name}",
             flush=True,
         )
+        # A crawl that parsed zero rows across every page almost certainly
+        # means futbin changed markup (or is blocking us) - page a human.
+        crawl_ok = total_rows > 0
+        await heartbeat(
+            conn,
+            "futbin_full_sync",
+            ok=crawl_ok,
+            detail=f"pages={PAGE_START}-{PAGE_END} rows={total_rows} written={written}",
+        )
+        if not crawl_ok:
+            await alert(
+                "futbin_full_sync: full crawl parsed **0 rows** - futbin markup change or "
+                "block? Catalog + daily prices are no longer refreshing."
+            )
     finally:
         await conn.close()
 
