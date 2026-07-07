@@ -50,6 +50,10 @@ import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+# futbin serves its sale timestamps in UK local time (see _parse_sale_date).
+_FUTBIN_TZ = ZoneInfo("Europe/London")
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -233,12 +237,15 @@ def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional
         return None
     now = now or datetime.now(timezone.utc)
     try:
-        dt = datetime.strptime(f"{date_text} {now.year}", "%b %d, %I:%M %p %Y")
+        naive = datetime.strptime(f"{date_text} {now.year}", "%b %d, %I:%M %p %Y")
     except ValueError:
         return None
-    dt = dt.replace(tzinfo=timezone.utc)
+    # futbin renders sale times in UK local time (BST/GMT), not UTC -
+    # treating them as UTC stored every summer sale ~1h in the future
+    # (surfaced live by /api/ops/freshness reporting a negative data age).
+    dt = naive.replace(tzinfo=_FUTBIN_TZ).astimezone(timezone.utc)
     if dt > now + timedelta(days=1):
-        dt = dt.replace(year=now.year - 1)
+        dt = naive.replace(year=now.year - 1, tzinfo=_FUTBIN_TZ).astimezone(timezone.utc)
     return dt
 
 
