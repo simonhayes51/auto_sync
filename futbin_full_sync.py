@@ -356,6 +356,51 @@ def row_args(row: dict, cols: list):
     return args
 
 
+async def ensure_identity_log(conn: asyncpg.Connection) -> None:
+    """A card_id whose stored name/rating/version changes between two
+    crawls is a strong signal it used to mean a DIFFERENT card (a resolved
+    card_id collision - see the card_id_collisions handling above - is the
+    known way this happens, but this catches it regardless of cause).
+    That matters because sales_history/bin_history are keyed on this same
+    numeric card_id and are never auto-deleted: any rows scraped before the
+    identity changed are now silently misattributed to whatever card this
+    id currently means (confirmed live: a 97 Star Performer's real-money
+    price sat next to a ~2.3k median sourced from sales that actually
+    belonged to the card this id used to be).
+
+    This only LOGS the change - it deliberately does not delete anything.
+    Auto-deleting sales_history on a heuristic match risks destroying
+    real history on a false positive (e.g. futbin renaming a version
+    label); a human should review before purging using this log as the
+    cutoff timestamp."""
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS card_identity_changes (
+            id BIGSERIAL PRIMARY KEY,
+            card_id BIGINT NOT NULL,
+            old_name TEXT, old_rating INTEGER, old_version TEXT,
+            new_name TEXT, new_rating INTEGER, new_version TEXT,
+            detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_card_identity_changes_card ON card_identity_changes(card_id, detected_at)"
+    )
+
+
+def _identity_changed(prior: dict, row: dict) -> bool:
+    if prior is None:
+        return False
+    # Rating can legitimately tick up/down via in-form upgrades on some
+    # card types - name and version are the reliable signals that this
+    # card_id now refers to a genuinely different card.
+    return (
+        (row.get("name") or None) != (prior.get("name") or None)
+        or (row.get("version") or None) != (prior.get("version") or None)
+    )
+
+
 async def crawl_once():
     """Run one full crawl of PAGE_START..PAGE_END and upsert everything found.
 
@@ -368,6 +413,11 @@ async def crawl_once():
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await ensure_new_columns(conn)
+        await ensure_identity_log(conn)
+        existing_identity = {
+            r["card_id"]: {"name": r["name"], "rating": r["rating"], "version": r["version"]}
+            for r in await conn.fetch("SELECT card_id, name, rating, version FROM fut_players")
+        }
         available = await detect_columns(conn)
         if "card_id" not in available:
             raise RuntimeError("❌ fut_players has no card_id column - can't upsert")
@@ -382,7 +432,7 @@ async def crawl_once():
                 f"Add handling for these before running the real crawl."
             )
 
-        total_rows = written = skipped_no_card_id = skipped_no_name = card_id_collisions = 0
+        total_rows = written = skipped_no_card_id = skipped_no_name = card_id_collisions = identity_changes = 0
 
         # card_id is extracted purely from a CDN image filename
         # (IMG_ID_RE), with no cross-check against anything else. On a
@@ -443,6 +493,31 @@ async def crawl_once():
                             "rating": r.get("rating"), "version": r.get("version"),
                         }
 
+                    old_identity = existing_identity.get(cid)
+                    if _identity_changed(old_identity, r):
+                        identity_changes += 1
+                        print(
+                            f"⚠️ card_id {cid} identity changed: "
+                            f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r} -> "
+                            f"{r.get('name')!r} {r.get('rating')} {r.get('version')!r} - "
+                            f"sales_history/bin_history rows for this card_id from before now belong to the "
+                            f"PREVIOUS card, not this one. Logged to card_identity_changes; review before "
+                            f"purging (see detected_at as the cutoff).",
+                            flush=True,
+                        )
+                        try:
+                            await conn.execute(
+                                """
+                                INSERT INTO card_identity_changes
+                                    (card_id, old_name, old_rating, old_version, new_name, new_rating, new_version)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                                """,
+                                cid, old_identity["name"], old_identity["rating"], old_identity["version"],
+                                r.get("name"), r.get("rating"), r.get("version"),
+                            )
+                        except Exception as e:
+                            print(f"❌ failed to log identity change for card_id={cid}: {e}", flush=True)
+
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
                         written += 1
@@ -452,7 +527,8 @@ async def crawl_once():
                 print(
                     f"📦 page {page}/{PAGE_END}: {len(rows)} rows "
                     f"(running totals: written={written} no_card_id={skipped_no_card_id} "
-                    f"no_name={skipped_no_name} collisions={card_id_collisions})",
+                    f"no_name={skipped_no_name} collisions={card_id_collisions} "
+                    f"identity_changes={identity_changes})",
                     flush=True,
                 )
                 if rows:
@@ -466,11 +542,18 @@ async def crawl_once():
                 f"see warnings above for which cards were affected.",
                 flush=True,
             )
+        if identity_changes:
+            print(
+                f"⚠️ {identity_changes} card_id identity change(s) detected this crawl - "
+                f"see warnings above; query card_identity_changes for the full list and use "
+                f"detected_at as a cutoff before purging any contaminated sales_history/bin_history.",
+                flush=True,
+            )
 
         print(
             f"✅ Done. pages={PAGE_START}-{PAGE_END} total_rows={total_rows} "
             f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name} "
-            f"collisions={card_id_collisions}",
+            f"collisions={card_id_collisions} identity_changes={identity_changes}",
             flush=True,
         )
         # A crawl that parsed zero rows across every page almost certainly
@@ -482,6 +565,7 @@ async def crawl_once():
             ok=crawl_ok,
             detail=(
                 f"pages={PAGE_START}-{PAGE_END} rows={total_rows} written={written}"
+                + (f" identity_changes={identity_changes}" if identity_changes else "")
                 + (f" collisions={card_id_collisions}" if card_id_collisions else "")
             ),
         )
