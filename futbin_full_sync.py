@@ -389,30 +389,51 @@ async def ensure_identity_log(conn: asyncpg.Connection) -> None:
     )
 
 
+def _norm_text(v):
+    v = (v or "").strip().lower()
+    return v or None
+
+
 def _identity_changed(prior: dict, row: dict) -> bool:
+    """True if this card_id's name/version text differs from what was
+    stored before (informational signal only - see _is_different_card for
+    whether that's actually a different physical card)."""
     if prior is None:
         return False
     # Rating can legitimately tick up/down via in-form upgrades on some
-    # card types - name and version are the reliable signals that this
-    # card_id now refers to a genuinely different card.
-    #
-    # Confirmed live: an exact, case-sensitive comparison here produced
+    # card types - name and version are the reliable signals to even look
+    # further. Case/whitespace normalized: an exact comparison produced
     # false positives for the well-known "normal" vs "Normal" version
-    # casing split (see _GOLD_RARE_WHERE's comment elsewhere in this repo -
-    # two different crawl eras wrote different casing for the same
-    # ordinary-gold version). Combined with the caller skipping the write
-    # on a detected change, that meant ordinary gold cards whose stored
-    # casing didn't match today's crawl silently stopped getting price
-    # updates - a false "collision" on nothing but casing, not a real
-    # identity change. Normalize case/whitespace before comparing so this
-    # only fires on an actual different name or version.
-    def _norm(v):
-        v = (v or "").strip().lower()
-        return v or None
+    # casing split (two different crawl eras wrote different casing for
+    # the same ordinary-gold version).
+    return _norm_text(row.get("name")) != _norm_text(prior.get("name")) or _norm_text(
+        row.get("version")
+    ) != _norm_text(prior.get("version"))
 
-    return _norm(row.get("name")) != _norm(prior.get("name")) or _norm(row.get("version")) != _norm(
-        prior.get("version")
-    )
+
+def _is_different_card(prior: dict, row: dict) -> bool:
+    """True only if this looks like a genuinely different physical card
+    taking over an existing card_id - not just a version-label change on
+    the same card.
+
+    Confirmed live that name/version text alone isn't sufficient: legacy
+    FC25 'Futties' promo cards legitimately get reclassified to 'Normal'
+    once their event period ends - same physical card, same page, just a
+    relabel - and blocking that write on a text-only signal permanently
+    freezes the card showing a stale version forever.
+
+    player_url is the reliable signal instead: it comes from the player-
+    name link's own href, independent of the image-derived card_id that
+    actually collides in the real failure mode (two different cards
+    sharing one image, e.g. a brand-new special usurping an established
+    gold, or two same-day releases sharing a placeholder). A genuinely
+    different card has a genuinely different player_url; a same-card
+    relabel keeps the same one. If either url is unknown, don't guess -
+    only block when we can positively confirm two different urls.
+    """
+    old_url = _norm_text(prior.get("player_url"))
+    new_url = _norm_text(row.get("player_url"))
+    return bool(old_url and new_url and old_url != new_url)
 
 
 async def crawl_once():
@@ -429,8 +450,11 @@ async def crawl_once():
         await ensure_new_columns(conn)
         await ensure_identity_log(conn)
         existing_identity = {
-            r["card_id"]: {"name": r["name"], "rating": r["rating"], "version": r["version"]}
-            for r in await conn.fetch("SELECT card_id, name, rating, version FROM fut_players")
+            r["card_id"]: {
+                "name": r["name"], "rating": r["rating"], "version": r["version"],
+                "player_url": r["player_url"],
+            }
+            for r in await conn.fetch("SELECT card_id, name, rating, version, player_url FROM fut_players")
         }
         available = await detect_columns(conn)
         if "card_id" not in available:
@@ -510,19 +534,7 @@ async def crawl_once():
                     old_identity = existing_identity.get(cid)
                     if _identity_changed(old_identity, r):
                         identity_changes += 1
-                        print(
-                            f"⚠️ card_id {cid} identity change BLOCKED: keeping existing "
-                            f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r}, "
-                            f"NOT overwriting with {r.get('name')!r} {r.get('rating')} {r.get('version')!r} - "
-                            f"this is the same 'shared placeholder image' pattern as same-run collisions, just "
-                            f"against an ALREADY-ESTABLISHED card from a previous crawl instead of a same-day one "
-                            f"(confirmed live: a brand-new special silently replaced an established base gold, "
-                            f"which this same identity-change signal was only logging, not preventing, before). "
-                            f"Logged to card_identity_changes for review - if this turns out to be a genuine "
-                            f"rename/correction rather than a collision, it needs a manual fix, not an automatic "
-                            f"overwrite.",
-                            flush=True,
-                        )
+                        different_card = _is_different_card(old_identity, r)
                         try:
                             await conn.execute(
                                 """
@@ -535,7 +547,37 @@ async def crawl_once():
                             )
                         except Exception as e:
                             print(f"❌ failed to log identity change for card_id={cid}: {e}", flush=True)
-                        continue
+
+                        if different_card:
+                            # player_url also differs - two genuinely
+                            # different cards, not just a relabel. Keep
+                            # the existing one rather than silently
+                            # overwriting it (the Kane/Mbappe gold-card
+                            # incident: a brand-new special usurped an
+                            # established gold's card_id).
+                            print(
+                                f"⚠️ card_id {cid} identity change BLOCKED (different player_url too): keeping "
+                                f"existing {old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r}, "
+                                f"NOT overwriting with {r.get('name')!r} {r.get('rating')} {r.get('version')!r}. "
+                                f"Logged to card_identity_changes for review.",
+                                flush=True,
+                            )
+                            continue
+                        else:
+                            # Same player_url (or unknown) - most likely
+                            # the same physical card being relabeled, not
+                            # a collision (confirmed live: legacy FC25
+                            # "Futties" promo cards reclassifying to
+                            # "Normal" once their event period ends). Let
+                            # the write proceed rather than freezing the
+                            # card on a stale label forever.
+                            print(
+                                f"ℹ️ card_id {cid} version/name changed but same player_url - treating as a "
+                                f"relabel of the same card, not a collision: "
+                                f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r} -> "
+                                f"{r.get('name')!r} {r.get('rating')} {r.get('version')!r}. Allowing the write.",
+                                flush=True,
+                            )
 
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
