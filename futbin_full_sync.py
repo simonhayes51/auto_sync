@@ -497,12 +497,16 @@ async def crawl_once():
                     if _identity_changed(old_identity, r):
                         identity_changes += 1
                         print(
-                            f"⚠️ card_id {cid} identity changed: "
-                            f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r} -> "
-                            f"{r.get('name')!r} {r.get('rating')} {r.get('version')!r} - "
-                            f"sales_history/bin_history rows for this card_id from before now belong to the "
-                            f"PREVIOUS card, not this one. Logged to card_identity_changes; review before "
-                            f"purging (see detected_at as the cutoff).",
+                            f"⚠️ card_id {cid} identity change BLOCKED: keeping existing "
+                            f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r}, "
+                            f"NOT overwriting with {r.get('name')!r} {r.get('rating')} {r.get('version')!r} - "
+                            f"this is the same 'shared placeholder image' pattern as same-run collisions, just "
+                            f"against an ALREADY-ESTABLISHED card from a previous crawl instead of a same-day one "
+                            f"(confirmed live: a brand-new special silently replaced an established base gold, "
+                            f"which this same identity-change signal was only logging, not preventing, before). "
+                            f"Logged to card_identity_changes for review - if this turns out to be a genuine "
+                            f"rename/correction rather than a collision, it needs a manual fix, not an automatic "
+                            f"overwrite.",
                             flush=True,
                         )
                         try:
@@ -517,6 +521,7 @@ async def crawl_once():
                             )
                         except Exception as e:
                             print(f"❌ failed to log identity change for card_id={cid}: {e}", flush=True)
+                        continue
 
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
