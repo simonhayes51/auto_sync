@@ -395,9 +395,23 @@ def _identity_changed(prior: dict, row: dict) -> bool:
     # Rating can legitimately tick up/down via in-form upgrades on some
     # card types - name and version are the reliable signals that this
     # card_id now refers to a genuinely different card.
-    return (
-        (row.get("name") or None) != (prior.get("name") or None)
-        or (row.get("version") or None) != (prior.get("version") or None)
+    #
+    # Confirmed live: an exact, case-sensitive comparison here produced
+    # false positives for the well-known "normal" vs "Normal" version
+    # casing split (see _GOLD_RARE_WHERE's comment elsewhere in this repo -
+    # two different crawl eras wrote different casing for the same
+    # ordinary-gold version). Combined with the caller skipping the write
+    # on a detected change, that meant ordinary gold cards whose stored
+    # casing didn't match today's crawl silently stopped getting price
+    # updates - a false "collision" on nothing but casing, not a real
+    # identity change. Normalize case/whitespace before comparing so this
+    # only fires on an actual different name or version.
+    def _norm(v):
+        v = (v or "").strip().lower()
+        return v or None
+
+    return _norm(row.get("name")) != _norm(prior.get("name")) or _norm(row.get("version")) != _norm(
+        prior.get("version")
     )
 
 
