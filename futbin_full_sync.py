@@ -473,25 +473,34 @@ async def crawl_once():
         total_rows = written = skipped_no_card_id = skipped_no_name = card_id_collisions = identity_changes = 0
 
         # card_id is extracted purely from a CDN image filename
-        # (IMG_ID_RE), with no cross-check against anything else. On a
-        # promo release day, if two distinct new cards briefly share the
-        # same placeholder/"coming soon" artwork before their real cutouts
-        # are uploaded, both rows extract the SAME numeric card_id even
-        # though they're genuinely different cards (e.g. reported live: a
-        # 97 Star Performer and a 97 TOTS of the same player, one visibly
-        # replacing the other after a re-crawl). Since the upsert is
-        # ON CONFLICT (card_id) DO UPDATE, that collision would silently
-        # overwrite one card's entire row with the other's data - not a
-        # skipped row, an actively destroyed one.
+        # (IMG_ID_RE), with no cross-check against anything else. Two
+        # distinct rows can end up sharing an image - and thus the same
+        # numeric card_id - in (at least) two ways confirmed live:
+        #   1. A brand-new special briefly reuses its base gold's image
+        #      as a "coming soon" placeholder before its own art ships
+        #      (Harry Kane/Mbappe: Star Performer sharing the base gold's
+        #      card_id, futbin_id 26xxx vs the base gold's futbin_id 40/69).
+        #   2. Very low-rated players who never get unique artwork at all,
+        #      permanently sharing a generic template image with other
+        #      similarly obscure cards (e.g. two different 'Man Ho Park'
+        #      entries) - this one does NOT "self-resolve".
+        # Since the upsert is ON CONFLICT (card_id) DO UPDATE, a collision
+        # would silently overwrite one card's entire row with the other's
+        # data - not a skipped row, an actively destroyed one.
         #
         # futbin_id (parsed from the player-name link's own href, entirely
         # independent of any image) is the cross-check: two rows can only
         # legitimately share a card_id if they're the same real card, which
-        # means the same futbin_id too. Track (card_id -> futbin_id) seen
-        # so far this run; a second row claiming an already-seen card_id
-        # under a DIFFERENT futbin_id is a genuine collision - skip writing
-        # it (don't stomp whatever this run already wrote for that
-        # card_id) and log it loudly rather than silently losing a card.
+        # means the same futbin_id too. A lower futbin_id means an older,
+        # already-established FUTBIN page - confirmed live, the base gold's
+        # futbin_id (40, 69) is always far smaller than the newly-created
+        # special's (26115, 26116), since FUTBIN's ids are assigned in
+        # creation order. That page is the legitimate owner of the shared
+        # image regardless of which row this crawl happens to encounter
+        # first, so on a collision we keep whichever contender has the
+        # LOWEST futbin_id seen so far - even if that means overwriting
+        # something we already wrote for the same card_id earlier in this
+        # same run - rather than just keeping "whoever we saw first".
         seen_card_ids: dict = {}
 
         async with aiohttp.ClientSession() as session:
@@ -513,18 +522,38 @@ async def crawl_once():
                     cid = r["card_id"]
                     fbid = r.get("futbin_id")
                     prior = seen_card_ids.get(cid)
+                    bypass_identity_gate = False
                     if prior is not None and fbid is not None and prior["futbin_id"] is not None and prior["futbin_id"] != fbid:
                         card_id_collisions += 1
-                        print(
-                            f"⚠️ card_id collision: {cid} claimed by BOTH "
-                            f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
-                            f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
-                            f"keeping the first, skipping this one so it doesn't overwrite it. "
-                            f"Likely a shared placeholder image on a brand-new promo card; should self-resolve "
-                            f"once futbin uploads distinct artwork for each.",
-                            flush=True,
-                        )
-                        continue
+                        try:
+                            this_is_older = int(fbid) < int(prior["futbin_id"])
+                        except (TypeError, ValueError):
+                            this_is_older = False
+
+                        if this_is_older:
+                            print(
+                                f"⚠️ card_id collision: {cid} claimed by BOTH "
+                                f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
+                                f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
+                                f"this one is the OLDER futbin page (established card); correcting by writing it "
+                                f"and overwriting whatever we already wrote for the newer page this run.",
+                                flush=True,
+                            )
+                            seen_card_ids[cid] = {
+                                "futbin_id": fbid, "name": r.get("name"),
+                                "rating": r.get("rating"), "version": r.get("version"),
+                            }
+                            bypass_identity_gate = True
+                        else:
+                            print(
+                                f"⚠️ card_id collision: {cid} claimed by BOTH "
+                                f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
+                                f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
+                                f"keeping the older page ({prior['futbin_id']}), skipping this one so it doesn't "
+                                f"overwrite it. Likely a shared placeholder/generic-template image.",
+                                flush=True,
+                            )
+                            continue
                     if prior is None:
                         seen_card_ids[cid] = {
                             "futbin_id": fbid, "name": r.get("name"),
@@ -532,7 +561,7 @@ async def crawl_once():
                         }
 
                     old_identity = existing_identity.get(cid)
-                    if _identity_changed(old_identity, r):
+                    if not bypass_identity_gate and _identity_changed(old_identity, r):
                         identity_changes += 1
                         different_card = _is_different_card(old_identity, r)
                         try:
