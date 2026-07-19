@@ -80,6 +80,13 @@ HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "5"))
 HISTORY_MAX_RETRIES = int(os.getenv("HISTORY_MAX_RETRIES", "3"))
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
+# How often this script is actually invoked - purely a phase-math input for
+# _tier_b_due() below, not an in-process sleep interval (this became a
+# one-shot Cron Job; there's no loop left to sleep in). Must match the real
+# Railway Cron schedule (*/10 * * * * = 600s) or Tier B's time-anchored
+# phase drifts out of sync with the real invocation cadence.
+CRON_INTERVAL_SECONDS = int(os.getenv("CRON_INTERVAL_SECONDS", "600"))
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
 # ---------------------------------------------------------------------------
@@ -486,10 +493,10 @@ async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
 
 
 def _tier_b_due(now_epoch: Optional[int] = None) -> bool:
-    """Time-anchored phase so worker restarts don't reset the rotation."""
+    """Time-anchored phase so separate Cron invocations don't reset the rotation."""
     import time as _time
     now_epoch = now_epoch if now_epoch is not None else int(_time.time())
-    return (now_epoch // HISTORY_INTERVAL_SECONDS) % TIER_B_EVERY == 0
+    return (now_epoch // CRON_INTERVAL_SECONDS) % TIER_B_EVERY == 0
 
 
 async def _scrape_batch(pool, session, sem, rows, diag) -> None:
