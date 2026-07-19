@@ -33,11 +33,12 @@ Railway's `worker` process runs, per the Procfile).
 
 ## 5. Run the BIN/sales history collector
 ```bash
-python bin_sales_history_sync.py --now
+python bin_sales_history_sync.py
 ```
-Same `--now` convention. Without it, runs forever, scraping every Gold Rare
-card's current lowest BIN (both ps and pc) and any newly-seen sales every
-10 minutes, appending to `bin_history`/`sales_history` (never overwriting
-or deleting). This is Railway's separate `history_worker` process in the
-Procfile - enable it as its own service alongside the existing `worker` one,
-they run independently and don't share state.
+Runs a single crawl and exits - scrapes every Gold Rare card's current
+lowest BIN (both ps and pc) and any newly-seen sales, appending to
+`bin_history`/`sales_history` (never overwriting or deleting). In
+production this is a Railway Cron Job (not a permanent worker) invoked
+every 10 minutes with the cron expression `*/10 * * * *`, running the
+same `python bin_sales_history_sync.py` start command per scheduled
+execution - it doesn't share state with `futbin_full_sync.py`.
