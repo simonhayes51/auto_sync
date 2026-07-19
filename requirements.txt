@@ -1,7 +1,6 @@
-aiohttp==3.9.5
-asyncpg==0.29.0
+aiohttp==3.14.1
+asyncpg==0.31.0
 beautifulsoup4==4.12.3
 requests
 python-dotenv
 playwright
-asyncpg
