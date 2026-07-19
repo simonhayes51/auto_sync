@@ -1,18 +1,23 @@
 """
 Extends the existing futbin scraper/DB/scheduled-sync setup with a second,
 independent process that builds a historical timeline of BIN prices and
-sales - it does not touch fut_players, futbin_full_sync.py, or any API
-endpoint. It's a separate Railway process (see Procfile's new
-`history_worker` line) so the existing daily full-catalog crawl keeps
-running exactly as it does today.
+sales for Gold Rare cards - it does not touch fut_players, futbin_full_sync.py,
+or any API endpoint. It's a separate Railway process (see Procfile's
+`history_worker` line) so the existing daily full-catalog crawl keeps running
+exactly as it does today.
 
-Every HISTORY_INTERVAL_SECONDS (default 600 = 10 minutes):
-  1. Select the cards worth a timeline, in tiers (see "Tiered coverage"
-     below): every special/promo card + ordinary golds 82+ on every sweep,
-     ordinary golds 75-81 every TIER_B_EVERY'th sweep. Bronze/silver fodder
-     is deliberately excluded - the daily catalog crawl's price is enough
-     there, and spending the request budget on it would collapse sample
-     resolution on the cards that actually trade.
+Runs as a single one-shot crawl per invocation (see `if __name__ ==
+"__main__"` below) - deployed as a Railway Cron Job on a 10-minute schedule
+rather than a permanent always-on worker, since there's no in-process
+scheduling loop anymore. Each invocation:
+  1. Select every Gold Rare card from fut_players (rating 75-99, version
+     'Normal' - see _GOLD_RARE_WHERE below; fut_players.version tracks card
+     EDITION (Normal vs TOTW/TOTS/Icon/etc promos), not the separate Rare/
+     Non-Rare cosmetic art style, which was never scraped into this schema
+     at all - confirmed by querying the live data (top values were Normal/
+     normal/TOTW/TOTS/Icon, no "Rare" anywhere). Common and Rare gold cards
+     both show up as "Normal" here, so this is every ordinary (non-promo)
+     gold card, not a Rare-only subset.
   2. For each one, scrape the current lowest BIN (both ps and pc markets)
      and the visible sales history from futbin.com, using the same
      proven parsing approach as backend/app/futbin_client.py - that module
@@ -43,7 +48,6 @@ stored, not an assumption of equality.
 import os
 import re
 import sys
-import signal
 import asyncio
 import logging
 from collections import defaultdict
@@ -57,7 +61,6 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 import aiohttp
 from bs4 import BeautifulSoup
-from aiohttp import web  # health server, same pattern as futbin_full_sync.py
 
 from monitoring import heartbeat, alert
 
@@ -68,11 +71,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
 
-HISTORY_INTERVAL_SECONDS = int(os.getenv("HISTORY_INTERVAL_SECONDS", "600"))  # 10 minutes
-# Lowered from 6 after the first run against the real Gold Rare population
-# (2463 candidates, up to 4 requests each) got rate-limited (HTTP 429) by
-# futbin - this is client-side politeness, not a hard technical limit.
-HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "3"))
+# Lowered from 6 to 3 after the first run against the real Gold Rare
+# population (2463 candidates, up to 4 requests each) got rate-limited
+# (HTTP 429) by futbin. With _get_with_retry's backoff now absorbing 429s,
+# nudged back up to 5 to shrink the ~37min crawl time (the real bottleneck
+# on cadence, not the 10min sleep) - watch http_429_hits after this change.
+HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "5"))
 HISTORY_MAX_RETRIES = int(os.getenv("HISTORY_MAX_RETRIES", "3"))
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
@@ -592,52 +596,17 @@ async def crawl_once() -> None:
         await pool.close()
 
 
-# ================== HEALTH & SCHEDULER (same pattern as futbin_full_sync.py) ================== #
-async def start_health():
-    app = web.Application()
-    app.add_routes([
-        web.get("/", lambda _: web.Response(text="OK")),
-        web.get("/health", lambda _: web.Response(text="OK")),
-    ])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8081")))
-    await site.start()
-    return asyncio.create_task(asyncio.Event().wait())
-
-
-shutdown_evt = asyncio.Event()
-
-
-def _sig():
-    shutdown_evt.set()
-
-
-async def main_loop():
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(s, _sig)
-        except Exception:
-            pass
-    health = None
-    if os.getenv("PORT"):
-        health = await start_health()
-    while not shutdown_evt.is_set():
-        try:
-            await crawl_once()
-        except Exception as e:
-            log.error("crawl_once() failed, will retry next interval: %s", e)
-        try:
-            await asyncio.wait_for(shutdown_evt.wait(), timeout=HISTORY_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
-            pass
-    if health:
-        health.cancel()
-
-
+# ================== ONE-SHOT ENTRY POINT ==================
+# Deployed as a Railway Cron Job (10-minute schedule) rather than a
+# permanent worker - Railway starts a fresh container for each scheduled
+# run and expects it to exit when done, so there's no in-process scheduling
+# loop, signal handling, or health server here anymore (a health-check
+# endpoint is for long-lived services Railway pings on an interval; a Cron
+# Job's container doesn't stay up between runs for that to apply to).
 if __name__ == "__main__":
-    if "--now" in sys.argv:
+    try:
         asyncio.run(crawl_once())
-    else:
-        asyncio.run(main_loop())
+    except Exception as e:
+        log.error("crawl_once() failed: %s", e)
+        sys.exit(1)
+    sys.exit(0)
