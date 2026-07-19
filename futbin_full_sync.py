@@ -40,6 +40,8 @@ from zoneinfo import ZoneInfo
 from aiohttp import web  # health server
 from bs4 import BeautifulSoup
 
+from monitoring import heartbeat, alert
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
@@ -354,6 +356,86 @@ def row_args(row: dict, cols: list):
     return args
 
 
+async def ensure_identity_log(conn: asyncpg.Connection) -> None:
+    """A card_id whose stored name/rating/version changes between two
+    crawls is a strong signal it used to mean a DIFFERENT card (a resolved
+    card_id collision - see the card_id_collisions handling above - is the
+    known way this happens, but this catches it regardless of cause).
+    That matters because sales_history/bin_history are keyed on this same
+    numeric card_id and are never auto-deleted: any rows scraped before the
+    identity changed are now silently misattributed to whatever card this
+    id currently means (confirmed live: a 97 Star Performer's real-money
+    price sat next to a ~2.3k median sourced from sales that actually
+    belonged to the card this id used to be).
+
+    This only LOGS the change - it deliberately does not delete anything.
+    Auto-deleting sales_history on a heuristic match risks destroying
+    real history on a false positive (e.g. futbin renaming a version
+    label); a human should review before purging using this log as the
+    cutoff timestamp."""
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS card_identity_changes (
+            id BIGSERIAL PRIMARY KEY,
+            card_id BIGINT NOT NULL,
+            old_name TEXT, old_rating INTEGER, old_version TEXT,
+            new_name TEXT, new_rating INTEGER, new_version TEXT,
+            detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_card_identity_changes_card ON card_identity_changes(card_id, detected_at)"
+    )
+
+
+def _norm_text(v):
+    v = (v or "").strip().lower()
+    return v or None
+
+
+def _identity_changed(prior: dict, row: dict) -> bool:
+    """True if this card_id's name/version text differs from what was
+    stored before (informational signal only - see _is_different_card for
+    whether that's actually a different physical card)."""
+    if prior is None:
+        return False
+    # Rating can legitimately tick up/down via in-form upgrades on some
+    # card types - name and version are the reliable signals to even look
+    # further. Case/whitespace normalized: an exact comparison produced
+    # false positives for the well-known "normal" vs "Normal" version
+    # casing split (two different crawl eras wrote different casing for
+    # the same ordinary-gold version).
+    return _norm_text(row.get("name")) != _norm_text(prior.get("name")) or _norm_text(
+        row.get("version")
+    ) != _norm_text(prior.get("version"))
+
+
+def _is_different_card(prior: dict, row: dict) -> bool:
+    """True only if this looks like a genuinely different physical card
+    taking over an existing card_id - not just a version-label change on
+    the same card.
+
+    Confirmed live that name/version text alone isn't sufficient: legacy
+    FC25 'Futties' promo cards legitimately get reclassified to 'Normal'
+    once their event period ends - same physical card, same page, just a
+    relabel - and blocking that write on a text-only signal permanently
+    freezes the card showing a stale version forever.
+
+    player_url is the reliable signal instead: it comes from the player-
+    name link's own href, independent of the image-derived card_id that
+    actually collides in the real failure mode (two different cards
+    sharing one image, e.g. a brand-new special usurping an established
+    gold, or two same-day releases sharing a placeholder). A genuinely
+    different card has a genuinely different player_url; a same-card
+    relabel keeps the same one. If either url is unknown, don't guess -
+    only block when we can positively confirm two different urls.
+    """
+    old_url = _norm_text(prior.get("player_url"))
+    new_url = _norm_text(row.get("player_url"))
+    return bool(old_url and new_url and old_url != new_url)
+
+
 async def crawl_once():
     """Run one full crawl of PAGE_START..PAGE_END and upsert everything found.
 
@@ -366,6 +448,14 @@ async def crawl_once():
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await ensure_new_columns(conn)
+        await ensure_identity_log(conn)
+        existing_identity = {
+            r["card_id"]: {
+                "name": r["name"], "rating": r["rating"], "version": r["version"],
+                "player_url": r["player_url"],
+            }
+            for r in await conn.fetch("SELECT card_id, name, rating, version, player_url FROM fut_players")
+        }
         available = await detect_columns(conn)
         if "card_id" not in available:
             raise RuntimeError("❌ fut_players has no card_id column - can't upsert")
@@ -380,7 +470,38 @@ async def crawl_once():
                 f"Add handling for these before running the real crawl."
             )
 
-        total_rows = written = skipped_no_card_id = skipped_no_name = 0
+        total_rows = written = skipped_no_card_id = skipped_no_name = card_id_collisions = identity_changes = 0
+
+        # card_id is extracted purely from a CDN image filename
+        # (IMG_ID_RE), with no cross-check against anything else. Two
+        # distinct rows can end up sharing an image - and thus the same
+        # numeric card_id - in (at least) two ways confirmed live:
+        #   1. A brand-new special briefly reuses its base gold's image
+        #      as a "coming soon" placeholder before its own art ships
+        #      (Harry Kane/Mbappe: Star Performer sharing the base gold's
+        #      card_id, futbin_id 26xxx vs the base gold's futbin_id 40/69).
+        #   2. Very low-rated players who never get unique artwork at all,
+        #      permanently sharing a generic template image with other
+        #      similarly obscure cards (e.g. two different 'Man Ho Park'
+        #      entries) - this one does NOT "self-resolve".
+        # Since the upsert is ON CONFLICT (card_id) DO UPDATE, a collision
+        # would silently overwrite one card's entire row with the other's
+        # data - not a skipped row, an actively destroyed one.
+        #
+        # futbin_id (parsed from the player-name link's own href, entirely
+        # independent of any image) is the cross-check: two rows can only
+        # legitimately share a card_id if they're the same real card, which
+        # means the same futbin_id too. A lower futbin_id means an older,
+        # already-established FUTBIN page - confirmed live, the base gold's
+        # futbin_id (40, 69) is always far smaller than the newly-created
+        # special's (26115, 26116), since FUTBIN's ids are assigned in
+        # creation order. That page is the legitimate owner of the shared
+        # image regardless of which row this crawl happens to encounter
+        # first, so on a collision we keep whichever contender has the
+        # LOWEST futbin_id seen so far - even if that means overwriting
+        # something we already wrote for the same card_id earlier in this
+        # same run - rather than just keeping "whoever we saw first".
+        seen_card_ids: dict = {}
 
         async with aiohttp.ClientSession() as session:
             for page in range(PAGE_START, PAGE_END + 1):
@@ -397,6 +518,96 @@ async def crawl_once():
                         # rather than risk an insert failure mid-batch.
                         skipped_no_name += 1
                         continue
+
+                    cid = r["card_id"]
+                    fbid = r.get("futbin_id")
+                    prior = seen_card_ids.get(cid)
+                    bypass_identity_gate = False
+                    if prior is not None and fbid is not None and prior["futbin_id"] is not None and prior["futbin_id"] != fbid:
+                        card_id_collisions += 1
+                        try:
+                            this_is_older = int(fbid) < int(prior["futbin_id"])
+                        except (TypeError, ValueError):
+                            this_is_older = False
+
+                        if this_is_older:
+                            print(
+                                f"⚠️ card_id collision: {cid} claimed by BOTH "
+                                f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
+                                f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
+                                f"this one is the OLDER futbin page (established card); correcting by writing it "
+                                f"and overwriting whatever we already wrote for the newer page this run.",
+                                flush=True,
+                            )
+                            seen_card_ids[cid] = {
+                                "futbin_id": fbid, "name": r.get("name"),
+                                "rating": r.get("rating"), "version": r.get("version"),
+                            }
+                            bypass_identity_gate = True
+                        else:
+                            print(
+                                f"⚠️ card_id collision: {cid} claimed by BOTH "
+                                f"futbin_id={prior['futbin_id']} ({prior['name']!r} {prior['rating']} {prior['version']}) "
+                                f"AND futbin_id={fbid} ({r.get('name')!r} {r.get('rating')} {r.get('version')}) - "
+                                f"keeping the older page ({prior['futbin_id']}), skipping this one so it doesn't "
+                                f"overwrite it. Likely a shared placeholder/generic-template image.",
+                                flush=True,
+                            )
+                            continue
+                    if prior is None:
+                        seen_card_ids[cid] = {
+                            "futbin_id": fbid, "name": r.get("name"),
+                            "rating": r.get("rating"), "version": r.get("version"),
+                        }
+
+                    old_identity = existing_identity.get(cid)
+                    if not bypass_identity_gate and _identity_changed(old_identity, r):
+                        identity_changes += 1
+                        different_card = _is_different_card(old_identity, r)
+                        try:
+                            await conn.execute(
+                                """
+                                INSERT INTO card_identity_changes
+                                    (card_id, old_name, old_rating, old_version, new_name, new_rating, new_version)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                                """,
+                                cid, old_identity["name"], old_identity["rating"], old_identity["version"],
+                                r.get("name"), r.get("rating"), r.get("version"),
+                            )
+                        except Exception as e:
+                            print(f"❌ failed to log identity change for card_id={cid}: {e}", flush=True)
+
+                        if different_card:
+                            # player_url also differs - two genuinely
+                            # different cards, not just a relabel. Keep
+                            # the existing one rather than silently
+                            # overwriting it (the Kane/Mbappe gold-card
+                            # incident: a brand-new special usurped an
+                            # established gold's card_id).
+                            print(
+                                f"⚠️ card_id {cid} identity change BLOCKED (different player_url too): keeping "
+                                f"existing {old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r}, "
+                                f"NOT overwriting with {r.get('name')!r} {r.get('rating')} {r.get('version')!r}. "
+                                f"Logged to card_identity_changes for review.",
+                                flush=True,
+                            )
+                            continue
+                        else:
+                            # Same player_url (or unknown) - most likely
+                            # the same physical card being relabeled, not
+                            # a collision (confirmed live: legacy FC25
+                            # "Futties" promo cards reclassifying to
+                            # "Normal" once their event period ends). Let
+                            # the write proceed rather than freezing the
+                            # card on a stale label forever.
+                            print(
+                                f"ℹ️ card_id {cid} version/name changed but same player_url - treating as a "
+                                f"relabel of the same card, not a collision: "
+                                f"{old_identity['name']!r} {old_identity['rating']} {old_identity['version']!r} -> "
+                                f"{r.get('name')!r} {r.get('rating')} {r.get('version')!r}. Allowing the write.",
+                                flush=True,
+                            )
+
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
                         written += 1
@@ -405,7 +616,9 @@ async def crawl_once():
 
                 print(
                     f"📦 page {page}/{PAGE_END}: {len(rows)} rows "
-                    f"(running totals: written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name})",
+                    f"(running totals: written={written} no_card_id={skipped_no_card_id} "
+                    f"no_name={skipped_no_name} collisions={card_id_collisions} "
+                    f"identity_changes={identity_changes})",
                     flush=True,
                 )
                 if rows:
@@ -413,11 +626,55 @@ async def crawl_once():
 
                 await asyncio.sleep(REQUEST_DELAY)
 
+        if card_id_collisions:
+            print(
+                f"⚠️ {card_id_collisions} card_id collision(s) detected this crawl - "
+                f"see warnings above for which cards were affected.",
+                flush=True,
+            )
+        if identity_changes:
+            print(
+                f"⚠️ {identity_changes} card_id identity change(s) detected this crawl - "
+                f"see warnings above; query card_identity_changes for the full list and use "
+                f"detected_at as a cutoff before purging any contaminated sales_history/bin_history.",
+                flush=True,
+            )
+
         print(
             f"✅ Done. pages={PAGE_START}-{PAGE_END} total_rows={total_rows} "
-            f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name}",
+            f"written={written} no_card_id={skipped_no_card_id} no_name={skipped_no_name} "
+            f"collisions={card_id_collisions} identity_changes={identity_changes}",
             flush=True,
         )
+        # A crawl that parsed zero rows across every page almost certainly
+        # means futbin changed markup (or is blocking us) - page a human.
+        crawl_ok = total_rows > 0
+        await heartbeat(
+            conn,
+            "futbin_full_sync",
+            ok=crawl_ok,
+            detail=(
+                f"pages={PAGE_START}-{PAGE_END} rows={total_rows} written={written}"
+                + (f" identity_changes={identity_changes}" if identity_changes else "")
+                + (f" collisions={card_id_collisions}" if card_id_collisions else "")
+            ),
+        )
+        if not crawl_ok:
+            await alert(
+                "futbin_full_sync: full crawl parsed **0 rows** - futbin markup change or "
+                "block? Catalog + daily prices are no longer refreshing."
+            )
+        elif card_id_collisions:
+            # Not a pipeline outage, but real data loss (one card's row was
+            # about to overwrite another's) - worth a page, not just a log
+            # line nobody will read until someone reports a missing card.
+            await alert(
+                f"futbin_full_sync: {card_id_collisions} card_id collision(s) this crawl - "
+                "two different cards resolved to the same card_id (likely a shared placeholder "
+                "image on a brand-new promo release). See worker logs for which cards; affected "
+                "card(s) were skipped rather than overwritten, so check if any are still missing "
+                "from fut_players once futbin uploads distinct artwork."
+            )
     finally:
         await conn.close()
 

@@ -52,11 +52,17 @@ import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+# futbin serves its sale timestamps in UK local time (see _parse_sale_date).
+_FUTBIN_TZ = ZoneInfo("Europe/London")
 from typing import Any, Dict, List, Optional
 
 import asyncpg
 import aiohttp
 from bs4 import BeautifulSoup
+
+from monitoring import heartbeat, alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bin_sales_history_sync")
@@ -76,19 +82,41 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
-# "Gold" = rating 75-99 (this app's/futbin's own rarity-tier convention
-# elsewhere - bronze <65, silver 65-74, gold 75+).
+# ---------------------------------------------------------------------------
+# Tiered coverage
+# ---------------------------------------------------------------------------
+# Originally this scraped only ordinary gold cards (rating 75-99, version
+# 'Normal') - which excluded every special/promo card (TOTW/TOTS/Icon/...),
+# i.e. the most-traded, highest-value segment of the market. Sweeping the
+# whole ~25k-card catalog instead is worse, not better: at the politeness
+# rate futbin tolerates (429s appeared at concurrency 6), a full sweep takes
+# ~10h, collapsing per-card sample resolution to 2-3/day and multiplying
+# ban risk for data that's ~80% illiquid bronze/silver noise.
 #
-# version was originally assumed to carry a "Rare"/"Non-Rare" cosmetic-style
-# tag - it doesn't. Querying the live data showed the real top values are
-# Normal (2080), TOTW (575), normal lowercase (383), TOTS (240), Icon (128) -
-# version tracks card EDITION (ordinary vs. promo type), and every ordinary
-# gold card shows up as "Normal" regardless of whether it's visually Rare or
-# Non-Rare in-game - that finer distinction was never scraped into this
-# schema. So this matches every ordinary (non-promo) gold card; ILIKE covers
-# the "Normal"/"normal" casing inconsistency seen in the real data (looks
-# like two different crawl eras wrote different casing for the same thing).
-_GOLD_RARE_WHERE = "rating BETWEEN 75 AND 99 AND version ILIKE 'normal'"
+# So: tiers, computed at selection time (no schema change, can't drift from
+# the catalog).
+#   Tier A - every sweep: all special/promo cards (version != Normal) plus
+#            ordinary golds rated 82+. The liquid, volatile segment.
+#   Tier B - every TIER_B_EVERY'th sweep (time-anchored, so restarts don't
+#            reset the phase): ordinary golds 75-81 (slow-moving fodder).
+#   Everything else (silver/bronze fodder): the daily futbin_full_sync
+#            catalog crawl already refreshes their price - enough for SBC
+#            purposes; no BIN/sales timeline is worth requests on them.
+#
+# If a sweep gets heavily 429'd during Tier A, Tier B is skipped for that
+# run - when throttled, spend the remaining budget on the data that matters.
+#
+# version tracks card EDITION (Normal vs TOTW/TOTS/Icon/etc) - confirmed by
+# querying live data (top values: Normal 2080, TOTW 575, normal 383, TOTS
+# 240, Icon 128); ILIKE covers the Normal/normal casing split from two
+# different crawl eras.
+TIER_A_WHERE = (
+    "((version IS NOT NULL AND version NOT ILIKE 'normal') "
+    "OR (rating >= 82 AND version ILIKE 'normal'))"
+)
+TIER_B_WHERE = "(rating BETWEEN 75 AND 81 AND version ILIKE 'normal')"
+TIER_B_EVERY = int(os.getenv("TIER_B_EVERY", "4"))
+TIER_B_SKIP_429_THRESHOLD = int(os.getenv("TIER_B_SKIP_429_THRESHOLD", "25"))
 
 _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
@@ -220,11 +248,17 @@ async def _sales_url(
     path = await _resolve_sales_path(session, player_url, diag)
     if path:
         return f"https://www.futbin.com{path}?platform={fb_plat}"
-    if "/player/" in player_url:
-        diag["sales_used_fallback_url"] += 1
-        sales_base = player_url.replace("/player/", "/sales/")
-        return f"{sales_base}?platform={fb_plat}"
-    diag["sales_no_url_at_all"] += 1
+    # No naive "/player/ -> /sales/" fallback: confirmed live that this
+    # collides with unrelated cards for brand-new cards whose /market page
+    # has no "latest sale" link yet - the numeric id does NOT reliably
+    # mean the same card across both URL namespaces, contrary to what this
+    # fallback used to assume. Real incident: a 97 Star Performer Mbappé
+    # and several new TOTW cards each recorded real, internally-consistent
+    # sales (correct EA tax math) for a DIFFERENT, unrelated card, because
+    # this fallback guessed a URL instead of confirming one. No sales data
+    # is a correct "we don't know yet" state; a wrong number silently
+    # accumulated into sales_history forever is not.
+    diag["sales_no_history_link_no_fallback"] += 1
     return None
 
 
@@ -233,12 +267,15 @@ def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional
         return None
     now = now or datetime.now(timezone.utc)
     try:
-        dt = datetime.strptime(f"{date_text} {now.year}", "%b %d, %I:%M %p %Y")
+        naive = datetime.strptime(f"{date_text} {now.year}", "%b %d, %I:%M %p %Y")
     except ValueError:
         return None
-    dt = dt.replace(tzinfo=timezone.utc)
+    # futbin renders sale times in UK local time (BST/GMT), not UTC -
+    # treating them as UTC stored every summer sale ~1h in the future
+    # (surfaced live by /api/ops/freshness reporting a negative data age).
+    dt = naive.replace(tzinfo=_FUTBIN_TZ).astimezone(timezone.utc)
     if dt > now + timedelta(days=1):
-        dt = dt.replace(year=now.year - 1)
+        dt = naive.replace(year=now.year - 1, tzinfo=_FUTBIN_TZ).astimezone(timezone.utc)
     return dt
 
 
@@ -442,17 +479,40 @@ async def _scrape_one(
                 log.warning("Sales insert failed for card_id=%s sold_at=%s: %s", card_id, s["sold_at"], e)
 
 
+async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
+    return await conn.fetch(
+        f"SELECT card_id, player_url FROM fut_players WHERE {where} AND player_url IS NOT NULL"
+    )
+
+
+def _tier_b_due(now_epoch: Optional[int] = None) -> bool:
+    """Time-anchored phase so worker restarts don't reset the rotation."""
+    import time as _time
+    now_epoch = now_epoch if now_epoch is not None else int(_time.time())
+    return (now_epoch // HISTORY_INTERVAL_SECONDS) % TIER_B_EVERY == 0
+
+
+async def _scrape_batch(pool, session, sem, rows, diag) -> None:
+    await asyncio.gather(*[
+        _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
+        for r in rows
+    ])
+
+
 async def crawl_once() -> None:
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=HISTORY_CONCURRENCY + 2)
     try:
         async with pool.acquire() as conn:
             await ensure_tables(conn)
-            rows = await conn.fetch(
-                f"SELECT card_id, player_url FROM fut_players "
-                f"WHERE {_GOLD_RARE_WHERE} AND player_url IS NOT NULL"
-            )
+            tier_a = await _fetch_tier(conn, TIER_A_WHERE)
+            b_due = _tier_b_due()
+            tier_b = await _fetch_tier(conn, TIER_B_WHERE) if b_due else []
 
-        log.info("Gold Rare candidates this run: %d", len(rows))
+        log.info(
+            "Candidates this run: tier_a=%d (specials + golds 82+) tier_b=%d (golds 75-81, due=%s)",
+            len(tier_a), len(tier_b), b_due,
+        )
+        rows = list(tier_a) + list(tier_b)
         if not rows:
             return
 
@@ -460,10 +520,22 @@ async def crawl_once() -> None:
         diag: Dict[str, Any] = defaultdict(int)
 
         async with aiohttp.ClientSession() as session:
-            await asyncio.gather(*[
-                _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
-                for r in rows
-            ])
+            # Hot tier first, always.
+            await _scrape_batch(pool, session, sem, tier_a, diag)
+
+            # Fodder tier only if the sweep isn't being throttled - promo
+            # nights are exactly when 429s spike AND when Tier A freshness
+            # matters most, so a constrained budget goes to A alone.
+            if tier_b:
+                if diag["http_429_hits"] > TIER_B_SKIP_429_THRESHOLD:
+                    diag["tier_b_skipped_throttled"] = len(tier_b)
+                    log.warning(
+                        "Skipping tier B (%d cards) this run: %d 429s during tier A - throttled, "
+                        "keeping remaining budget on the hot tier.",
+                        len(tier_b), diag["http_429_hits"],
+                    )
+                else:
+                    await _scrape_batch(pool, session, sem, tier_b, diag)
 
         log.info(
             "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
@@ -496,6 +568,30 @@ async def crawl_once() -> None:
         ):
             if sample_key in diag:
                 log.info("%s: %s", sample_key, diag[sample_key])
+
+        # Heartbeat for /api/ops/freshness. A run where every single scrape
+        # failed (and nothing new landed) is a markup change or a block -
+        # that's the failure mode that silently kills the fair-value data.
+        total_attempted = diag["bin_price_found"] + diag["bin_price_null"] + diag["bin_failed"]
+        run_ok = total_attempted == 0 or diag["bin_failed"] < total_attempted
+        async with pool.acquire() as hb_conn:
+            await heartbeat(
+                hb_conn,
+                "bin_sales_history_sync",
+                ok=run_ok,
+                detail=(
+                    f"tier_a={len(tier_a)} tier_b={len(tier_b)}"
+                    + (f" (skipped, throttled)" if diag.get("tier_b_skipped_throttled") else "")
+                    + f" sales_new={diag['sales_new']} bin_found={diag['bin_price_found']} "
+                    f"bin_failed={diag['bin_failed']} http_429={diag['http_429_hits']}"
+                ),
+            )
+        if not run_ok:
+            await alert(
+                "bin_sales_history_sync: every BIN scrape failed this run "
+                f"(bin_failed={diag['bin_failed']}/{total_attempted}, 429s={diag['http_429_hits']}) - "
+                "futbin markup change or block? Sales/BIN history has stopped growing."
+            )
     finally:
         await pool.close()
 
