@@ -21,23 +21,18 @@ Defaults to the full 1-848 range now that this is proven safe at scale -
 set FUTBIN_PAGE_START/FUTBIN_PAGE_END to override with a smaller range
 for local testing.
 
-Deployed as the Railway `worker` process (see Procfile). Since Railway
-workers are expected to run indefinitely rather than exit, this runs the
-full crawl once daily at a fixed time (19:00 UK, matching the old
-futgg_auto_sync.py's schedule) and sleeps between runs - see main_loop()
-at the bottom. Pass --now to run a single crawl immediately and exit,
-which is useful for local testing.
+Deployed as a Railway Cron Job (schedule 0 19 * * *, i.e. once daily at
+19:00 UTC - note this is 20:00 UK time during BST, not 19:00 UK, since
+Railway cron schedules run in UTC year-round). Each invocation starts a
+fresh container, runs one full crawl via crawl_once(), and exits - no
+in-process scheduling loop.
 """
 import os
 import re
 import sys
-import signal
 import asyncio
 import asyncpg
 import aiohttp
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from aiohttp import web  # health server
 from bs4 import BeautifulSoup
 
 from monitoring import heartbeat, alert
@@ -679,65 +674,10 @@ async def crawl_once():
         await conn.close()
 
 
-# ================== HEALTH & SCHEDULER ================== #
-# Railway's `worker` process type expects a long-running process, not a
-# one-shot script that exits - a worker that exits immediately (or once a
-# day) looks crashed/restart-looping from Railway's perspective. This loop
-# runs a full crawl once daily and sleeps in between, following the same
-# sleep_until_19_uk()/health-server pattern futgg_auto_sync.py used.
-async def start_health():
-    app = web.Application()
-    app.add_routes([
-        web.get("/", lambda _: web.Response(text="OK")),
-        web.get("/health", lambda _: web.Response(text="OK")),
-    ])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
-    await site.start()
-    return asyncio.create_task(asyncio.Event().wait())
-
-
-shutdown_evt = asyncio.Event()
-
-
-def _sig():
-    shutdown_evt.set()
-
-
-async def sleep_until_19_uk():
-    tz = ZoneInfo("Europe/London")
-    now = datetime.now(tz)
-    target = now.replace(hour=19, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    print(f"🕖 Next crawl at {target.isoformat()}", flush=True)
-    await asyncio.sleep((target - now).total_seconds())
-
-
-async def main_loop():
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(s, _sig)
-        except Exception:
-            pass
-    health = None
-    if os.getenv("PORT"):
-        health = await start_health()
-    while not shutdown_evt.is_set():
-        try:
-            await crawl_once()
-        except Exception as e:
-            print(f"❌ crawl_once() failed, will retry at next scheduled time: {e}", flush=True)
-        await sleep_until_19_uk()
-    if health:
-        health.cancel()
-
-
 if __name__ == "__main__":
-    if "--now" in sys.argv:
-        # Single crawl, then exit - for local testing (mirrors futgg_auto_sync.py's --now flag).
+    try:
         asyncio.run(crawl_once())
-    else:
-        asyncio.run(main_loop())
+    except Exception as e:
+        print(f"❌ crawl_once() failed: {e}", flush=True)
+        sys.exit(1)
+    sys.exit(0)
