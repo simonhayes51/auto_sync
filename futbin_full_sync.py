@@ -820,6 +820,7 @@ async def crawl_latest():
                 await asyncio.sleep(_jittered_delay())
 
         written = skipped_no_card_id = skipped_no_name = 0
+        new_cards = []
         for r in all_rows:
             if r["card_id"] is None:
                 skipped_no_card_id += 1
@@ -828,7 +829,7 @@ async def crawl_latest():
                 skipped_no_name += 1
                 continue
             try:
-                await conn.execute(
+                row = await conn.fetchrow(
                     """
                     INSERT INTO fut_players (card_id, name, rating, position, image_url, player_url, price, price_num, price_updated_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -841,25 +842,32 @@ async def crawl_latest():
                         price = EXCLUDED.price,
                         price_num = EXCLUDED.price_num,
                         price_updated_at = NOW()
+                    RETURNING (xmax = 0) AS inserted
                     """,
                     r["card_id"], r["name"], r["rating"], r["position"], r["image_url"], r["player_url"],
                     str(r["ps_price"]) if r["ps_price"] is not None else None, r["ps_price"],
                 )
                 written += 1
+                if row["inserted"]:
+                    new_cards.append(r["name"])
             except Exception as e:
                 print(f"❌ latest upsert failed for card_id={r['card_id']} ({r.get('name')}): {e}", flush=True)
 
         print(
             f"✅ Done (latest). rows={len(all_rows)} written={written} "
+            f"new={len(new_cards)} updated={written - len(new_cards)} "
             f"no_card_id={skipped_no_card_id} no_name={skipped_no_name}",
             flush=True,
         )
+        if new_cards:
+            print(f"🆕 New card(s) found: {', '.join(new_cards[:20])}"
+                  + (f" (+{len(new_cards) - 20} more)" if len(new_cards) > 20 else ""), flush=True)
         crawl_ok = len(all_rows) > 0
         await heartbeat(
             conn,
             "futbin_latest_sync",
             ok=crawl_ok,
-            detail=f"rows={len(all_rows)} written={written}",
+            detail=f"rows={len(all_rows)} written={written} new={len(new_cards)}",
         )
         if not crawl_ok:
             await alert(
