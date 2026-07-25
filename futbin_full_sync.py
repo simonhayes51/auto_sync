@@ -30,9 +30,12 @@ in-process scheduling loop.
 import os
 import re
 import sys
+import random
 import asyncio
 import asyncpg
 import aiohttp
+from datetime import date, datetime, timedelta
+from typing import Optional
 from bs4 import BeautifulSoup
 
 from monitoring import heartbeat, alert
@@ -46,7 +49,34 @@ PAGE_START = int(os.getenv("FUTBIN_PAGE_START", "1"))
 PAGE_END = int(os.getenv("FUTBIN_PAGE_END", "848"))  # full listing range
 REQUEST_DELAY = float(os.getenv("FUTBIN_REQUEST_DELAY", "1.5"))
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
+# "full" = the existing behavior below, crawling PAGE_START..PAGE_END of
+# the main catalog listing - meant for an infrequent (weekly/monthly)
+# full-catalog refresh. "latest" = crawl_latest() further down: a much
+# lighter daily job that only reads futbin's own "recently added" feed
+# (/26/latest) and stops as soon as it reaches cards older than the
+# cutoff, instead of sweeping the whole catalog every day.
+FUTBIN_MODE = os.getenv("FUTBIN_MODE", "full")
+LATEST_MAX_PAGES = int(os.getenv("FUTBIN_LATEST_MAX_PAGES", "265"))  # safety cap - matches the feed's own total page count
+LATEST_CUTOFF_DAYS = int(os.getenv("FUTBIN_LATEST_CUTOFF_DAYS", "2"))  # stop once a page's oldest card is older than this
+
+# A perfectly uniform delay between 848 sequential requests to one
+# predictable URL scheme, at the same time every day, is an easy pattern
+# for anti-bot protection to fingerprint (confirmed live: this crawl
+# started getting HTTP 403 on every page). Jittering the delay doesn't
+# guarantee anything, but it's a real, honest difference in the traffic
+# shape rather than a fixed mechanical cadence.
+def _jittered_delay() -> float:
+    return random.uniform(REQUEST_DELAY * 0.6, REQUEST_DELAY * 1.6)
+
+# The previous UA string ("SBCSolver/1.5") announces itself as a
+# non-browser tool. A realistic, current desktop-browser UA is a safe,
+# easy change regardless of whether it's the actual cause of the 403s.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 # futbin's cutout image filename is /players/p{id}.png for special cards
 # but /players/{id}.png (no "p") for base gold/silver/bronze cards - the "p"
@@ -267,17 +297,97 @@ def parse_row(row):
     }
 
 
+# /26/latest's rows are a much smaller subset of the same player-row
+# markup - no club/nation/league, no foot/skills/6-stats/body info, and
+# position is plain text (<td class="table-pos">CM</td>) rather than the
+# nested table-pos-main/span structure the main listing uses. Confirmed
+# against real markup. Only used for fast new-card discovery, not a full
+# catalog refresh - see crawl_latest().
+def parse_latest_row(row):
+    name_tag = row.find("a", class_="table-player-name")
+    name = name_tag.get_text(strip=True) if name_tag else None
+
+    futbin_id = slug = None
+    if name_tag and name_tag.get("href"):
+        m = FUTBIN_HREF_RE.search(name_tag["href"])
+        if m:
+            futbin_id, slug = m.group(1), m.group(2)
+
+    card_id = None
+    image_url = None
+    for img in row.find_all("img"):
+        src = img.get("src", "")
+        m = IMG_ID_RE.search(src)
+        if m:
+            card_id = int(m.group(1))
+            image_url = src
+            break
+
+    rating_tag = row.find("div", class_="rating-square")
+    rating_txt = rating_tag.get_text(strip=True) if rating_tag else ""
+    rating = int(rating_txt) if rating_txt.isdigit() else None
+
+    pos_td = row.find("td", class_="table-pos")
+    position = pos_td.get_text(strip=True) if pos_td else None
+
+    price_td = row.find("td", class_="table-cross-price")
+    ps_price = _num(price_td.get_text(strip=True)) if price_td else None
+
+    added_on = None
+    date_td = row.find("td", class_="table-added-on")
+    if date_td:
+        try:
+            added_on = datetime.strptime(date_td.get_text(strip=True), "%Y-%m-%d").date()
+        except ValueError:
+            added_on = None
+
+    player_url = f"https://www.futbin.com/{GAME}/player/{futbin_id}/{slug}" if futbin_id and slug else None
+
+    return {
+        "card_id": card_id, "name": name, "rating": rating, "position": position,
+        "image_url": image_url, "player_url": player_url, "ps_price": ps_price,
+        "added_on": added_on,
+    }
+
+
+async def _fetch_html(session: aiohttp.ClientSession, url: str, label: str) -> Optional[str]:
+    """GET with one capped retry on a 403 - not the aggressive multi-
+    attempt backoff used for 429s elsewhere in this project, since a 403
+    usually means "you've been identified" and hammering the same block
+    repeatedly is more likely to reinforce it than resolve it. If the
+    retry (after a longer pause) still 403s, log and give up on this URL
+    rather than looping."""
+    for attempt in range(2):
+        async with session.get(url, headers=HEADERS, timeout=30) as resp:
+            if resp.status == 403 and attempt == 0:
+                print(f"⚠️ {label} → status 403, retrying once after a pause", flush=True)
+                await asyncio.sleep(random.uniform(5.0, 10.0))
+                continue
+            if resp.status != 200:
+                print(f"⚠️ {label} → status {resp.status}", flush=True)
+                return None
+            return await resp.text()
+    return None
+
+
 async def fetch_page(session: aiohttp.ClientSession, page: int):
     url = f"https://www.futbin.com/{GAME}/players?page={page}"
-    async with session.get(url, headers=HEADERS, timeout=30) as resp:
-        if resp.status != 200:
-            print(f"⚠️ page {page} → status {resp.status}", flush=True)
-            return []
-        html = await resp.text()
-
+    html = await _fetch_html(session, url, f"page {page}")
+    if html is None:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.find_all("tr", class_="player-row")
     return [parse_row(r) for r in rows]
+
+
+async def fetch_latest_page(session: aiohttp.ClientSession, page: int):
+    url = f"https://www.futbin.com/{GAME}/latest?page={page}"
+    html = await _fetch_html(session, url, f"latest page {page}")
+    if html is None:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.find_all("tr", class_="player-row")
+    return [parse_latest_row(r) for r in rows]
 
 
 async def ensure_new_columns(conn: asyncpg.Connection) -> None:
@@ -619,7 +729,7 @@ async def crawl_once():
                 if rows:
                     print(f"   sample row: {rows[0]}", flush=True)
 
-                await asyncio.sleep(REQUEST_DELAY)
+                await asyncio.sleep(_jittered_delay())
 
         if card_id_collisions:
             print(
@@ -674,10 +784,97 @@ async def crawl_once():
         await conn.close()
 
 
-if __name__ == "__main__":
+async def crawl_latest():
+    """Daily discovery crawl of futbin's own "recently added" feed
+    (/26/latest) instead of sweeping the whole ~848-page catalog every
+    day. Pages are newest-first (confirmed live); this stops as soon as
+    a page's oldest card falls outside LATEST_CUTOFF_DAYS, so most days
+    this only touches a handful of pages, not the full LATEST_MAX_PAGES
+    safety cap.
+
+    /26/latest rows carry far fewer fields than the main listing (no
+    club/nation/league, no stats, no body info - see parse_latest_row),
+    so the upsert here only ever touches the columns it actually has
+    data for. It never sets the richer stat columns to NULL for a card
+    that already has them from a previous full crawl() - it just doesn't
+    mention those columns in the UPDATE at all.
+    """
+    conn = await asyncpg.connect(DATABASE_URL)
     try:
-        asyncio.run(crawl_once())
+        cutoff = date.today() - timedelta(days=LATEST_CUTOFF_DAYS)
+        print(f"🔎 Crawling /latest, stopping once a page is entirely older than {cutoff}", flush=True)
+
+        all_rows = []
+        async with aiohttp.ClientSession() as session:
+            for page in range(1, LATEST_MAX_PAGES + 1):
+                rows = await fetch_latest_page(session, page)
+                if not rows:
+                    print(f"📦 latest page {page}: 0 rows - stopping", flush=True)
+                    break
+                all_rows.extend(rows)
+                dates_on_page = [r["added_on"] for r in rows if r["added_on"]]
+                oldest = min(dates_on_page) if dates_on_page else None
+                print(f"📦 latest page {page}/{LATEST_MAX_PAGES}: {len(rows)} rows, oldest={oldest}", flush=True)
+                if oldest is not None and oldest < cutoff:
+                    break
+                await asyncio.sleep(_jittered_delay())
+
+        written = skipped_no_card_id = skipped_no_name = 0
+        for r in all_rows:
+            if r["card_id"] is None:
+                skipped_no_card_id += 1
+                continue
+            if not r.get("name"):
+                skipped_no_name += 1
+                continue
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO fut_players (card_id, name, rating, position, image_url, player_url, price, price_num, price_updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                    ON CONFLICT (card_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        rating = EXCLUDED.rating,
+                        position = EXCLUDED.position,
+                        image_url = EXCLUDED.image_url,
+                        player_url = EXCLUDED.player_url,
+                        price = EXCLUDED.price,
+                        price_num = EXCLUDED.price_num,
+                        price_updated_at = NOW()
+                    """,
+                    r["card_id"], r["name"], r["rating"], r["position"], r["image_url"], r["player_url"],
+                    str(r["ps_price"]) if r["ps_price"] is not None else None, r["ps_price"],
+                )
+                written += 1
+            except Exception as e:
+                print(f"❌ latest upsert failed for card_id={r['card_id']} ({r.get('name')}): {e}", flush=True)
+
+        print(
+            f"✅ Done (latest). rows={len(all_rows)} written={written} "
+            f"no_card_id={skipped_no_card_id} no_name={skipped_no_name}",
+            flush=True,
+        )
+        crawl_ok = len(all_rows) > 0
+        await heartbeat(
+            conn,
+            "futbin_latest_sync",
+            ok=crawl_ok,
+            detail=f"rows={len(all_rows)} written={written}",
+        )
+        if not crawl_ok:
+            await alert(
+                "futbin_latest_sync: /26/latest crawl parsed **0 rows** on page 1 - "
+                "futbin markup change or block? New-card discovery has stopped."
+            )
+    finally:
+        await conn.close()
+
+
+if __name__ == "__main__":
+    target = crawl_latest if FUTBIN_MODE == "latest" else crawl_once
+    try:
+        asyncio.run(target())
     except Exception as e:
-        print(f"❌ crawl_once() failed: {e}", flush=True)
+        print(f"❌ {target.__name__}() failed: {e}", flush=True)
         sys.exit(1)
     sys.exit(0)
