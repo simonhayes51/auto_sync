@@ -220,13 +220,52 @@ def parse_lowest_bin(html: str, platform: str) -> Optional[int]:
     return None
 
 
+# Games played / goals-per-game / best chem style live in the player-bio
+# paragraph as a natural-language sentence, not a table - confirmed live
+# against futbin.com/26/player/67/erling-haaland's bio section: "He has
+# been used in 6,688,772 games with a GPG (goals per game) of 1.346."
+# and "The best chemistry style for him is Basic." Each sentence appears
+# twice, once per platform, in platform-ps-only/platform-pc-only spans -
+# the same convention already used for BIN price on this page. This data
+# only lives on the main player page (not /market or the sales page), so
+# it piggybacks on the same fetch fetch_lowest_bin already makes rather
+# than costing an extra request.
+_BIO_GAMES_GOALS_RE = re.compile(r"used in ([\d,]+) games with a GPG \(goals per game\) of (\d+(?:\.\d+)?)\.")
+_BIO_CHEM_RE = re.compile(r"best chemistry style for \w+ is ([A-Za-z][A-Za-z \-]*?)\.")
+
+
+def parse_bio_stats(html: str, platform: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+    bio = soup.find("div", class_=re.compile(r"\bplayer-text-section\b"))
+    if not bio:
+        return {}
+
+    plat_class = _PLATFORM_CLASS.get(platform, "platform-ps-only")
+    games = avg_goals = top_chem_style = None
+    for span in bio.find_all(class_=re.compile(rf"\b{plat_class}\b")):
+        text = span.get_text(" ", strip=True)
+        m = _BIO_GAMES_GOALS_RE.search(text)
+        if m:
+            games = _num(m.group(1))
+            try:
+                avg_goals = float(m.group(2))
+            except ValueError:
+                avg_goals = None
+            continue
+        m = _BIO_CHEM_RE.search(text)
+        if m:
+            top_chem_style = m.group(1).strip()
+
+    return {"games": games, "avg_goals": avg_goals, "top_chem_style": top_chem_style}
+
+
 async def fetch_lowest_bin(
     session: aiohttp.ClientSession, player_url: str, platform: str, diag: Dict[str, Any]
-) -> Optional[int]:
+) -> "tuple[Optional[int], Dict[str, Any]]":
     status, html = await _get_with_retry(session, player_url, diag)
     if status != 200 or html is None:
-        return None
-    return parse_lowest_bin(html, platform)
+        return None, {}
+    return parse_lowest_bin(html, platform), parse_bio_stats(html, platform)
 
 
 async def _resolve_sales_path(
@@ -406,6 +445,20 @@ async def ensure_tables(conn: asyncpg.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS sales_history_player_sold_idx ON sales_history (player_id, sold_at)"
     )
 
+    # Bio stats (games played, avg goals, top chem style) - "console" here
+    # means the combined PS+Xbox market/stat set futbin itself reports as
+    # a single "ps-only" value (same convention BIN price already uses).
+    # Nullable, safe to add to an existing table.
+    for col, ddl in {
+        "games_played_console": "INTEGER",
+        "games_played_pc": "INTEGER",
+        "avg_goals_console": "NUMERIC(6,3)",
+        "avg_goals_pc": "NUMERIC(6,3)",
+        "top_chem_style_console": "TEXT",
+        "top_chem_style_pc": "TEXT",
+    }.items():
+        await conn.execute(f"ALTER TABLE fut_players ADD COLUMN IF NOT EXISTS {col} {ddl}")
+
 
 # ---------------------------------------------------------------------------
 # Per-player scrape + insert
@@ -433,9 +486,11 @@ async def _scrape_one(
             return
 
         # --- BIN history: both markets, always insert, never overwrite ---
+        bio_by_platform: Dict[str, Dict[str, Any]] = {}
         for platform in ("ps", "pc"):
             try:
-                bin_price = await fetch_lowest_bin(session, player_url, platform, diag)
+                bin_price, bio_stats = await fetch_lowest_bin(session, player_url, platform, diag)
+                bio_by_platform[platform] = bio_stats
                 async with pool.acquire() as conn:
                     await conn.execute(
                         "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
@@ -453,6 +508,40 @@ async def _scrape_one(
             except Exception as e:
                 diag["bin_failed"] += 1
                 log.warning("BIN scrape failed for card_id=%s platform=%s: %s", card_id, platform, e)
+
+        # --- Bio stats: games played / avg goals / top chem style, parsed
+        # from the same page fetched above - zero extra requests. Only
+        # covers these three (not avg assists/yellow/red - those aren't in
+        # the bio text, only on the separate /pgp bulk listing). COALESCE
+        # against the existing value so a failed/partial parse this run
+        # doesn't blow away a good value from a previous run.
+        console_bio = bio_by_platform.get("ps") or {}
+        pc_bio = bio_by_platform.get("pc") or {}
+        if any(v is not None for v in (
+            console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
+            pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
+        )):
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE fut_players SET
+                            games_played_console = COALESCE($1, games_played_console),
+                            avg_goals_console = COALESCE($2, avg_goals_console),
+                            top_chem_style_console = COALESCE($3, top_chem_style_console),
+                            games_played_pc = COALESCE($4, games_played_pc),
+                            avg_goals_pc = COALESCE($5, avg_goals_pc),
+                            top_chem_style_pc = COALESCE($6, top_chem_style_pc)
+                        WHERE card_id = $7
+                        """,
+                        console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
+                        pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
+                        card_id,
+                    )
+                diag["bio_stats_updated"] += 1
+            except Exception as e:
+                diag["bio_stats_failed"] += 1
+                log.warning("Bio stats update failed for card_id=%s: %s", card_id, e)
 
         # --- Sales history: dedupe on (player_id, sold_at, sold_price) ---
         try:
@@ -546,10 +635,12 @@ async def crawl_once() -> None:
 
         log.info(
             "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
-            "sales_new=%d sales_dupe=%d sales_failed=%d | http_429_hits=%d http_exceptions=%d",
+            "sales_new=%d sales_dupe=%d sales_failed=%d | bio_stats_updated=%d bio_stats_failed=%d | "
+            "http_429_hits=%d http_exceptions=%d",
             diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
             diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
+            diag["bio_stats_updated"], diag["bio_stats_failed"],
             diag["http_429_hits"], diag["http_exceptions"],
         )
         if diag["stale_non_futbin_url"]:

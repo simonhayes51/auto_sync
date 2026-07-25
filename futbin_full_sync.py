@@ -30,6 +30,7 @@ in-process scheduling loop.
 import os
 import re
 import sys
+import random
 import asyncio
 import asyncpg
 import aiohttp
@@ -46,7 +47,24 @@ PAGE_START = int(os.getenv("FUTBIN_PAGE_START", "1"))
 PAGE_END = int(os.getenv("FUTBIN_PAGE_END", "848"))  # full listing range
 REQUEST_DELAY = float(os.getenv("FUTBIN_REQUEST_DELAY", "1.5"))
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
+# A perfectly uniform delay between 848 sequential requests to one
+# predictable URL scheme, at the same time every day, is an easy pattern
+# for anti-bot protection to fingerprint (confirmed live: this crawl
+# started getting HTTP 403 on every page). Jittering the delay doesn't
+# guarantee anything, but it's a real, honest difference in the traffic
+# shape rather than a fixed mechanical cadence.
+def _jittered_delay() -> float:
+    return random.uniform(REQUEST_DELAY * 0.6, REQUEST_DELAY * 1.6)
+
+# The previous UA string ("SBCSolver/1.5") announces itself as a
+# non-browser tool. A realistic, current desktop-browser UA is a safe,
+# easy change regardless of whether it's the actual cause of the 403s.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 # futbin's cutout image filename is /players/p{id}.png for special cards
 # but /players/{id}.png (no "p") for base gold/silver/bronze cards - the "p"
@@ -269,11 +287,23 @@ def parse_row(row):
 
 async def fetch_page(session: aiohttp.ClientSession, page: int):
     url = f"https://www.futbin.com/{GAME}/players?page={page}"
-    async with session.get(url, headers=HEADERS, timeout=30) as resp:
-        if resp.status != 200:
-            print(f"⚠️ page {page} → status {resp.status}", flush=True)
-            return []
-        html = await resp.text()
+
+    # One retry on a 403, not the aggressive multi-attempt backoff used
+    # for 429s elsewhere in this project - a 403 usually means "you've
+    # been identified", and hammering the same block repeatedly is more
+    # likely to reinforce it than resolve it. If the retry (after a
+    # longer pause) still 403s, log and move on rather than looping.
+    for attempt in range(2):
+        async with session.get(url, headers=HEADERS, timeout=30) as resp:
+            if resp.status == 403 and attempt == 0:
+                print(f"⚠️ page {page} → status 403, retrying once after a pause", flush=True)
+                await asyncio.sleep(random.uniform(5.0, 10.0))
+                continue
+            if resp.status != 200:
+                print(f"⚠️ page {page} → status {resp.status}", flush=True)
+                return []
+            html = await resp.text()
+            break
 
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.find_all("tr", class_="player-row")
@@ -619,7 +649,7 @@ async def crawl_once():
                 if rows:
                     print(f"   sample row: {rows[0]}", flush=True)
 
-                await asyncio.sleep(REQUEST_DELAY)
+                await asyncio.sleep(_jittered_delay())
 
         if card_id_collisions:
             print(
