@@ -187,23 +187,44 @@ def _num(txt: str) -> int:
     return int(float(m.group(0))) if m else 0
 
 
-def parse_lowest_bin(html: str, platform: str) -> Optional[int]:
+def parse_lowest_bin(html: str, platform: str, diag: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """
+    platform-ps-only/platform-pc-only aren't exclusive to the price widget -
+    futbin reuses those same classes for the bio text, stats sections, etc.
+    (confirmed live: this is the exact convention parse_bio_stats below also
+    relies on). Searching the WHOLE page for the first element with that
+    class - which is what this used to do - often lands on a non-price
+    section first, then silently falls through to a shared fallback that
+    isn't platform-scoped at all, returning the same value for both
+    platforms. Scope to the price box FIRST, then look for the
+    platform-specific element inside it, so we're never matching some other
+    part of the page.
+    """
     soup = BeautifulSoup(html, "html.parser")
     plat_class = _PLATFORM_CLASS.get(platform, "platform-ps-only")
-
-    cell = soup.find(class_=re.compile(rf"\b{plat_class}\b"))
-    if cell:
-        price_div = cell.find("div", class_=re.compile(r"\bprice\b"))
-        if price_div:
-            val = _num(price_div.get_text(strip=True))
-            if val:
-                return val
 
     box = (
         soup.find("div", class_=re.compile(r"price[- ]?box", re.I))
         or soup.find("div", class_=re.compile(r"price-box-original-player", re.I))
-        or soup
     )
+    if box:
+        cell = box.find(class_=re.compile(rf"\b{plat_class}\b"))
+        if cell:
+            price_div = cell.find("div", class_=re.compile(r"\bprice\b"))
+            val = _num((price_div or cell).get_text(strip=True))
+            if val:
+                if diag is not None:
+                    diag["bin_platform_scoped_hit"] += 1
+                return val
+
+    # Last-resort fallback only - NOT platform-scoped, so it can return the
+    # same value for both ps and pc if reached. Kept so a markup variant
+    # without the expected classes still yields something rather than
+    # nothing, but every hit here is logged so this staying at 0 (or not)
+    # is visible in the run summary instead of silently masking bad data.
+    if diag is not None:
+        diag["bin_platform_fallback_used"] += 1
+    box = box or soup
     plat_word = "pc" if platform == "pc" else "ps"
     for tag in box.find_all(string=re.compile(rf"\b{plat_word}\b", re.I)):
         txt = tag.parent.get_text(" ", strip=True)
@@ -265,7 +286,7 @@ async def fetch_lowest_bin(
     status, html = await _get_with_retry(session, player_url, diag)
     if status != 200 or html is None:
         return None, {}
-    return parse_lowest_bin(html, platform), parse_bio_stats(html, platform)
+    return parse_lowest_bin(html, platform, diag), parse_bio_stats(html, platform)
 
 
 async def _resolve_sales_path(
@@ -576,8 +597,29 @@ async def _scrape_one(
 
 
 async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
+    """
+    Ordered oldest-refreshed-first (nulls - never captured - first), not
+    left to whatever order Postgres happens to return. A full Tier A sweep
+    can take longer than the 10-minute cron interval (confirmed: ~37-47min
+    for ~2500 candidates at current concurrency), and with no ordering the
+    same subset of cards can end up chronically last in a stable query plan
+    - starving specific cards run after run rather than spreading staleness
+    evenly. Prioritizing the least-recently-updated cards means every run
+    spends its budget where it matters most, and no card can starve forever
+    even if a sweep never fully completes within one invocation.
+    """
     return await conn.fetch(
-        f"SELECT card_id, player_url FROM fut_players WHERE {where} AND player_url IS NOT NULL"
+        f"""
+        SELECT fp.card_id, fp.player_url
+        FROM fut_players fp
+        LEFT JOIN LATERAL (
+            SELECT MAX(captured_at) AS last_captured_at
+            FROM bin_history bh
+            WHERE bh.player_id = fp.card_id
+        ) lb ON true
+        WHERE {where} AND fp.player_url IS NOT NULL
+        ORDER BY lb.last_captured_at ASC NULLS FIRST
+        """
     )
 
 
@@ -634,11 +676,13 @@ async def crawl_once() -> None:
                     await _scrape_batch(pool, session, sem, tier_b, diag)
 
         log.info(
-            "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d | "
+            "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d "
+            "bin_platform_scoped_hit=%d bin_platform_fallback_used=%d | "
             "sales_new=%d sales_dupe=%d sales_failed=%d | bio_stats_updated=%d bio_stats_failed=%d | "
             "http_429_hits=%d http_exceptions=%d",
             diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
+            diag["bin_platform_scoped_hit"], diag["bin_platform_fallback_used"],
             diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
             diag["bio_stats_updated"], diag["bio_stats_failed"],
             diag["http_429_hits"], diag["http_exceptions"],
