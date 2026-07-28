@@ -43,23 +43,45 @@ every 10 minutes with the cron expression `*/10 * * * *`, running the
 same `python bin_sales_history_sync.py` start command per scheduled
 execution - it doesn't share state with `futbin_full_sync.py`.
 
-## 6. SBC collector - NOT YET SCHEDULED, READ BEFORE DEPLOYING
+## 6. SBC collector - selectors confirmed, do one supervised run first
 ```bash
+pip install playwright --break-system-packages   # if not already installed
+playwright install chromium
 python futbin_sbc_sync.py
 ```
 Scrapes futbin.com's SBC hub + per-set detail pages into the backend's
 `market_events`/`sbc_details`/`sbc_challenges` tables (backend migrations
-018/019). Same one-shot-per-invocation Cron Job design as
-`bin_sales_history_sync.py` (not a permanent worker, no Procfile entry).
+018/019), used to track how card prices move around SBC releases/
+requirements. Same one-shot-per-invocation Cron Job design as
+`bin_sales_history_sync.py` (not a permanent worker, no Procfile entry) -
+except this one uses **Playwright + Chromium, not aiohttp**, because SBC
+pages (unlike futbin's player pages) render their listing grid and
+detail content client-side and need a real browser
+(`nixpacks.toml`, new alongside this file, installs Chromium at build
+time so it's already present in the deployed image).
 
-**Do not add this to a real Railway Cron schedule yet.** It was written
-without live network access to futbin.com, so its parsing logic is a
-best-effort first draft against *assumed* page structure, not confirmed
-real markup - see the numbered verification checklist at the top of
-`futbin_sbc_sync.py` for exactly what needs confirming first. Everything
-else about it (database writes, upsert idempotency, fingerprint
-generation, failure/heartbeat/alert handling) is fully tested and
-working - only the HTML parsing itself is unverified.
+The CSS selectors themselves are **confirmed against real, saved FUTBIN
+HTML** (both a listing page and an individual SBC detail page,
+cross-checked independently with BeautifulSoup) - this is a real upgrade
+from the previous draft, which was an unverified guess. Still open,
+because this sandbox has no live network access to futbin.com to check
+them:
+- FUTBIN redesigns occasionally - selectors confirmed at validation time
+  could have drifted since. A run logging "zero SBCs parsed" is the
+  signal to re-check.
+- The exact text format of the "expires"/"repeatable" fields on the
+  listing card - the selectors are confirmed to find the right elements,
+  but this file's parsing of their literal text content
+  (`_parse_expiry`, `_parse_repeatable`) wasn't asserted against real
+  strings.
+- 429/403 behavior under this exact page-count/timing pattern.
+
+**Do one supervised manual run and read the log/heartbeat output before
+adding this to a real Cron schedule** - same discipline as
+`futbin_card_art_backfill.py` below. Recommended cadence once verified:
+once daily (e.g. `0 18 * * *`), not more often - a full run visits ~7
+listing pages plus every due SBC's detail page (~40-60 typically),
+several minutes total at the polite `SBC_REQUEST_DELAY_SECONDS` apart.
 
 ## 7. Card art backfill - NOT YET SCHEDULED, READ BEFORE DEPLOYING
 ```bash
