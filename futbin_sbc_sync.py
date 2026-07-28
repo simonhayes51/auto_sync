@@ -1053,6 +1053,7 @@ async def navigate(
     url: str,
     expected_selector: str,
     diagnostics: Diagnostics,
+    referer: Optional[str] = None,
 ) -> NavigationResult:
     """
     Navigate to one document.
@@ -1068,11 +1069,25 @@ async def navigate(
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=NAV_TIMEOUT_MS,
-            )
+            goto_kwargs: Dict[str, Any] = {
+                "wait_until": "domcontentloaded",
+                "timeout": NAV_TIMEOUT_MS,
+            }
+
+            # A real user only ever reaches an SBC detail page by clicking
+            # a link on the listing page, so a real browser sends that
+            # page as Referer. A direct page.goto() to the detail URL with
+            # no Referer at all is a "type it straight into the address
+            # bar" pattern no real visitor produces - real testing showed
+            # the listing page succeeds but the very first detail page
+            # gets its own distinct 403 ("Oops, there was an error - 403
+            # ... try again in a few minutes", not Cloudflare's generic
+            # challenge page), consistent with a WAF rule keyed on exactly
+            # this signal.
+            if referer is not None:
+                goto_kwargs["referer"] = referer
+
+            response = await page.goto(url, **goto_kwargs)
 
             status = (
                 response.status
@@ -1464,6 +1479,7 @@ async def crawl_once() -> None:
                                 DETAIL_CHALLENGE_CARD_SELECTOR
                             ),
                             diagnostics=diagnostics,
+                            referer=LISTING_URL,
                         )
                     )
 
