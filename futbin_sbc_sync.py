@@ -1,91 +1,99 @@
 """
-SBC (Squad Building Challenge) collector - an independent process alongside
-futbin_full_sync.py/bin_sales_history_sync.py/ea_price_sync.py/
-futbin_card_art_backfill.py. Scrapes futbin.com's SBC listing pages + each
-set's detail page and writes to the backend's market_events/sbc_details/
-sbc_challenges tables (backend migrations 018/019, `-- target: player`),
-NOT any table this script owns exclusively - see ensure_tables() below.
+FUTBIN SBC collector.
 
-*** Selectors below are CONFIRMED against real FUTBIN markup ***
-The first version of this file (git history) was a best-effort guess
-written with no live network access to futbin.com - explicitly flagged as
-not-yet-verified, per its own checklist. That's now resolved: the CSS
-selectors below were checked against real saved FUTBIN HTML (both a
-listing page and an individual SBC detail page) and cross-validated with
-BeautifulSoup independently of Playwright, confirming every field parses
-correctly as of that check. This file ports that confirmed scraping
-strategy into this project's real schema/monitoring/Cron Job conventions,
-rather than the original standalone script's local-JSON-file output.
+Scrapes FUTBIN's rendered Squad Building Challenge listing and detail pages,
+then writes into:
 
-One real, confirmed finding from that validation that changes this
-script's whole approach: SBC pages are NOT plain server-rendered HTML
-like futbin's player pages (which bin_sales_history_sync.py and
-futbin_card_art_backfill.py fetch with a simple aiohttp GET) - the
-listing grid and detail page both need a real browser to render before
-this markup exists in the page. This is the only collector in this repo
-that needs Playwright + Chromium rather than aiohttp; requirements.txt
-already lists playwright (added ahead of this), and nixpacks.toml (new,
-alongside this file) installs the Chromium binary at build time so it's
-present in the deployed image rather than fetched on every cron
-invocation.
+    market_events
+    sbc_details
+    sbc_challenges
 
-Still NOT independently confirmed in THIS environment (no live network
-access to futbin.com here) - do one supervised manual run
-(`python3 futbin_sbc_sync.py`) and read the log output before adding
-this to a real Cron schedule:
-  - FUTBIN does redesign occasionally (per the original scraper's own
-    notes) - selectors that matched at validation time may have drifted
-    by the time this actually runs. If a run logs "zero SBCs parsed",
-    that's the signal to re-check.
-  - The exact text format of the listing card's "expires"/"repeatable"
-    fields - confirmed to exist and be selectable, but this file's
-    interpretation of their *content* (_parse_expiry's day/hour regex,
-    _parse_repeatable's substring check) was not asserted against the
-    literal real strings, only reasoned about.
-  - 429/403 behavior under this exact page-count/timing pattern -
-    unrelated to whether the selectors are right.
-  - Total runtime: ~7 listing pages + ~40-60 detail pages at
-    REQUEST_DELAY_SECONDS apart is several minutes per run (matches the
-    original scraper's own "5-7 minutes" estimate) - too slow for a
-    tight interval. Recommend a Railway Cron Job once daily (e.g. 18:00,
-    matching the original scraper's own suggested schedule), not the
-    15-30 minute cadence that suits futbin_card_art_backfill.py's much
-    cheaper per-card fetches.
+This collector is intentionally separate from the regular player/BIN workers.
 
-reward_card_id (a specific fut_players.card_id for the SBC's reward) is
-deliberately left unset here, same as the prior draft - resolving a
-reward's text description to a real catalog id needs the same fuzzy
-name-matching futbin_full_sync.py already does elsewhere in this repo,
-not reinvented here against an unconfirmed text format.
+Important behaviour:
+
+1. SBC pages require browser-rendered markup.
+2. One browser context and one page are reused for the whole run.
+3. HTTP 403 responses are treated as access denial, not transient failures.
+4. The collector stops after repeated 403 responses rather than continuing
+   to hammer FUTBIN.
+5. Detail freshness is tracked with sbc_details.detail_scraped_at. It is not
+   inferred from market_events.updated_at because listing upserts update that
+   timestamp independently of detail scraping.
+6. Heartbeat health reflects whether due detail pages were actually written.
+7. Interesting XHR/fetch URLs are logged during the first successful listing
+   render to help identify whether FUTBIN exposes SBC data through an internal
+   JSON endpoint.
+
+Suggested Railway Cron schedule:
+
+    0 18 * * *
+
+Required environment variables:
+
+    DATABASE_URL
+
+Optional environment variables:
+
+    SBC_REQUEST_DELAY_SECONDS=4
+    SBC_DETAIL_STALE_HOURS=20
+    SBC_MAX_RETRIES=2
+    SBC_MAX_CONSECUTIVE_403=2
+    SBC_NAV_TIMEOUT_MS=30000
+    SBC_SELECTOR_TIMEOUT_MS=15000
+    SBC_HEADLESS=true
 """
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import os
+import random
 import re
 import sys
-import json
-import random
-import asyncio
-import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import asyncpg
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Response,
+    async_playwright,
+)
 
-from monitoring import heartbeat, alert
+from monitoring import alert, heartbeat
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
 log = logging.getLogger("futbin_sbc_sync")
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not found!")
+    raise RuntimeError("DATABASE_URL not found")
 
 BASE_URL = "https://www.futbin.com"
-# Specific categories first, "All" last - see the merge loop in crawl_once()
-# for why order matters (first-seen category wins per SBC).
+
 CATEGORY_PATHS = [
     "/26/squad-building-challenges/Players",
     "/26/squad-building-challenges/Upgrades",
@@ -96,194 +104,403 @@ CATEGORY_PATHS = [
     "/26/squad-building-challenges",
 ]
 
-REQUEST_DELAY_SECONDS = float(os.getenv("SBC_REQUEST_DELAY_SECONDS", "4"))
-# Matched to the recommended once-daily cadence (see module docstring) -
-# comfortably shorter than 24h so a run that's a little early or late
-# still re-scrapes everything, longer than the gap between runs so a
-# same-day re-run (e.g. manual testing) doesn't redundantly re-scrape.
-DETAIL_STALE_HOURS = int(os.getenv("SBC_DETAIL_STALE_HOURS", "20"))
-NAV_TIMEOUT_MS = 30_000
-SELECTOR_TIMEOUT_MS = 15_000
-MAX_RETRIES = int(os.getenv("SBC_MAX_RETRIES", "2"))
-
-# A real run (2026-07-28) showed request #1 succeeding then every other
-# request 403ing outright, categories and detail pages alike - the same
-# class of problem futbin_full_sync.py already hit and fixed in this repo
-# (see its own HEADERS comment): a UA string that announces itself as a
-# non-browser bot ("FutHubSBCBot/1.0; ...tracker; contact: ...") is an easy
-# thing for a WAF to key on, far more so than futbin_full_sync.py's already
-# more conservative "SBCSolver/1.5". Matching that file's realistic-Chrome
-# UA here too.
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+REQUEST_DELAY_SECONDS = float(
+    os.getenv("SBC_REQUEST_DELAY_SECONDS", "4")
 )
 
-# --- Confirmed against real FUTBIN markup (see module docstring) ---
+DETAIL_STALE_HOURS = int(
+    os.getenv("SBC_DETAIL_STALE_HOURS", "20")
+)
+
+MAX_RETRIES = int(
+    os.getenv("SBC_MAX_RETRIES", "2")
+)
+
+MAX_CONSECUTIVE_403 = int(
+    os.getenv("SBC_MAX_CONSECUTIVE_403", "2")
+)
+
+NAV_TIMEOUT_MS = int(
+    os.getenv("SBC_NAV_TIMEOUT_MS", "30000")
+)
+
+SELECTOR_TIMEOUT_MS = int(
+    os.getenv("SBC_SELECTOR_TIMEOUT_MS", "15000")
+)
+
+HEADLESS = os.getenv("SBC_HEADLESS", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+# ---------------------------------------------------------------------------
+# Confirmed FUTBIN selectors
+# ---------------------------------------------------------------------------
+
 CARD_SELECTOR = ".sbc-card-wrapper"
-CARD_NAME_SELECTOR = ".og-card-wrapper-top div.text-ellipsis > div.text-ellipsis"
+
+CARD_NAME_SELECTOR = (
+    ".og-card-wrapper-top "
+    "div.text-ellipsis > div.text-ellipsis"
+)
+
 CARD_BADGE_SELECTOR = ".sbc-badge"
-CARD_REWARD_SELECTOR = ".sbc-rewards-area .xxs-font.slim-font.text-ellipsis-2"
-CARD_DESC_SELECTOR = ".centered.full-height.max-width-100.text-wrap p"
-CARD_EXPIRES_SELECTOR = ".sbc-info-row .xxs-column:nth-of-type(1) .bold"
-CARD_REPEATABLE_SELECTOR = ".sbc-info-row .xxs-column:nth-of-type(2) > div:not(.text-faded)"
-CARD_PROGRESS_SELECTOR = ".sbc-info-row .xxs-column:nth-of-type(3) .bold"
 
-DETAIL_TOTAL_PRICE_SELECTOR = ".info-row-part .s-row.centered.flex-wrap"
+CARD_REWARD_SELECTOR = (
+    ".sbc-rewards-area "
+    ".xxs-font.slim-font.text-ellipsis-2"
+)
+
+CARD_DESC_SELECTOR = (
+    ".centered.full-height.max-width-100.text-wrap p"
+)
+
+CARD_EXPIRES_SELECTOR = (
+    ".sbc-info-row "
+    ".xxs-column:nth-of-type(1) .bold"
+)
+
+CARD_REPEATABLE_SELECTOR = (
+    ".sbc-info-row "
+    ".xxs-column:nth-of-type(2) "
+    "> div:not(.text-faded)"
+)
+
+CARD_PROGRESS_SELECTOR = (
+    ".sbc-info-row "
+    ".xxs-column:nth-of-type(3) .bold"
+)
+
+DETAIL_TOTAL_PRICE_SELECTOR = (
+    ".info-row-part .s-row.centered.flex-wrap"
+)
+
 DETAIL_CHALLENGE_CARD_SELECTOR = ".sbc-box-wrapper"
-DETAIL_CHALLENGE_NAME_SELECTOR = ".og-card-wrapper-top .xxs-font.bold"
-DETAIL_CHALLENGE_REWARD_SELECTOR = ".sbc-box-front-info .xxs-font"
-DETAIL_CHALLENGE_DESC_SELECTOR = ".sbc-box-front p"
-DETAIL_REQUIREMENT_ROW_SELECTOR = ".sbc-requirements .challenge-box-description-row"
 
+DETAIL_CHALLENGE_NAME_SELECTOR = (
+    ".og-card-wrapper-top .xxs-font.bold"
+)
+
+DETAIL_CHALLENGE_REWARD_SELECTOR = (
+    ".sbc-box-front-info .xxs-font"
+)
+
+DETAIL_CHALLENGE_DESC_SELECTOR = ".sbc-box-front p"
+
+DETAIL_REQUIREMENT_ROW_SELECTOR = (
+    ".sbc-requirements "
+    ".challenge-box-description-row"
+)
+
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+Diagnostics = DefaultDict[str, int]
+
+FetchResult = Tuple[
+    Optional[str],  # HTML
+    str,            # reason
+    Optional[int],  # HTTP status
+]
+
+
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
 
 async def _polite_delay() -> None:
-    """Jittered rather than a fixed REQUEST_DELAY_SECONDS gap - a run
-    against real futbin.com (2026-07-28) saw the very first category
-    request succeed and every next one fail near-instantly at a uniform
-    ~4.6s cadence, consistent with rate/pattern-based blocking rather
-    than bad URLs (the URLs were independently confirmed correct).
-    Jitter is a defensive hypothesis, not a confirmed fix - the improved
-    per-request failure logging above this is what will actually tell us
-    the real cause on the next run."""
-    await asyncio.sleep(REQUEST_DELAY_SECONDS + random.uniform(0, REQUEST_DELAY_SECONDS))
+    """
+    Sleep for a jittered interval.
+
+    The delay is not treated as a way of overcoming a 403. Once the collector
+    detects access denial, the circuit breaker stops the run.
+    """
+
+    base = max(0.0, REQUEST_DELAY_SECONDS)
+    jitter = random.uniform(0.0, base)
+
+    await asyncio.sleep(base + jitter)
 
 
-def _num(txt: Optional[str]) -> Optional[int]:
-    if not txt:
+def _num(text: Optional[str]) -> Optional[int]:
+    if not text:
         return None
-    t = txt.lower().replace(",", "").strip()
-    if t.endswith("m"):
-        try:
-            return int(float(t[:-1]) * 1_000_000)
-        except Exception:
-            return None
-    if t.endswith("k"):
-        try:
-            return int(float(t[:-1]) * 1_000)
-        except Exception:
-            return None
-    m = re.search(r"\d+(\.\d+)?", t)
-    return int(float(m.group(0))) if m else None
+
+    cleaned = text.lower().replace(",", "").strip()
+
+    try:
+        if cleaned.endswith("m"):
+            return int(float(cleaned[:-1]) * 1_000_000)
+
+        if cleaned.endswith("k"):
+            return int(float(cleaned[:-1]) * 1_000)
+    except (TypeError, ValueError):
+        return None
+
+    match = re.search(r"\d+(?:\.\d+)?", cleaned)
+
+    if not match:
+        return None
+
+    try:
+        return int(float(match.group(0)))
+    except (TypeError, ValueError):
+        return None
 
 
-_EXPIRY_RE = re.compile(r"(\d+)\s*(day|hour|hr|d|h)s?", re.I)
+_EXPIRY_RE = re.compile(
+    r"(\d+)\s*(day|hour|hr|d|h)s?",
+    re.IGNORECASE,
+)
 
 
 def _parse_expiry(text: Optional[str]) -> Optional[datetime]:
-    """Best-effort - the selector is confirmed, the exact real string
-    content wasn't independently re-asserted here. Returns None (an
-    honest "unknown", not a guess) rather than trying to force-match."""
     if not text:
         return None
-    m = _EXPIRY_RE.search(text)
-    if not m:
+
+    match = _EXPIRY_RE.search(text)
+
+    if not match:
         return None
-    n = int(m.group(1))
-    unit = m.group(2).lower()
-    delta = timedelta(days=n) if unit.startswith("d") else timedelta(hours=n)
+
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+
+    if unit.startswith("d"):
+        delta = timedelta(days=amount)
+    else:
+        delta = timedelta(hours=amount)
+
     return datetime.now(timezone.utc) + delta
 
 
 def _parse_repeatable(text: Optional[str]) -> bool:
     if not text:
         return False
-    return "non" not in text.lower()
+
+    normalised = text.strip().lower()
+
+    if not normalised:
+        return False
+
+    if "non-repeatable" in normalised:
+        return False
+
+    if "not repeatable" in normalised:
+        return False
+
+    if normalised.startswith("non"):
+        return False
+
+    return "repeatable" in normalised
 
 
-def parse_listing_page(html: str, category: str) -> List[Dict[str, Any]]:
+def _category_from_path(path: str) -> str:
+    segment = path.rstrip("/").rsplit("/", 1)[-1]
+
+    if segment == "squad-building-challenges":
+        return "all"
+
+    return segment.lower()
+
+
+def _normalise_external_id(url: str) -> Optional[str]:
+    path = urlparse(url).path.strip("/")
+
+    return path or None
+
+
+def _trim_text(text: str, limit: int = 300) -> str:
+    collapsed = re.sub(r"\s+", " ", text).strip()
+
+    if len(collapsed) <= limit:
+        return collapsed
+
+    return collapsed[:limit] + "..."
+
+
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+
+def parse_listing_page(
+    html: str,
+    category: str,
+) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
-    out: List[Dict[str, Any]] = []
+    output: List[Dict[str, Any]] = []
+
     for card in soup.select(CARD_SELECTOR):
-        link_el = card.select_one("a")
-        href = link_el.get("href") if link_el else None
+        link_element = card.select_one("a")
+        href = link_element.get("href") if link_element else None
+
         if not href:
             continue
-        url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        # No confirmed numeric SBC id was captured by the original
-        # scraper (it only kept the resolved URL) - the URL path itself
-        # is a stable, unique-per-set natural key, so used directly
-        # rather than guessing an id-extraction regex against an
-        # unconfirmed URL structure.
-        external_id = urlparse(url).path.strip("/")
+
+        url = (
+            href
+            if href.startswith("http")
+            else f"{BASE_URL}{href}"
+        )
+
+        external_id = _normalise_external_id(url)
+
         if not external_id:
             continue
 
-        name_el = card.select_one(CARD_NAME_SELECTOR)
-        badge_el = card.select_one(CARD_BADGE_SELECTOR)
-        reward_el = card.select_one(CARD_REWARD_SELECTOR)
-        desc_el = card.select_one(CARD_DESC_SELECTOR)
-        expires_el = card.select_one(CARD_EXPIRES_SELECTOR)
-        repeat_el = card.select_one(CARD_REPEATABLE_SELECTOR)
-        progress_el = card.select_one(CARD_PROGRESS_SELECTOR)
+        name_element = card.select_one(CARD_NAME_SELECTOR)
+        badge_element = card.select_one(CARD_BADGE_SELECTOR)
+        reward_element = card.select_one(CARD_REWARD_SELECTOR)
+        description_element = card.select_one(CARD_DESC_SELECTOR)
+        expires_element = card.select_one(CARD_EXPIRES_SELECTOR)
+        repeatable_element = card.select_one(CARD_REPEATABLE_SELECTOR)
+        progress_element = card.select_one(CARD_PROGRESS_SELECTOR)
 
-        out.append({
-            "external_id": external_id,
-            "url": url,
-            "title": name_el.get_text(strip=True) if name_el else "Unknown SBC",
-            "category": category,
-            "badge": badge_el.get_text(strip=True) if badge_el else None,
-            "description": desc_el.get_text(strip=True) if desc_el else None,
-            "group_reward": reward_el.get_text(strip=True) if reward_el else None,
-            "expires_text": expires_el.get_text(strip=True) if expires_el else None,
-            "repeatable_text": repeat_el.get_text(strip=True) if repeat_el else None,
-            "progress_text": progress_el.get_text(strip=True) if progress_el else None,
-        })
-    return out
+        output.append(
+            {
+                "external_id": external_id,
+                "url": url,
+                "title": (
+                    name_element.get_text(strip=True)
+                    if name_element
+                    else "Unknown SBC"
+                ),
+                "category": category,
+                "badge": (
+                    badge_element.get_text(strip=True)
+                    if badge_element
+                    else None
+                ),
+                "description": (
+                    description_element.get_text(strip=True)
+                    if description_element
+                    else None
+                ),
+                "group_reward": (
+                    reward_element.get_text(strip=True)
+                    if reward_element
+                    else None
+                ),
+                "expires_text": (
+                    expires_element.get_text(strip=True)
+                    if expires_element
+                    else None
+                ),
+                "repeatable_text": (
+                    repeatable_element.get_text(strip=True)
+                    if repeatable_element
+                    else None
+                ),
+                "progress_text": (
+                    progress_element.get_text(strip=True)
+                    if progress_element
+                    else None
+                ),
+            }
+        )
+
+    return output
 
 
 def parse_detail_page(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
-    result: Dict[str, Any] = {"total_cost_coins": None, "challenges": []}
 
-    price_el = soup.select_one(DETAIL_TOTAL_PRICE_SELECTOR)
-    if price_el:
-        # PS/Xbox price and PC price are separate child rows with no
-        # separator between them in the DOM - take the first row as the
-        # PS/Xbox figure, matching the 'ps' platform this whole project
-        # is scoped to elsewhere (fair_value_mv, card_scores, etc).
-        rows = [r.get_text(strip=True) for r in price_el.select(":scope > div") if r.get_text(strip=True)]
+    result: Dict[str, Any] = {
+        "total_cost_coins": None,
+        "challenges": [],
+    }
+
+    price_element = soup.select_one(DETAIL_TOTAL_PRICE_SELECTOR)
+
+    if price_element:
+        rows = [
+            row.get_text(" ", strip=True)
+            for row in price_element.select(":scope > div")
+            if row.get_text(" ", strip=True)
+        ]
+
         if rows:
             result["total_cost_coins"] = _num(rows[0])
 
-    for i, cc in enumerate(soup.select(DETAIL_CHALLENGE_CARD_SELECTOR)):
-        name_el = cc.select_one(DETAIL_CHALLENGE_NAME_SELECTOR)
-        reward_el = cc.select_one(DETAIL_CHALLENGE_REWARD_SELECTOR)
-        desc_el = cc.select_one(DETAIL_CHALLENGE_DESC_SELECTOR)
-        req_els = cc.select(DETAIL_REQUIREMENT_ROW_SELECTOR)
+    for index, challenge_card in enumerate(
+        soup.select(DETAIL_CHALLENGE_CARD_SELECTOR)
+    ):
+        name_element = challenge_card.select_one(
+            DETAIL_CHALLENGE_NAME_SELECTOR
+        )
+
+        reward_element = challenge_card.select_one(
+            DETAIL_CHALLENGE_REWARD_SELECTOR
+        )
+
+        description_element = challenge_card.select_one(
+            DETAIL_CHALLENGE_DESC_SELECTOR
+        )
+
+        requirement_elements = challenge_card.select(
+            DETAIL_REQUIREMENT_ROW_SELECTOR
+        )
 
         requirements: Dict[str, str] = {}
-        for r in req_els:
-            txt = r.get_text(" ", strip=True)
-            if not txt:
-                continue
-            # Raw requirement text keyed by a slugified version of
-            # itself - structured extraction (min_rating, chem_min, etc)
-            # needs a confirmed real requirement phrasing to regex
-            # against, which wasn't part of this validation pass.
-            key = re.sub(r"[^a-z0-9]+", "_", txt.lower()).strip("_")[:40] or f"req_{len(requirements)}"
-            requirements[key] = txt
 
-        result["challenges"].append({
-            "challenge_name": name_el.get_text(strip=True) if name_el else f"Challenge {i + 1}",
-            "reward": reward_el.get_text(strip=True) if reward_el else None,
-            "description": desc_el.get_text(strip=True) if desc_el else None,
-            "requirements": requirements,
-            # Not present on the detail page per the confirmed
-            # selectors (only overall total_cost_coins is) - left
-            # unset rather than guessed.
-            "estimated_cost_coins": None,
-        })
+        for requirement_element in requirement_elements:
+            text = requirement_element.get_text(" ", strip=True)
+
+            if not text:
+                continue
+
+            base_key = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                text.lower(),
+            ).strip("_")[:40]
+
+            key = base_key or f"req_{len(requirements)}"
+
+            if key in requirements:
+                key = f"{key}_{len(requirements)}"
+
+            requirements[key] = text
+
+        result["challenges"].append(
+            {
+                "challenge_name": (
+                    name_element.get_text(strip=True)
+                    if name_element
+                    else f"Challenge {index + 1}"
+                ),
+                "reward": (
+                    reward_element.get_text(strip=True)
+                    if reward_element
+                    else None
+                ),
+                "description": (
+                    description_element.get_text(strip=True)
+                    if description_element
+                    else None
+                ),
+                "requirements": requirements,
+                "estimated_cost_coins": None,
+            }
+        )
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Schema - byte-identical DDL to backend/migrations/018_market_events.sql
-# and 019_event_market_impact.sql, so whichever lands first on a fresh
-# database wins and the other is a true no-op (same idiom
-# bin_sales_history_sync.py's own ensure_tables uses against fut_players).
+# Schema
 # ---------------------------------------------------------------------------
+
 async def ensure_tables(conn: asyncpg.Connection) -> None:
     await conn.execute(
         """
@@ -304,27 +521,63 @@ async def ensure_tables(conn: asyncpg.Connection) -> None:
         )
         """
     )
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_events_fingerprint ON market_events USING GIN (fingerprint)")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_events_kind_starts ON market_events (kind, starts_at DESC)")
+
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_market_events_fingerprint
+        ON market_events
+        USING GIN (fingerprint)
+        """
+    )
+
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_market_events_kind_starts
+        ON market_events (kind, starts_at DESC)
+        """
+    )
+
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sbc_details (
-            event_id            BIGINT PRIMARY KEY REFERENCES market_events(id) ON DELETE CASCADE,
+            event_id            BIGINT PRIMARY KEY
+                                REFERENCES market_events(id)
+                                ON DELETE CASCADE,
             set_name            TEXT NOT NULL,
             category            TEXT,
             total_cost_coins    BIGINT,
             repeatable          BOOLEAN NOT NULL DEFAULT false,
             reward_card_id      BIGINT REFERENCES fut_players(card_id),
             reward_description  TEXT,
-            expires_at          TIMESTAMPTZ
+            expires_at          TIMESTAMPTZ,
+            detail_scraped_at   TIMESTAMPTZ
         )
         """
     )
+
+    # Makes the script safe against databases where sbc_details was created
+    # before detail_scraped_at was introduced.
+    await conn.execute(
+        """
+        ALTER TABLE sbc_details
+        ADD COLUMN IF NOT EXISTS detail_scraped_at TIMESTAMPTZ
+        """
+    )
+
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_sbc_details_scraped_at
+        ON sbc_details (detail_scraped_at)
+        """
+    )
+
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sbc_challenges (
             id                    BIGSERIAL PRIMARY KEY,
-            event_id              BIGINT NOT NULL REFERENCES market_events(id) ON DELETE CASCADE,
+            event_id              BIGINT NOT NULL
+                                  REFERENCES market_events(id)
+                                  ON DELETE CASCADE,
             challenge_name        TEXT NOT NULL,
             requirements          JSONB NOT NULL DEFAULT '{}',
             estimated_cost_coins  BIGINT,
@@ -332,272 +585,1049 @@ async def ensure_tables(conn: asyncpg.Connection) -> None:
         )
         """
     )
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_sbc_challenges_event ON sbc_challenges (event_id)")
+
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_sbc_challenges_event
+        ON sbc_challenges (event_id)
+        """
+    )
 
 
 # ---------------------------------------------------------------------------
-# Fingerprints - generated at write time from parsed structure, never
-# re-derived downstream (see the v2 plan's SBC collector design).
+# Fingerprints
 # ---------------------------------------------------------------------------
-def _build_fingerprint(item: Dict[str, Any], detail: Dict[str, Any], repeatable: bool) -> List[str]:
+
+def _build_fingerprint(
+    item: Dict[str, Any],
+    detail: Dict[str, Any],
+    repeatable: bool,
+) -> List[str]:
     tags: List[str] = []
+
     if repeatable:
         tags.append("repeatable")
-    category = (item.get("category") or "").lower()
-    if category in ("icons", "icon", "heroes", "hero"):
+
+    category = str(item.get("category") or "").lower()
+
+    if category in {"icons", "icon", "heroes", "hero"}:
         tags.append("icon_hero_reward")
-    for ch in detail.get("challenges", []):
-        req_text = " ".join(str(v) for v in ch.get("requirements", {}).values()).lower()
-        if "totw" in req_text and "requires_totw" not in tags:
+
+    for challenge in detail.get("challenges", []):
+        requirements = challenge.get("requirements") or {}
+
+        requirement_text = " ".join(
+            str(value)
+            for value in requirements.values()
+        ).lower()
+
+        if (
+            "totw" in requirement_text
+            and "requires_totw" not in tags
+        ):
             tags.append("requires_totw")
-        if ("if " in req_text or "inform" in req_text) and "requires_if" not in tags:
+
+        if (
+            (
+                "team of the week" in requirement_text
+                or "inform" in requirement_text
+                or re.search(r"\bif\b", requirement_text)
+            )
+            and "requires_if" not in tags
+        ):
             tags.append("requires_if")
-    if detail.get("total_cost_coins") and detail["total_cost_coins"] >= 500_000:
+
+    total_cost = detail.get("total_cost_coins")
+
+    if total_cost is not None and total_cost >= 500_000:
         tags.append("high_cost")
+
     return tags
 
 
-async def _upsert_event(conn: asyncpg.Connection, item: Dict[str, Any]) -> int:
+# ---------------------------------------------------------------------------
+# Database writes
+# ---------------------------------------------------------------------------
+
+async def _upsert_event(
+    conn: asyncpg.Connection,
+    item: Dict[str, Any],
+) -> int:
     payload = {
         "badge": item.get("badge"),
         "group_reward": item.get("group_reward"),
         "progress_text": item.get("progress_text"),
+        "expires_text": item.get("expires_text"),
+        "repeatable_text": item.get("repeatable_text"),
+        "url": item.get("url"),
     }
+
     row = await conn.fetchrow(
         """
-        INSERT INTO market_events (kind, source, external_id, title, description, payload, updated_at)
-        VALUES ('sbc', 'futbin', $1, $2, $3, $4, now())
-        ON CONFLICT (kind, source, external_id) DO UPDATE SET
-            title = EXCLUDED.title, description = EXCLUDED.description,
-            payload = EXCLUDED.payload, updated_at = now()
+        INSERT INTO market_events (
+            kind,
+            source,
+            external_id,
+            title,
+            description,
+            payload,
+            updated_at
+        )
+        VALUES (
+            'sbc',
+            'futbin',
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            now()
+        )
+        ON CONFLICT (kind, source, external_id)
+        DO UPDATE SET
+            title = EXCLUDED.title,
+            description = EXCLUDED.description,
+            payload = EXCLUDED.payload,
+            updated_at = now()
         RETURNING id
         """,
-        item["external_id"], item["title"], item.get("description"), json.dumps(payload),
+        item["external_id"],
+        item["title"],
+        item.get("description"),
+        json.dumps(payload),
     )
-    return row["id"]
 
-
-async def _write_detail(conn: asyncpg.Connection, event_id: int, item: Dict[str, Any], detail: Dict[str, Any]) -> None:
-    expires_at = _parse_expiry(item.get("expires_text"))
-    repeatable = _parse_repeatable(item.get("repeatable_text"))
-    fingerprint = _build_fingerprint(item, detail, repeatable)
-
-    await conn.execute(
-        "UPDATE market_events SET fingerprint = $2, ends_at = COALESCE($3, ends_at) WHERE id = $1",
-        event_id, fingerprint, expires_at,
-    )
-    await conn.execute(
-        """
-        INSERT INTO sbc_details (event_id, set_name, category, total_cost_coins, repeatable, reward_card_id, reward_description, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (event_id) DO UPDATE SET
-            set_name = EXCLUDED.set_name, category = EXCLUDED.category,
-            total_cost_coins = EXCLUDED.total_cost_coins, repeatable = EXCLUDED.repeatable,
-            reward_card_id = EXCLUDED.reward_card_id, reward_description = EXCLUDED.reward_description,
-            expires_at = EXCLUDED.expires_at
-        """,
-        event_id, item["title"], item.get("category"),
-        detail.get("total_cost_coins"), repeatable,
-        None, item.get("group_reward"), expires_at,
-    )
-    await conn.execute("DELETE FROM sbc_challenges WHERE event_id = $1", event_id)
-    for i, ch in enumerate(detail.get("challenges", [])):
-        await conn.execute(
-            """
-            INSERT INTO sbc_challenges (event_id, challenge_name, requirements, estimated_cost_coins, display_order)
-            VALUES ($1, $2, $3, $4, $5)
-            """,
-            event_id, ch["challenge_name"], json.dumps(ch.get("requirements") or {}),
-            ch.get("estimated_cost_coins"), i,
+    if row is None:
+        raise RuntimeError(
+            f"Failed to upsert market event {item['external_id']}"
         )
 
+    return int(row["id"])
+
+
+async def _write_detail(
+    conn: asyncpg.Connection,
+    event_id: int,
+    item: Dict[str, Any],
+    detail: Dict[str, Any],
+) -> None:
+    expires_at = _parse_expiry(item.get("expires_text"))
+    repeatable = _parse_repeatable(item.get("repeatable_text"))
+
+    fingerprint = _build_fingerprint(
+        item=item,
+        detail=detail,
+        repeatable=repeatable,
+    )
+
+    async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE market_events
+            SET
+                fingerprint = $2,
+                ends_at = COALESCE($3, ends_at),
+                updated_at = now()
+            WHERE id = $1
+            """,
+            event_id,
+            fingerprint,
+            expires_at,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO sbc_details (
+                event_id,
+                set_name,
+                category,
+                total_cost_coins,
+                repeatable,
+                reward_card_id,
+                reward_description,
+                expires_at,
+                detail_scraped_at
+            )
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                now()
+            )
+            ON CONFLICT (event_id)
+            DO UPDATE SET
+                set_name = EXCLUDED.set_name,
+                category = EXCLUDED.category,
+                total_cost_coins = EXCLUDED.total_cost_coins,
+                repeatable = EXCLUDED.repeatable,
+                reward_card_id = EXCLUDED.reward_card_id,
+                reward_description = EXCLUDED.reward_description,
+                expires_at = EXCLUDED.expires_at,
+                detail_scraped_at = now()
+            """,
+            event_id,
+            item["title"],
+            item.get("category"),
+            detail.get("total_cost_coins"),
+            repeatable,
+            None,
+            item.get("group_reward"),
+            expires_at,
+        )
+
+        await conn.execute(
+            """
+            DELETE FROM sbc_challenges
+            WHERE event_id = $1
+            """,
+            event_id,
+        )
+
+        for display_order, challenge in enumerate(
+            detail.get("challenges", [])
+        ):
+            await conn.execute(
+                """
+                INSERT INTO sbc_challenges (
+                    event_id,
+                    challenge_name,
+                    requirements,
+                    estimated_cost_coins,
+                    display_order
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3::jsonb,
+                    $4,
+                    $5
+                )
+                """,
+                event_id,
+                challenge["challenge_name"],
+                json.dumps(challenge.get("requirements") or {}),
+                challenge.get("estimated_cost_coins"),
+                display_order,
+            )
+
+
+async def _get_due_external_ids(
+    conn: asyncpg.Connection,
+    event_ids: Dict[str, int],
+) -> Set[str]:
+    if not event_ids:
+        return set()
+
+    rows = await conn.fetch(
+        """
+        SELECT e.external_id
+        FROM market_events e
+        LEFT JOIN sbc_details d
+            ON d.event_id = e.id
+        WHERE
+            e.kind = 'sbc'
+            AND e.source = 'futbin'
+            AND e.id = ANY($1::bigint[])
+            AND (
+                d.event_id IS NULL
+                OR d.detail_scraped_at IS NULL
+                OR d.detail_scraped_at
+                    < now() - make_interval(hours => $2)
+            )
+        """,
+        list(event_ids.values()),
+        DETAIL_STALE_HOURS,
+    )
+
+    return {
+        str(row["external_id"])
+        for row in rows
+    }
+
 
 # ---------------------------------------------------------------------------
-# Fetching - Playwright, not aiohttp (see module docstring for why).
+# Browser diagnostics
 # ---------------------------------------------------------------------------
-async def _goto_with_retry(
-    context: BrowserContext, url: str, wait_selector: str, diag: Dict[str, Any], referer: Optional[str] = None
-) -> tuple[Optional[str], str]:
-    """Returns (html, reason). reason is "ok" on success, otherwise a short
-    diagnostic string (status code / exception) - callers log this instead
-    of a bare "fetch failed" so a real run tells us WHAT blocked it (403?
-    429? a timeout?) rather than requiring another guess-and-check round.
 
-    referer: a real click-through always carries one; page.goto sends none
-    by default, which is itself an easy non-human tell for a WAF to key on."""
-    page: Page = await context.new_page()
+def _interesting_response_url(url: str) -> bool:
+    lowered = url.lower()
+
+    interesting_terms = (
+        "sbc",
+        "squad-building",
+        "challenge",
+        "graphql",
+        "/api/",
+        "ajax",
+    )
+
+    return any(term in lowered for term in interesting_terms)
+
+
+def _install_network_observer(
+    page: Page,
+    observed_urls: Set[str],
+) -> None:
+    async def handle_response(response: Response) -> None:
+        try:
+            request = response.request
+
+            if request.resource_type not in {
+                "xhr",
+                "fetch",
+            }:
+                return
+
+            url = response.url
+
+            if not _interesting_response_url(url):
+                return
+
+            if url in observed_urls:
+                return
+
+            observed_urls.add(url)
+
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            )
+
+            log.info(
+                "Observed browser data request: status=%s type=%s "
+                "content_type=%s url=%s",
+                response.status,
+                request.resource_type,
+                content_type,
+                url,
+            )
+
+        except Exception as exc:
+            log.debug(
+                "Could not inspect browser response: %s",
+                exc,
+            )
+
+    page.on(
+        "response",
+        lambda response: asyncio.create_task(
+            handle_response(response)
+        ),
+    )
+
+
+async def _log_response_diagnostics(
+    page: Page,
+    response: Optional[Response],
+    url: str,
+    status: Optional[int],
+) -> None:
+    if response is None:
+        log.warning(
+            "No main-document response object for %s",
+            url,
+        )
+        return
+
+    headers = response.headers
+
+    useful_headers = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() in {
+            "server",
+            "content-type",
+            "cf-ray",
+            "cf-cache-status",
+            "retry-after",
+            "location",
+        }
+    }
+
     try:
-        backoff = 2.0
-        last_reason = "unknown"
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                goto_kwargs = {"wait_until": "networkidle", "timeout": NAV_TIMEOUT_MS}
-                if referer:
-                    goto_kwargs["referer"] = referer
-                resp = await page.goto(url, **goto_kwargs)
-                if resp is not None and resp.status == 429:
-                    diag["http_429_hits"] += 1
-                    last_reason = "status=429"
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(backoff)
-                        backoff *= 2
-                        continue
-                    return None, last_reason
-                if resp is not None and resp.status >= 400:
-                    diag["http_non200"] += 1
-                    return None, f"status={resp.status}"
-                try:
-                    await page.wait_for_selector(wait_selector, timeout=SELECTOR_TIMEOUT_MS)
-                except Exception:
-                    # Page loaded but the expected content never showed up -
-                    # let the caller's parser report zero items/challenges
-                    # rather than treating this as a hard fetch failure.
-                    pass
-                return await page.content(), "ok"
-            except Exception as e:
-                last_reason = f"exception: {type(e).__name__}: {e}"[:200]
+        title = await page.title()
+    except Exception:
+        title = ""
+
+    body_preview = ""
+
+    try:
+        body_text = await page.locator("body").inner_text(
+            timeout=3_000
+        )
+        body_preview = _trim_text(body_text, limit=350)
+    except Exception:
+        body_preview = ""
+
+    log.warning(
+        "Navigation diagnostics: status=%s url=%s title=%r "
+        "headers=%s body_preview=%r",
+        status,
+        url,
+        title,
+        useful_headers,
+        body_preview,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Browser navigation
+# ---------------------------------------------------------------------------
+
+async def _navigate_with_retry(
+    page: Page,
+    url: str,
+    wait_selector: str,
+    diag: Diagnostics,
+) -> FetchResult:
+    """
+    Navigate using the existing browser page.
+
+    Returns:
+
+        html, reason, status
+
+    Rules:
+
+    - 403 is returned immediately and is not retried.
+    - 429 may be retried with exponential backoff.
+    - browser/navigation exceptions may be retried.
+    - selector timeout is not automatically a fetch failure. The returned
+      HTML is still parsed so the caller can distinguish empty markup from
+      an HTTP failure.
+    """
+
+    backoff_seconds = 2.0
+    last_reason = "unknown"
+    last_status: Optional[int] = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT_MS,
+            )
+
+            status = (
+                response.status
+                if response is not None
+                else None
+            )
+
+            last_status = status
+
+            if status == 403:
+                diag["http_403_hits"] += 1
+                diag["http_non200"] += 1
+
+                await _log_response_diagnostics(
+                    page=page,
+                    response=response,
+                    url=url,
+                    status=status,
+                )
+
+                return None, "status=403", status
+
+            if status == 429:
+                diag["http_429_hits"] += 1
+                diag["http_non200"] += 1
+
+                await _log_response_diagnostics(
+                    page=page,
+                    response=response,
+                    url=url,
+                    status=status,
+                )
+
+                last_reason = "status=429"
+
                 if attempt < MAX_RETRIES:
                     diag["nav_retries"] += 1
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
+                    await asyncio.sleep(backoff_seconds)
+                    backoff_seconds *= 2
                     continue
-                diag["http_exceptions"] += 1
-                return None, last_reason
-        return None, last_reason
-    finally:
-        await page.close()
 
+                return None, last_reason, status
+
+            if status is not None and status >= 400:
+                diag["http_non200"] += 1
+
+                await _log_response_diagnostics(
+                    page=page,
+                    response=response,
+                    url=url,
+                    status=status,
+                )
+
+                return None, f"status={status}", status
+
+            try:
+                await page.wait_for_selector(
+                    wait_selector,
+                    state="attached",
+                    timeout=SELECTOR_TIMEOUT_MS,
+                )
+            except Exception as selector_exc:
+                diag["selector_timeouts"] += 1
+
+                log.warning(
+                    "Expected selector did not appear: url=%s "
+                    "selector=%s error=%s",
+                    url,
+                    wait_selector,
+                    type(selector_exc).__name__,
+                )
+
+            html = await page.content()
+
+            return html, "ok", status
+
+        except Exception as exc:
+            last_reason = (
+                f"exception: {type(exc).__name__}: {exc}"
+            )[:300]
+
+            if attempt < MAX_RETRIES:
+                diag["nav_retries"] += 1
+
+                log.warning(
+                    "Navigation attempt %d/%d failed for %s: %s",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    url,
+                    last_reason,
+                )
+
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds *= 2
+                continue
+
+            diag["http_exceptions"] += 1
+
+            return None, last_reason, last_status
+
+    return None, last_reason, last_status
+
+
+# ---------------------------------------------------------------------------
+# Browser creation
+# ---------------------------------------------------------------------------
+
+async def _create_browser(
+    playwright: Any,
+) -> Tuple[Browser, BrowserContext, Page]:
+    browser = await playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={
+            "width": 1920,
+            "height": 1080,
+        },
+        locale="en-GB",
+        timezone_id="Europe/London",
+        extra_http_headers={
+            "Accept-Language": "en-GB,en;q=0.9",
+        },
+    )
+
+    page = await context.new_page()
+
+    page.set_default_navigation_timeout(
+        NAV_TIMEOUT_MS
+    )
+
+    page.set_default_timeout(
+        SELECTOR_TIMEOUT_MS
+    )
+
+    return browser, context, page
+
+
+# ---------------------------------------------------------------------------
+# Crawl
+# ---------------------------------------------------------------------------
 
 async def crawl_once() -> None:
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=4)
-    diag: Dict[str, Any] = defaultdict(int)
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=4,
+        command_timeout=60,
+    )
+
+    diag: Diagnostics = defaultdict(int)
+
+    all_items: Dict[str, Dict[str, Any]] = {}
+    event_ids: Dict[str, int] = {}
+    due_ids: Set[str] = set()
+
+    written = 0
+    failed = 0
+    category_successes = 0
+    access_blocked = False
+
+    observed_data_urls: Set[str] = set()
+
     try:
         async with pool.acquire() as conn:
             await ensure_tables(conn)
 
-        all_items: Dict[str, Dict[str, Any]] = {}
-        async with async_playwright() as pw:
-            # --disable-blink-features=AutomationControlled + the
-            # navigator.webdriver override below hide the two most common
-            # tells a WAF/bot-check uses to flag Playwright's default
-            # headless Chromium as non-human, on top of the realistic UA
-            # above - same reasoning as futbin_full_sync.py's own header
-            # fix, applied to the browser fingerprint instead of just headers.
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = await browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1920, "height": 1080},
-                locale="en-GB",
-            )
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
+        async with async_playwright() as playwright:
+            browser: Optional[Browser] = None
+            context: Optional[BrowserContext] = None
+            page: Optional[Page] = None
 
-            hub_url = f"{BASE_URL}/26/squad-building-challenges"
-            for path in CATEGORY_PATHS:
-                last_segment = path.rstrip("/").rsplit("/", 1)[-1]
-                category = "all" if last_segment == "squad-building-challenges" else last_segment.lower()
-                url = f"{BASE_URL}{path}"
-                # Real category-tab clicks all come from the hub page, not
-                # BASE_URL - a goto with no referer at all is itself a
-                # non-human tell.
-                html, reason = await _goto_with_retry(context, url, CARD_SELECTOR, diag, referer=hub_url)
-                if html is None:
-                    diag["category_fetch_failed"] += 1
-                    log.warning("Category fetch failed: %s (%s)", url, reason)
+            try:
+                browser, context, page = await _create_browser(
+                    playwright
+                )
+
+                _install_network_observer(
+                    page=page,
+                    observed_urls=observed_data_urls,
+                )
+
+                consecutive_403s = 0
+
+                # -----------------------------------------------------------
+                # Listings
+                # -----------------------------------------------------------
+
+                for path in CATEGORY_PATHS:
+                    category = _category_from_path(path)
+                    url = f"{BASE_URL}{path}"
+
+                    html, reason, status = await _navigate_with_retry(
+                        page=page,
+                        url=url,
+                        wait_selector=CARD_SELECTOR,
+                        diag=diag,
+                    )
+
+                    if status == 403:
+                        diag["category_fetch_failed"] += 1
+                        consecutive_403s += 1
+
+                        log.warning(
+                            "Category fetch forbidden: %s (%s); "
+                            "consecutive_403=%d",
+                            url,
+                            reason,
+                            consecutive_403s,
+                        )
+
+                        if (
+                            consecutive_403s
+                            >= MAX_CONSECUTIVE_403
+                        ):
+                            access_blocked = True
+                            diag["blocked_circuit_breaker"] += 1
+
+                            log.error(
+                                "Stopping category navigation after %d "
+                                "consecutive 403 responses",
+                                consecutive_403s,
+                            )
+
+                            break
+
+                        await _polite_delay()
+                        continue
+
+                    if html is None:
+                        diag["category_fetch_failed"] += 1
+                        consecutive_403s = 0
+
+                        log.warning(
+                            "Category fetch failed: %s (%s)",
+                            url,
+                            reason,
+                        )
+
+                        await _polite_delay()
+                        continue
+
+                    consecutive_403s = 0
+
+                    items = parse_listing_page(
+                        html=html,
+                        category=category,
+                    )
+
+                    if not items:
+                        diag["category_zero_items"] += 1
+
+                        log.warning(
+                            "Category %s loaded but zero SBCs parsed: %s",
+                            category,
+                            url,
+                        )
+                    else:
+                        category_successes += 1
+
+                        log.info(
+                            "Category %s: %d SBCs found",
+                            category,
+                            len(items),
+                        )
+
+                    for item in items:
+                        # Specific categories are visited before "all".
+                        # The first category found therefore wins.
+                        all_items.setdefault(
+                            item["external_id"],
+                            item,
+                        )
+
                     await _polite_delay()
-                    continue
 
-                items = parse_listing_page(html, category)
-                log.info("Category %s: %d SBCs found", category, len(items))
-                for it in items:
-                    # First-seen category wins - CATEGORY_PATHS lists the
-                    # specific categories before "All", so a set only
-                    # gets category="all" if it wasn't found under any
-                    # specific one (an honest fallback, not expected to
-                    # be common).
-                    all_items.setdefault(it["external_id"], it)
-                await _polite_delay()
+                if observed_data_urls:
+                    log.info(
+                        "Observed %d potentially relevant XHR/fetch URLs",
+                        len(observed_data_urls),
+                    )
 
-            if not all_items:
-                await browser.close()
-                async with pool.acquire() as hb_conn:
-                    await heartbeat(hb_conn, "futbin_sbc_sync", ok=False, detail="zero SBCs parsed from any listing page")
-                await alert(
-                    "futbin_sbc_sync: zero SBC sets parsed from any listing page - FUTBIN markup may have "
-                    "changed (re-check selectors against a fresh page save) or every category fetch failed."
-                )
-                return
+                    for observed_url in sorted(observed_data_urls):
+                        log.info(
+                            "Observed data URL: %s",
+                            observed_url,
+                        )
 
-            event_ids: Dict[str, int] = {}
-            async with pool.acquire() as conn:
-                for item in all_items.values():
-                    event_ids[item["external_id"]] = await _upsert_event(conn, item)
+                if not all_items:
+                    detail_message = (
+                        "zero SBC sets parsed; "
+                        f"category_successes={category_successes} "
+                        f"category_fetch_failed="
+                        f"{diag['category_fetch_failed']} "
+                        f"http_403={diag['http_403_hits']} "
+                        f"http_429={diag['http_429_hits']} "
+                        f"http_exceptions={diag['http_exceptions']}"
+                    )
 
-            async with pool.acquire() as conn:
-                stale_rows = await conn.fetch(
-                    """
-                    SELECT e.external_id
-                    FROM market_events e
-                    LEFT JOIN sbc_details d ON d.event_id = e.id
-                    WHERE e.kind = 'sbc' AND e.id = ANY($1::bigint[])
-                      AND (d.event_id IS NULL OR e.updated_at < now() - ($2 || ' hours')::interval)
-                    """,
-                    list(event_ids.values()), str(DETAIL_STALE_HOURS),
-                )
-            due_ids = {r["external_id"] for r in stale_rows}
-            log.info("SBC detail: %d of %d sets due for a (re)scrape", len(due_ids), len(all_items))
+                    async with pool.acquire() as conn:
+                        await heartbeat(
+                            conn,
+                            "futbin_sbc_sync",
+                            ok=False,
+                            detail=detail_message,
+                        )
 
-            written = failed = 0
-            for external_id, item in all_items.items():
-                if external_id not in due_ids:
-                    continue
-                html, reason = await _goto_with_retry(
-                    context, item["url"], DETAIL_CHALLENGE_CARD_SELECTOR, diag, referer=hub_url
-                )
-                if html is None:
-                    failed += 1
-                    log.warning("Detail fetch failed: %s (%s)", item["url"], reason)
-                    await _polite_delay()
-                    continue
-                detail = parse_detail_page(html)
+                    await alert(
+                        "futbin_sbc_sync: zero SBC sets parsed. "
+                        + detail_message
+                    )
+
+                    return
+
+                # -----------------------------------------------------------
+                # Listing writes
+                # -----------------------------------------------------------
+
                 async with pool.acquire() as conn:
-                    await _write_detail(conn, event_ids[external_id], item, detail)
-                written += 1
-                diag["challenges_written"] += len(detail.get("challenges", []))
-                await _polite_delay()
+                    async with conn.transaction():
+                        for item in all_items.values():
+                            event_id = await _upsert_event(
+                                conn=conn,
+                                item=item,
+                            )
 
-            await browser.close()
+                            event_ids[
+                                item["external_id"]
+                            ] = event_id
 
-        run_ok = diag["category_fetch_failed"] < len(CATEGORY_PATHS)
-        detail_msg = (
-            f"sets_found={len(all_items)} sets_due={len(due_ids)} sets_written={written} "
-            f"sets_failed={failed} challenges_written={diag['challenges_written']} "
-            f"category_fetch_failed={diag['category_fetch_failed']} "
-            f"http_429={diag['http_429_hits']} http_exc={diag['http_exceptions']}"
+                async with pool.acquire() as conn:
+                    due_ids = await _get_due_external_ids(
+                        conn=conn,
+                        event_ids=event_ids,
+                    )
+
+                log.info(
+                    "SBC detail: %d of %d sets due for a (re)scrape",
+                    len(due_ids),
+                    len(all_items),
+                )
+
+                # Do not continue hammering detail routes after the browser
+                # has already been refused repeatedly during category fetches.
+                if access_blocked:
+                    failed = len(due_ids)
+
+                    log.error(
+                        "Skipping %d due detail pages because the "
+                        "403 circuit breaker was triggered",
+                        len(due_ids),
+                    )
+
+                else:
+                    # -------------------------------------------------------
+                    # Details
+                    # -------------------------------------------------------
+
+                    consecutive_403s = 0
+
+                    for external_id, item in all_items.items():
+                        if external_id not in due_ids:
+                            continue
+
+                        html, reason, status = await _navigate_with_retry(
+                            page=page,
+                            url=item["url"],
+                            wait_selector=(
+                                DETAIL_CHALLENGE_CARD_SELECTOR
+                            ),
+                            diag=diag,
+                        )
+
+                        if status == 403:
+                            failed += 1
+                            consecutive_403s += 1
+
+                            log.warning(
+                                "Detail fetch forbidden: %s (%s); "
+                                "consecutive_403=%d",
+                                item["url"],
+                                reason,
+                                consecutive_403s,
+                            )
+
+                            if (
+                                consecutive_403s
+                                >= MAX_CONSECUTIVE_403
+                            ):
+                                access_blocked = True
+                                diag[
+                                    "blocked_circuit_breaker"
+                                ] += 1
+
+                                remaining_due = sum(
+                                    1
+                                    for remaining_id
+                                    in due_ids
+                                    if (
+                                        remaining_id
+                                        != external_id
+                                        and remaining_id
+                                        not in {
+                                            key
+                                            for key, value
+                                            in event_ids.items()
+                                            if False
+                                        }
+                                    )
+                                )
+
+                                log.error(
+                                    "Stopping detail navigation after %d "
+                                    "consecutive 403 responses",
+                                    consecutive_403s,
+                                )
+
+                                # We count the remaining unattempted rows
+                                # below from the final written total rather
+                                # than trying to track them individually.
+                                break
+
+                            await _polite_delay()
+                            continue
+
+                        if html is None:
+                            failed += 1
+                            consecutive_403s = 0
+
+                            log.warning(
+                                "Detail fetch failed: %s (%s)",
+                                item["url"],
+                                reason,
+                            )
+
+                            await _polite_delay()
+                            continue
+
+                        consecutive_403s = 0
+
+                        detail = parse_detail_page(html)
+
+                        challenge_count = len(
+                            detail.get("challenges", [])
+                        )
+
+                        if challenge_count == 0:
+                            failed += 1
+                            diag["detail_zero_challenges"] += 1
+
+                            log.warning(
+                                "Detail page loaded but zero challenges "
+                                "parsed: %s",
+                                item["url"],
+                            )
+
+                            await _polite_delay()
+                            continue
+
+                        async with pool.acquire() as conn:
+                            await _write_detail(
+                                conn=conn,
+                                event_id=event_ids[external_id],
+                                item=item,
+                                detail=detail,
+                            )
+
+                        written += 1
+                        diag["challenges_written"] += (
+                            challenge_count
+                        )
+
+                        log.info(
+                            "Detail written: %s; challenges=%d; "
+                            "total_cost=%s",
+                            item["title"],
+                            challenge_count,
+                            detail.get("total_cost_coins"),
+                        )
+
+                        await _polite_delay()
+
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+
+        # If the detail circuit breaker stopped the loop, include every
+        # unwritten due record in the failure count.
+        if due_ids:
+            failed = max(
+                failed,
+                len(due_ids) - written,
+            )
+
+        detail_success_rate = (
+            written / len(due_ids)
+            if due_ids
+            else 1.0
         )
-        async with pool.acquire() as hb_conn:
-            await heartbeat(hb_conn, "futbin_sbc_sync", ok=run_ok, detail=detail_msg)
-        log.info("Run complete. %s", detail_msg)
 
-        if written == 0 and len(due_ids) > 0:
-            await alert(f"futbin_sbc_sync: {len(due_ids)} sets were due for a detail scrape but 0 succeeded - {detail_msg}")
+        run_ok = (
+            len(all_items) > 0
+            and category_successes > 0
+            and not access_blocked
+            and (
+                not due_ids
+                or detail_success_rate >= 0.80
+            )
+        )
+
+        detail_message = (
+            f"sets_found={len(all_items)} "
+            f"sets_due={len(due_ids)} "
+            f"sets_written={written} "
+            f"sets_failed={failed} "
+            f"detail_success_rate={detail_success_rate:.2f} "
+            f"challenges_written={diag['challenges_written']} "
+            f"category_successes={category_successes} "
+            f"category_fetch_failed="
+            f"{diag['category_fetch_failed']} "
+            f"category_zero_items={diag['category_zero_items']} "
+            f"detail_zero_challenges="
+            f"{diag['detail_zero_challenges']} "
+            f"selector_timeouts={diag['selector_timeouts']} "
+            f"http_403={diag['http_403_hits']} "
+            f"http_429={diag['http_429_hits']} "
+            f"http_non200={diag['http_non200']} "
+            f"http_exceptions={diag['http_exceptions']} "
+            f"nav_retries={diag['nav_retries']} "
+            f"circuit_breakers="
+            f"{diag['blocked_circuit_breaker']} "
+            f"observed_data_urls={len(observed_data_urls)}"
+        )
+
+        async with pool.acquire() as conn:
+            await heartbeat(
+                conn,
+                "futbin_sbc_sync",
+                ok=run_ok,
+                detail=detail_message,
+            )
+
+        if run_ok:
+            log.info(
+                "Run complete. %s",
+                detail_message,
+            )
+        else:
+            log.error(
+                "Run failed health checks. %s",
+                detail_message,
+            )
+
+        if access_blocked:
+            await alert(
+                "futbin_sbc_sync: FUTBIN returned repeated HTTP 403 "
+                "responses and the circuit breaker stopped the crawl. "
+                + detail_message
+            )
+
+        elif due_ids and written == 0:
+            await alert(
+                "futbin_sbc_sync: detail pages were due but zero "
+                "details were written. "
+                + detail_message
+            )
+
+        elif detail_success_rate < 0.80:
+            await alert(
+                "futbin_sbc_sync: fewer than 80% of due SBC detail "
+                "pages were written. "
+                + detail_message
+            )
+
     finally:
         await pool.close()
 
 
-# ================== ONE-SHOT ENTRY POINT ==================
-# Deployed as a Railway Cron Job (not a permanent worker), same reasoning
-# as bin_sales_history_sync.py/futbin_card_art_backfill.py. Recommend
-# once daily (e.g. "0 18 * * *") - see module docstring for why this is
-# too slow a job for a tight interval.
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     try:
         asyncio.run(crawl_once())
-    except Exception as e:
-        log.error("crawl_once() failed: %s", e)
+
+    except KeyboardInterrupt:
+        log.warning("Interrupted")
+        sys.exit(130)
+
+    except Exception as exc:
+        log.exception(
+            "crawl_once() failed: %s",
+            exc,
+        )
         sys.exit(1)
+
     sys.exit(0)
