@@ -3,4 +3,4 @@ asyncpg==0.31.0
 beautifulsoup4==4.12.3
 requests
 python-dotenv
-playwright
+playwright==1.61.0

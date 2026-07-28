@@ -43,45 +43,95 @@ every 10 minutes with the cron expression `*/10 * * * *`, running the
 same `python bin_sales_history_sync.py` start command per scheduled
 execution - it doesn't share state with `futbin_full_sync.py`.
 
-## 6. SBC collector - selectors confirmed, do one supervised run first
+## 6. SBC collector - headed Chromium required, do one supervised run first
 ```bash
-pip install playwright --break-system-packages   # if not already installed
+pip install -r requirements.txt   # includes playwright==1.61.0
 playwright install chromium
-python futbin_sbc_sync.py
+SBC_HEADLESS=false SBC_MAX_DETAIL_PAGES=1 python futbin_sbc_sync.py
 ```
-Scrapes futbin.com's SBC hub + per-set detail pages into the backend's
-`market_events`/`sbc_details`/`sbc_challenges` tables (backend migrations
-018/019), used to track how card prices move around SBC releases/
-requirements. Same one-shot-per-invocation Cron Job design as
-`bin_sales_history_sync.py` (not a permanent worker, no Procfile entry) -
-except this one uses **Playwright + Chromium, not aiohttp**, because SBC
-pages (unlike futbin's player pages) render their listing grid and
-detail content client-side and need a real browser
-(`nixpacks.toml`, new alongside this file, installs Chromium at build
-time so it's already present in the deployed image).
+Scrapes FUTBIN's single "ALL SBCs" listing page
+(`https://www.futbin.com/26/squad-building-challenges` - the per-category
+filter URLs are the same dataset and are deliberately not used) plus each
+due SBC's detail page, into the backend's `market_events`/`sbc_details`/
+`sbc_challenges` tables (backend migrations 018/019), used to track how
+card prices move around SBC releases/requirements. Same
+one-shot-per-invocation Cron Job design as `bin_sales_history_sync.py`
+(not a permanent worker, no Procfile entry) - except this one uses
+**Playwright + Chromium, not aiohttp**, because SBC pages render their
+listing grid and detail content client-side and need a real browser.
 
-The CSS selectors themselves are **confirmed against real, saved FUTBIN
-HTML** (both a listing page and an individual SBC detail page,
-cross-checked independently with BeautifulSoup) - this is a real upgrade
-from the previous draft, which was an unverified guess. Still open,
-because this sandbox has no live network access to futbin.com to check
-them:
+The CSS selectors are **confirmed against real, saved FUTBIN HTML**
+(both the listing page and an individual SBC detail page, cross-checked
+independently with BeautifulSoup). A real local test also confirmed
+something selectors alone don't fix: **FUTBIN's Cloudflare returns HTTP
+403 for headless Playwright Chromium but HTTP 200 for the identical
+request under headed Chrome** - so this worker must run headed
+(`SBC_HEADLESS=false`, the default), which needs a real X display. See
+the "Railway SBC Worker" section below for how that's deployed.
+
+Still genuinely open, because this sandbox has no live network access to
+futbin.com to check them:
 - FUTBIN redesigns occasionally - selectors confirmed at validation time
   could have drifted since. A run logging "zero SBCs parsed" is the
   signal to re-check.
 - The exact text format of the "expires"/"repeatable" fields on the
   listing card - the selectors are confirmed to find the right elements,
   but this file's parsing of their literal text content
-  (`_parse_expiry`, `_parse_repeatable`) wasn't asserted against real
+  (`parse_expiry`, `parse_repeatable`) wasn't asserted against real
   strings.
-- 429/403 behavior under this exact page-count/timing pattern.
+- Whether headed-via-Xvfb from Railway's datacentre IP is actually
+  accepted by FUTBIN - the local headed test proved headless is the
+  problem, not that Railway's IP will be treated the same as a home
+  connection. Confirm with a real deployed run before trusting a
+  schedule.
 
 **Do one supervised manual run and read the log/heartbeat output before
 adding this to a real Cron schedule** - same discipline as
 `futbin_card_art_backfill.py` below. Recommended cadence once verified:
-once daily (e.g. `0 18 * * *`), not more often - a full run visits ~7
-listing pages plus every due SBC's detail page (~40-60 typically),
-several minutes total at the polite `SBC_REQUEST_DELAY_SECONDS` apart.
+once daily, not more often.
+
+## Railway SBC Worker
+
+Only the Railway service running `futbin_sbc_sync.py` should use:
+
+```
+RAILWAY_DOCKERFILE_PATH=Dockerfile.sbc
+```
+
+Every other service in this repo keeps its existing Nixpacks/Procfile
+setup untouched - `Dockerfile.sbc` is not the repo-root `Dockerfile` and
+nothing else picks it up automatically.
+
+Initial test variables for that service (in addition to `DATABASE_URL`,
+which this worker also requires):
+
+```
+SBC_HEADLESS=false
+SBC_MAX_DETAIL_PAGES=1
+SBC_REQUEST_DELAY_SECONDS=8
+SBC_DETAIL_STALE_HOURS=20
+SBC_NAV_TIMEOUT_MS=45000
+SBC_SELECTOR_TIMEOUT_MS=20000
+SBC_MAX_RETRIES=1
+```
+
+- **Railway Start Command should be left blank** so `Dockerfile.sbc`'s
+  own `CMD` (which runs the worker through `xvfb-run`) is used. A
+  manually configured Start Command overrides the Dockerfile `CMD`
+  entirely - if you do set one, it must invoke the worker through
+  `xvfb-run` itself, or headed Chromium has no display to attach to and
+  will fail to launch.
+- **Do not initially set `SBC_MAX_DETAIL_PAGES=0`.** Prove one detail
+  page works end-to-end first (`SBC_MAX_DETAIL_PAGES=1`), check the
+  heartbeat/log output, then increase it cautiously or move to `0`
+  (no limit) once you trust the run.
+- The scraper only ever uses the single "ALL SBCs" listing page - the
+  per-category filter URLs must not be reintroduced, they're the same
+  underlying dataset.
+- Headed-via-Xvfb fixes the headless-vs-headed 403 difference confirmed
+  in local testing. It does **not** prove Railway's datacentre IP will
+  be accepted by FUTBIN - that's only provable by watching the first
+  real deployed run's logs/heartbeat.
 
 ## 7. Card art backfill - NOT YET SCHEDULED, READ BEFORE DEPLOYING
 ```bash
