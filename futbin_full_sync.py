@@ -40,8 +40,14 @@ from bs4 import BeautifulSoup
 
 from monitoring import heartbeat, alert
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 if not DATABASE_URL:
+    # A whitespace-only value (e.g. a broken Railway variable reference
+    # left as a single space) is truthy under plain `if not DATABASE_URL`
+    # and used to slip past this check, only failing later inside
+    # asyncpg.connect() with a confusing "invalid DSN: ... got ''" error
+    # instead of this clear one - stripped above so that case is caught
+    # here too.
     raise RuntimeError("❌ DATABASE_URL not found!")
 
 GAME = os.getenv("FUTBIN_GAME", "26")
