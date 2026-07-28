@@ -116,11 +116,15 @@ SBC_MAX_RETRIES=1
 ```
 
 - **Railway Start Command should be left blank** so `Dockerfile.sbc`'s
-  own `CMD` (which runs the worker through `xvfb-run`) is used. A
-  manually configured Start Command overrides the Dockerfile `CMD`
-  entirely - if you do set one, it must invoke the worker through
-  `xvfb-run` itself, or headed Chromium has no display to attach to and
-  will fail to launch.
+  own `CMD` (which runs `docker-entrypoint-sbc.sh` - starts Xvfb on a
+  fixed display, then the worker) is used. A manually configured Start
+  Command overrides the Dockerfile `CMD` entirely - if you do set one, it
+  must start Xvfb first (e.g. run `docker-entrypoint-sbc.sh` yourself),
+  or headed Chromium has no display to attach to and will fail to
+  launch. Deliberately not `xvfb-run` directly - its own display
+  auto-detection hung indefinitely on a real Railway deploy with zero
+  log output, which `docker-entrypoint-sbc.sh`'s fixed-display, bounded
+  readiness check avoids.
 - **Do not initially set `SBC_MAX_DETAIL_PAGES=0`.** Prove one detail
   page works end-to-end first (`SBC_MAX_DETAIL_PAGES=1`), check the
   heartbeat/log output, then increase it cautiously or move to `0`
