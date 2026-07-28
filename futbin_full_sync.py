@@ -719,6 +719,17 @@ async def crawl_once():
                                 flush=True,
                             )
 
+                    # NOTE: this upsert is ON CONFLICT (card_id) only, so it's
+                    # subject to the same ux_fut_players_name_rating_playerurl
+                    # unique-violation crawl_latest() hit live (a real card
+                    # already stored under a different, earlier card_id) -
+                    # this loop's own try/except keeps a single bad row from
+                    # crashing the whole crawl, but doesn't recover the row
+                    # like crawl_latest()'s fallback UPDATE now does. Not
+                    # fixed here: this call site's columns are dynamic
+                    # (`cols`, from build_upsert_sql's schema introspection),
+                    # so the equivalent fallback needs its own dynamic SET
+                    # clause rather than copying crawl_latest()'s fixed one.
                     try:
                         await conn.execute(upsert_sql, *row_args(r, cols))
                         written += 1
@@ -834,6 +845,7 @@ async def crawl_latest():
             if not r.get("name"):
                 skipped_no_name += 1
                 continue
+            price_str = str(r["ps_price"]) if r["ps_price"] is not None else None
             try:
                 row = await conn.fetchrow(
                     """
@@ -851,11 +863,53 @@ async def crawl_latest():
                     RETURNING (xmax = 0) AS inserted
                     """,
                     r["card_id"], r["name"], r["rating"], r["position"], r["image_url"], r["player_url"],
-                    str(r["ps_price"]) if r["ps_price"] is not None else None, r["ps_price"],
+                    price_str, r["ps_price"],
                 )
                 written += 1
                 if row["inserted"]:
                     new_cards.append(r["name"])
+            except asyncpg.UniqueViolationError as e:
+                if e.constraint_name == "ux_fut_players_name_rating_playerurl":
+                    # This exact (name, rating, player_url) already exists
+                    # under a DIFFERENT, earlier-established card_id -
+                    # confirmed live (Dean Huijsen/Georginio Rutter/
+                    # Richarlison all hit this the same run) - futbin's
+                    # /latest feed occasionally re-lists an already-known
+                    # card under a new id. ON CONFLICT (card_id) can't
+                    # catch this second, separate unique constraint, so
+                    # the INSERT fails outright and this row's price
+                    # refresh was silently dropped every time. Update the
+                    # existing row by its true (name, rating, player_url)
+                    # identity instead - leaves that row's original
+                    # card_id alone, since other tables (sales_history,
+                    # bin_history, watchlist, ...) already reference it.
+                    try:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE fut_players SET
+                                position = $4,
+                                image_url = $5,
+                                price = $6,
+                                price_num = $7,
+                                price_updated_at = NOW()
+                            WHERE name = $1 AND rating = $2 AND player_url = $3
+                            RETURNING card_id
+                            """,
+                            r["name"], r["rating"], r["player_url"],
+                            r["position"], r["image_url"], price_str, r["ps_price"],
+                        )
+                        if updated:
+                            written += 1
+                        else:
+                            print(
+                                f"⚠️ latest fallback update matched no row for card_id={r['card_id']} "
+                                f"({r.get('name')}) despite the unique-constraint hit - unexpected, skipping.",
+                                flush=True,
+                            )
+                    except Exception as e2:
+                        print(f"❌ latest fallback update failed for card_id={r['card_id']} ({r.get('name')}): {e2}", flush=True)
+                else:
+                    print(f"❌ latest upsert failed for card_id={r['card_id']} ({r.get('name')}): {e}", flush=True)
             except Exception as e:
                 print(f"❌ latest upsert failed for card_id={r['card_id']} ({r.get('name')}): {e}", flush=True)
 
