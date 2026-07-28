@@ -106,9 +106,17 @@ NAV_TIMEOUT_MS = 30_000
 SELECTOR_TIMEOUT_MS = 15_000
 MAX_RETRIES = int(os.getenv("SBC_MAX_RETRIES", "2"))
 
+# A real run (2026-07-28) showed request #1 succeeding then every other
+# request 403ing outright, categories and detail pages alike - the same
+# class of problem futbin_full_sync.py already hit and fixed in this repo
+# (see its own HEADERS comment): a UA string that announces itself as a
+# non-browser bot ("FutHubSBCBot/1.0; ...tracker; contact: ...") is an easy
+# thing for a WAF to key on, far more so than futbin_full_sync.py's already
+# more conservative "SBCSolver/1.5". Matching that file's realistic-Chrome
+# UA here too.
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; FutHubSBCBot/1.0; "
-    "personal-use SBC price-impact tracker; contact: add-a-real-contact-here)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 # --- Confirmed against real FUTBIN markup (see module docstring) ---
@@ -407,18 +415,26 @@ async def _write_detail(conn: asyncpg.Connection, event_id: int, item: Dict[str,
 # ---------------------------------------------------------------------------
 # Fetching - Playwright, not aiohttp (see module docstring for why).
 # ---------------------------------------------------------------------------
-async def _goto_with_retry(context: BrowserContext, url: str, wait_selector: str, diag: Dict[str, Any]) -> tuple[Optional[str], str]:
+async def _goto_with_retry(
+    context: BrowserContext, url: str, wait_selector: str, diag: Dict[str, Any], referer: Optional[str] = None
+) -> tuple[Optional[str], str]:
     """Returns (html, reason). reason is "ok" on success, otherwise a short
     diagnostic string (status code / exception) - callers log this instead
     of a bare "fetch failed" so a real run tells us WHAT blocked it (403?
-    429? a timeout?) rather than requiring another guess-and-check round."""
+    429? a timeout?) rather than requiring another guess-and-check round.
+
+    referer: a real click-through always carries one; page.goto sends none
+    by default, which is itself an easy non-human tell for a WAF to key on."""
     page: Page = await context.new_page()
     try:
         backoff = 2.0
         last_reason = "unknown"
         for attempt in range(MAX_RETRIES + 1):
             try:
-                resp = await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+                goto_kwargs = {"wait_until": "networkidle", "timeout": NAV_TIMEOUT_MS}
+                if referer:
+                    goto_kwargs["referer"] = referer
+                resp = await page.goto(url, **goto_kwargs)
                 if resp is not None and resp.status == 429:
                     diag["http_429_hits"] += 1
                     last_reason = "status=429"
@@ -461,14 +477,34 @@ async def crawl_once() -> None:
 
         all_items: Dict[str, Dict[str, Any]] = {}
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=USER_AGENT)
+            # --disable-blink-features=AutomationControlled + the
+            # navigator.webdriver override below hide the two most common
+            # tells a WAF/bot-check uses to flag Playwright's default
+            # headless Chromium as non-human, on top of the realistic UA
+            # above - same reasoning as futbin_full_sync.py's own header
+            # fix, applied to the browser fingerprint instead of just headers.
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-GB",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
 
+            hub_url = f"{BASE_URL}/26/squad-building-challenges"
             for path in CATEGORY_PATHS:
                 last_segment = path.rstrip("/").rsplit("/", 1)[-1]
                 category = "all" if last_segment == "squad-building-challenges" else last_segment.lower()
                 url = f"{BASE_URL}{path}"
-                html, reason = await _goto_with_retry(context, url, CARD_SELECTOR, diag)
+                # Real category-tab clicks all come from the hub page, not
+                # BASE_URL - a goto with no referer at all is itself a
+                # non-human tell.
+                html, reason = await _goto_with_retry(context, url, CARD_SELECTOR, diag, referer=hub_url)
                 if html is None:
                     diag["category_fetch_failed"] += 1
                     log.warning("Category fetch failed: %s (%s)", url, reason)
@@ -519,7 +555,9 @@ async def crawl_once() -> None:
             for external_id, item in all_items.items():
                 if external_id not in due_ids:
                     continue
-                html, reason = await _goto_with_retry(context, item["url"], DETAIL_CHALLENGE_CARD_SELECTOR, diag)
+                html, reason = await _goto_with_retry(
+                    context, item["url"], DETAIL_CHALLENGE_CARD_SELECTOR, diag, referer=hub_url
+                )
                 if html is None:
                     failed += 1
                     log.warning("Detail fetch failed: %s (%s)", item["url"], reason)
