@@ -1,0 +1,12 @@
+# Needed only because futbin_sbc_sync.py uses Playwright (a real browser),
+# unlike every other collector here (aiohttp is enough for them - see
+# README.md). `playwright` the Python package is in requirements.txt and
+# gets installed by Nixpacks' normal pip install phase, but the actual
+# Chromium *browser binary* is a separate download - without this extra
+# build phase it would either be missing at runtime or get re-downloaded
+# on every Cron Job invocation, which is slow and wasteful.
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "playwright install --with-deps chromium",
+]
