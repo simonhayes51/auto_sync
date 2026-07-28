@@ -27,19 +27,27 @@ RUN python -m pip install \
 
 # Belt-and-suspenders: the official Playwright Python image already ships
 # Chromium plus its Linux system deps (including, in every version checked
-# at the time this was written, xvfb) - not reinstalled here per the
+# at the time this was written, Xvfb) - not reinstalled here per the
 # instruction not to duplicate what the base image already provides.
-# `command -v xvfb-run` below is intentionally NOT a hard build failure if
-# it's ever missing, so a base-image change surfaces as a clear runtime log
-# line instead of a silent, confusing worker crash.
-RUN xvfb-run --help > /dev/null 2>&1 \
-    && echo "xvfb-run present in base image" \
-    || echo "WARNING: xvfb-run not found in base image - worker will fail at runtime"
+# These are intentionally NOT hard build failures if either binary is ever
+# missing, so a base-image change surfaces as a clear runtime log line
+# instead of a silent, confusing worker crash.
+RUN command -v Xvfb > /dev/null 2>&1 \
+    && echo "Xvfb present in base image" \
+    || echo "WARNING: Xvfb not found in base image - worker will fail at runtime"
 
 COPY . /app
 
-# JSON/exec-form CMD does not go through a shell, so
-# "--server-args=-screen 0 1920x1080x24" is delivered to xvfb-run as one
-# argv token (embedded spaces preserved) - no separate entrypoint script
-# needed for this to parse correctly.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "futbin_sbc_sync.py"]
+# chmod runs AFTER the full COPY, not before - relying on git to preserve
+# the executable bit through clone/checkout is fragile; this guarantees it
+# regardless.
+RUN chmod +x /app/docker-entrypoint-sbc.sh
+
+# A first real deploy hung indefinitely at container start with `xvfb-run
+# -a ...` as the CMD - not even this worker's own first log line ever
+# appeared, meaning Python never started. xvfb-run's own auto display-
+# number selection (scanning /tmp/.X*-lock files) is a known hang point on
+# restricted/ephemeral container runtimes. docker-entrypoint-sbc.sh starts
+# Xvfb directly on the fixed DISPLAY set above, with its own bounded (~2s)
+# readiness check, avoiding xvfb-run's auto-detection entirely.
+CMD ["/app/docker-entrypoint-sbc.sh"]
