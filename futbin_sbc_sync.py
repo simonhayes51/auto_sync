@@ -62,6 +62,7 @@ import os
 import re
 import sys
 import json
+import random
 import asyncio
 import logging
 from collections import defaultdict
@@ -92,7 +93,7 @@ CATEGORY_PATHS = [
     "/26/squad-building-challenges/Icons",
     "/26/squad-building-challenges/Foundations",
     "/26/squad-building-challenges/Swaps",
-    "/squad-building-challenges",
+    "/26/squad-building-challenges",
 ]
 
 REQUEST_DELAY_SECONDS = float(os.getenv("SBC_REQUEST_DELAY_SECONDS", "4"))
@@ -126,6 +127,18 @@ DETAIL_CHALLENGE_NAME_SELECTOR = ".og-card-wrapper-top .xxs-font.bold"
 DETAIL_CHALLENGE_REWARD_SELECTOR = ".sbc-box-front-info .xxs-font"
 DETAIL_CHALLENGE_DESC_SELECTOR = ".sbc-box-front p"
 DETAIL_REQUIREMENT_ROW_SELECTOR = ".sbc-requirements .challenge-box-description-row"
+
+
+async def _polite_delay() -> None:
+    """Jittered rather than a fixed REQUEST_DELAY_SECONDS gap - a run
+    against real futbin.com (2026-07-28) saw the very first category
+    request succeed and every next one fail near-instantly at a uniform
+    ~4.6s cadence, consistent with rate/pattern-based blocking rather
+    than bad URLs (the URLs were independently confirmed correct).
+    Jitter is a defensive hypothesis, not a confirmed fix - the improved
+    per-request failure logging above this is what will actually tell us
+    the real cause on the next run."""
+    await asyncio.sleep(REQUEST_DELAY_SECONDS + random.uniform(0, REQUEST_DELAY_SECONDS))
 
 
 def _num(txt: Optional[str]) -> Optional[int]:
@@ -394,23 +407,29 @@ async def _write_detail(conn: asyncpg.Connection, event_id: int, item: Dict[str,
 # ---------------------------------------------------------------------------
 # Fetching - Playwright, not aiohttp (see module docstring for why).
 # ---------------------------------------------------------------------------
-async def _goto_with_retry(context: BrowserContext, url: str, wait_selector: str, diag: Dict[str, Any]) -> Optional[str]:
+async def _goto_with_retry(context: BrowserContext, url: str, wait_selector: str, diag: Dict[str, Any]) -> tuple[Optional[str], str]:
+    """Returns (html, reason). reason is "ok" on success, otherwise a short
+    diagnostic string (status code / exception) - callers log this instead
+    of a bare "fetch failed" so a real run tells us WHAT blocked it (403?
+    429? a timeout?) rather than requiring another guess-and-check round."""
     page: Page = await context.new_page()
     try:
         backoff = 2.0
+        last_reason = "unknown"
         for attempt in range(MAX_RETRIES + 1):
             try:
                 resp = await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
                 if resp is not None and resp.status == 429:
                     diag["http_429_hits"] += 1
+                    last_reason = "status=429"
                     if attempt < MAX_RETRIES:
                         await asyncio.sleep(backoff)
                         backoff *= 2
                         continue
-                    return None
+                    return None, last_reason
                 if resp is not None and resp.status >= 400:
                     diag["http_non200"] += 1
-                    return None
+                    return None, f"status={resp.status}"
                 try:
                     await page.wait_for_selector(wait_selector, timeout=SELECTOR_TIMEOUT_MS)
                 except Exception:
@@ -418,17 +437,17 @@ async def _goto_with_retry(context: BrowserContext, url: str, wait_selector: str
                     # let the caller's parser report zero items/challenges
                     # rather than treating this as a hard fetch failure.
                     pass
-                return await page.content()
+                return await page.content(), "ok"
             except Exception as e:
+                last_reason = f"exception: {type(e).__name__}: {e}"[:200]
                 if attempt < MAX_RETRIES:
                     diag["nav_retries"] += 1
                     await asyncio.sleep(backoff)
                     backoff *= 2
                     continue
                 diag["http_exceptions"] += 1
-                log.warning("goto failed for %s: %s", url, e)
-                return None
-        return None
+                return None, last_reason
+        return None, last_reason
     finally:
         await page.close()
 
@@ -449,11 +468,11 @@ async def crawl_once() -> None:
                 last_segment = path.rstrip("/").rsplit("/", 1)[-1]
                 category = "all" if last_segment == "squad-building-challenges" else last_segment.lower()
                 url = f"{BASE_URL}{path}"
-                html = await _goto_with_retry(context, url, CARD_SELECTOR, diag)
+                html, reason = await _goto_with_retry(context, url, CARD_SELECTOR, diag)
                 if html is None:
                     diag["category_fetch_failed"] += 1
-                    log.warning("Category fetch failed: %s", url)
-                    await asyncio.sleep(REQUEST_DELAY_SECONDS)
+                    log.warning("Category fetch failed: %s (%s)", url, reason)
+                    await _polite_delay()
                     continue
 
                 items = parse_listing_page(html, category)
@@ -465,7 +484,7 @@ async def crawl_once() -> None:
                     # specific one (an honest fallback, not expected to
                     # be common).
                     all_items.setdefault(it["external_id"], it)
-                await asyncio.sleep(REQUEST_DELAY_SECONDS)
+                await _polite_delay()
 
             if not all_items:
                 await browser.close()
@@ -500,17 +519,18 @@ async def crawl_once() -> None:
             for external_id, item in all_items.items():
                 if external_id not in due_ids:
                     continue
-                html = await _goto_with_retry(context, item["url"], DETAIL_CHALLENGE_CARD_SELECTOR, diag)
+                html, reason = await _goto_with_retry(context, item["url"], DETAIL_CHALLENGE_CARD_SELECTOR, diag)
                 if html is None:
                     failed += 1
-                    await asyncio.sleep(REQUEST_DELAY_SECONDS)
+                    log.warning("Detail fetch failed: %s (%s)", item["url"], reason)
+                    await _polite_delay()
                     continue
                 detail = parse_detail_page(html)
                 async with pool.acquire() as conn:
                     await _write_detail(conn, event_ids[external_id], item, detail)
                 written += 1
                 diag["challenges_written"] += len(detail.get("challenges", []))
-                await asyncio.sleep(REQUEST_DELAY_SECONDS)
+                await _polite_delay()
 
             await browser.close()
 
