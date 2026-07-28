@@ -1,0 +1,45 @@
+# Dedicated image for ONLY the SBC worker (futbin_sbc_sync.py). Other
+# Railway services in this repo keep using Nixpacks/Procfile - this file is
+# not the repo-root Dockerfile and must not be picked up by them; the SBC
+# Railway service selects it explicitly via RAILWAY_DOCKERFILE_PATH (see
+# README's "Railway SBC Worker" section).
+#
+# FUTBIN's Cloudflare returned HTTP 403 for headless Playwright Chromium but
+# HTTP 200 for the same request under headed Chrome in local testing, so this
+# worker must run headed, which needs a real X display - hence Xvfb.
+FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV DISPLAY=:99
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+
+RUN python -m pip install \
+    --no-cache-dir \
+    --upgrade pip \
+    && python -m pip install \
+    --no-cache-dir \
+    -r /app/requirements.txt
+
+# Belt-and-suspenders: the official Playwright Python image already ships
+# Chromium plus its Linux system deps (including, in every version checked
+# at the time this was written, xvfb) - not reinstalled here per the
+# instruction not to duplicate what the base image already provides.
+# `command -v xvfb-run` below is intentionally NOT a hard build failure if
+# it's ever missing, so a base-image change surfaces as a clear runtime log
+# line instead of a silent, confusing worker crash.
+RUN xvfb-run --help > /dev/null 2>&1 \
+    && echo "xvfb-run present in base image" \
+    || echo "WARNING: xvfb-run not found in base image - worker will fail at runtime"
+
+COPY . /app
+
+# JSON/exec-form CMD does not go through a shell, so
+# "--server-args=-screen 0 1920x1080x24" is delivered to xvfb-run as one
+# argv token (embedded spaces preserved) - no separate entrypoint script
+# needed for this to parse correctly.
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "futbin_sbc_sync.py"]

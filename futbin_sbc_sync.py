@@ -22,7 +22,7 @@ SBC_MAX_DETAIL_PAGES=0
 SBC_NAV_TIMEOUT_MS=30000
 SBC_SELECTOR_TIMEOUT_MS=15000
 SBC_MAX_RETRIES=2
-SBC_HEADLESS=true
+SBC_HEADLESS=false
 
 SBC_MAX_DETAIL_PAGES:
     0 = no limit
@@ -106,13 +106,17 @@ MAX_RETRIES = int(
     os.getenv("SBC_MAX_RETRIES", "2")
 )
 
+# Defaults to headed (False) - a real local test confirmed FUTBIN's Cloudflare
+# returns HTTP 403 for headless Playwright Chromium but 200 for the same
+# request under headed Chrome, so headed-via-Xvfb is the only mode this
+# worker is currently known to work under (see Dockerfile.sbc/README).
 HEADLESS = os.getenv(
     "SBC_HEADLESS",
-    "true",
-).strip().lower() not in {
-    "0",
     "false",
-    "no",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
 }
 
 
@@ -1186,11 +1190,19 @@ async def navigate(
 async def create_browser(
     playwright: Any,
 ) -> Tuple[Browser, BrowserContext, Page]:
+    log.info(
+        "Launching Chromium: headed=%s display=%s",
+        not HEADLESS,
+        os.getenv("DISPLAY", "not-set"),
+    )
+
     browser = await playwright.chromium.launch(
         headless=HEADLESS,
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
         ],
     )
 
@@ -1201,8 +1213,16 @@ async def create_browser(
             "width": 1920,
             "height": 1080,
         },
+        screen={
+            "width": 1920,
+            "height": 1080,
+        },
         locale="en-GB",
         timezone_id="Europe/London",
+        color_scheme="light",
+        device_scale_factor=1,
+        has_touch=False,
+        is_mobile=False,
     )
 
     page = await context.new_page()
