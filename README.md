@@ -127,6 +127,71 @@ navigation is attempted) in case Railway's IP reputation ever changes or
 you want to try a different host later - the blocker is the network
 origin, not the container setup.
 
+## 6b. SBC collector v2 - EasySBC API (recommended over section 6)
+```bash
+pip install -r requirements.txt   # only needs aiohttp/asyncpg, already listed
+python easysbc_sbc_sync.py
+```
+Same `market_events`/`sbc_details`/`sbc_challenges` tables as the FUTBIN
+collector above, but `source='easysbc'` instead of `'futbin'` (the two
+coexist - not deduplicated against each other), and a completely different
+approach: EasySBC.io's frontend is a client-rendered SPA backed by a
+plain, **unauthenticated JSON API** (`api-fc26.easysbc.io`), confirmed by
+inspecting real DevTools Network requests against real loaded pages, not
+guessed:
+
+- `GET /sbc-sets?page=N&limit=M` - paginated listing of SBC sets
+- `GET /sbc-sets/{id}` - one set's full metadata (real bool `repeatable`,
+  Unix-second `startTime`/`endTime`, real int `psPrice`/`pcPrice` - no
+  HTML text parsing of "37.3K" or "Expires in 6 days" needed at all)
+- `GET /sbcs?setId={id}` - that set's challenge breakdown, each with a
+  `requirements` field that's already a clean array of human-readable
+  strings (e.g. `"Team Rating: Min. 89"`, `"Min. 1 Players Any
+  TOTW/TOTS/FOF"`)
+
+**No browser, no Xvfb, no Cloudflare challenge** - plain `aiohttp` GETs,
+the same shape as `bin_sales_history_sync.py`'s approach to futbin.com's
+HTML pages. This should run fine directly on Railway (a normal Nixpacks
+worker/Cron Job, no `Dockerfile.sbc` needed) - unlike section 6, nothing
+about this approach is currently known to require a residential IP, though
+that's only proven for a handful of manual one-off requests, not sustained
+crawl volume.
+
+Requirement text is also cross-checked against **real `fut_players.nation`
+/ `fut_players.league` values already in this database** (queried at
+runtime, not a hardcoded guessed list) to tag the SBC's `market_events.
+fingerprint` with things like `nation_spain` or `league_premier_league`
+whenever a requirement names a real nation/league - alongside the
+existing `requires_totw`/`requires_tots`/`requires_toty`/`requires_fof`
+promo-keyword tags. Matching is whole-phrase/word-boundary (not naive
+substring), so e.g. "Mali" cannot false-positive-match inside "Somalia" -
+verified against the real Bárbara López payload plus synthetic
+Premier-League/Somalia cases.
+
+Still genuinely open, because this sandbox has no live network access to
+verify further:
+- The exact envelope shape of `GET /sbc-sets` (bare array vs wrapped
+  object) - only single-item `/sbc-sets/{id}` and `/sbcs?setId=` responses
+  were directly confirmed; `fetch_listing()` handles either shape
+  defensively and logs a warning if it recognises neither.
+- Whether sequential requests across dozens of sets in one run trips any
+  rate limit on this API - `_get_json_with_retry` backs off on 429/5xx the
+  same way `bin_sales_history_sync.py` does for futbin.com, but that's
+  untested at real volume here.
+- `categoryId` (e.g. `2`) has no confirmed name mapping, so `sbc_details.
+  category` is left `NULL` rather than guessed.
+- Reward `resourceId`/`assetId` are EA's own definition-id namespace, not
+  this codebase's FUTBIN-derived `fut_players.card_id` - no mapping
+  between the two is known, so `reward_card_id` is left `NULL`.
+
+**Do one supervised manual run and read the log/heartbeat output before
+scheduling this as a real Cron Job** - same discipline as every other
+worker in this file. `futbin_sbc_sync.py`/`Dockerfile.sbc`/
+`docker-entrypoint-sbc.sh` are left in the repo for now rather than
+deleted, in case this API also turns out to be rate-limited or blocked at
+scale and the Playwright approach needs revisiting - remove them once
+this one is proven reliable over a few real runs.
+
 ## 7. Card art backfill - NOT YET SCHEDULED, READ BEFORE DEPLOYING
 ```bash
 python futbin_card_art_backfill.py
