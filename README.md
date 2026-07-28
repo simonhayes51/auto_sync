@@ -43,34 +43,39 @@ every 10 minutes with the cron expression `*/10 * * * *`, running the
 same `python bin_sales_history_sync.py` start command per scheduled
 execution - it doesn't share state with `futbin_full_sync.py`.
 
-## 6. SBC collector - headed Chromium required, do one supervised run first
+## 6. SBC collector - run from your own machine, NOT Railway (confirmed blocked)
 ```bash
 pip install -r requirements.txt   # includes playwright==1.61.0
 playwright install chromium
-SBC_HEADLESS=false SBC_MAX_DETAIL_PAGES=1 python futbin_sbc_sync.py
+SBC_MAX_DETAIL_PAGES=1 python futbin_sbc_sync.py
 ```
 Scrapes FUTBIN's single "ALL SBCs" listing page
 (`https://www.futbin.com/26/squad-building-challenges` - the per-category
 filter URLs are the same dataset and are deliberately not used) plus each
 due SBC's detail page, into the backend's `market_events`/`sbc_details`/
 `sbc_challenges` tables (backend migrations 018/019), used to track how
-card prices move around SBC releases/requirements. Same
-one-shot-per-invocation Cron Job design as `bin_sales_history_sync.py`
-(not a permanent worker, no Procfile entry) - except this one uses
-**Playwright + Chromium, not aiohttp**, because SBC pages render their
-listing grid and detail content client-side and need a real browser.
+card prices move around SBC releases/requirements. Uses **Playwright +
+Chromium, not aiohttp**, because SBC pages render their listing grid and
+detail content client-side and need a real browser.
 
-The CSS selectors are **confirmed against real, saved FUTBIN HTML**
-(both the listing page and an individual SBC detail page, cross-checked
-independently with BeautifulSoup). A real local test also confirmed
-something selectors alone don't fix: **FUTBIN's Cloudflare returns HTTP
-403 for headless Playwright Chromium but HTTP 200 for the identical
-request under headed Chrome** - so this worker must run headed
-(`SBC_HEADLESS=false`, the default), which needs a real X display. See
-the "Railway SBC Worker" section below for how that's deployed.
+The CSS selectors are **confirmed against real, saved FUTBIN HTML**. Two
+things beyond selectors were confirmed by real testing:
+- **FUTBIN's Cloudflare returns HTTP 403 for headless Playwright
+  Chromium but HTTP 200 for the identical request under headed
+  Chrome** - so this worker runs headed (`SBC_HEADLESS=false`, the
+  default) by default.
+- **Headed Chromium is not enough on its own if the request is coming
+  from a datacentre IP.** A real Railway deployment (headed, via Xvfb,
+  everything working correctly right up to the actual page request)
+  still got an immediate `HTTP 403 "Just a moment..."` from Cloudflare -
+  a hard WAF block on the IP/network origin, not a solvable JS
+  challenge, and not something any browser-fingerprint or timing change
+  fixes. **Confirmed working from a home/residential connection with
+  headed Chrome; confirmed blocked from Railway's network.** Run this
+  worker from a machine on a normal home/residential connection, not
+  Railway or another cloud/datacentre host - see "Running Locally" below.
 
-Still genuinely open, because this sandbox has no live network access to
-futbin.com to check them:
+Still genuinely open:
 - FUTBIN redesigns occasionally - selectors confirmed at validation time
   could have drifted since. A run logging "zero SBCs parsed" is the
   signal to re-check.
@@ -79,63 +84,48 @@ futbin.com to check them:
   but this file's parsing of their literal text content
   (`parse_expiry`, `parse_repeatable`) wasn't asserted against real
   strings.
-- Whether headed-via-Xvfb from Railway's datacentre IP is actually
-  accepted by FUTBIN - the local headed test proved headless is the
-  problem, not that Railway's IP will be treated the same as a home
-  connection. Confirm with a real deployed run before trusting a
-  schedule.
 
 **Do one supervised manual run and read the log/heartbeat output before
-adding this to a real Cron schedule** - same discipline as
+scheduling anything unattended** - same discipline as
 `futbin_card_art_backfill.py` below. Recommended cadence once verified:
 once daily, not more often.
 
-## Railway SBC Worker
+## Running Locally (recommended - Railway is blocked)
 
-Only the Railway service running `futbin_sbc_sync.py` should use:
+Since Railway's network is confirmed blocked by FUTBIN's Cloudflare
+(see above), run this worker on a schedule from a machine on a normal
+home/residential connection instead - the same setup your local test
+already proved works.
 
+**1. Point it at your Railway Postgres database from outside Railway's
+network.** In the Railway dashboard, open your Postgres service ->
+Settings -> Networking -> enable "Public Networking" if it isn't
+already, then use the resulting public connection string (a
+`postgresql://...proxy.rlwy.net:PORT/...`-style URL, not the internal
+`DATABASE_URL` other Railway services use) as `DATABASE_URL` below -
+the internal one is only reachable from inside Railway's own network.
+
+**2. Install and do one manual run** (as in section 6 above) to confirm
+it works from your connection and check the log/heartbeat output.
+
+**3. Schedule it** - once daily is plenty (a full run is several
+minutes; see the module docstring for why). Linux/macOS:
+```bash
+crontab -e
 ```
-RAILWAY_DOCKERFILE_PATH=Dockerfile.sbc
 ```
-
-Every other service in this repo keeps its existing Nixpacks/Procfile
-setup untouched - `Dockerfile.sbc` is not the repo-root `Dockerfile` and
-nothing else picks it up automatically.
-
-Initial test variables for that service (in addition to `DATABASE_URL`,
-which this worker also requires):
-
+0 18 * * * cd /path/to/auto_sync && DATABASE_URL="postgresql://...proxy.rlwy.net:PORT/..." /usr/bin/python3 futbin_sbc_sync.py >> sbc_sync.log 2>&1
 ```
-SBC_HEADLESS=false
-SBC_MAX_DETAIL_PAGES=1
-SBC_REQUEST_DELAY_SECONDS=8
-SBC_DETAIL_STALE_HOURS=20
-SBC_NAV_TIMEOUT_MS=45000
-SBC_SELECTOR_TIMEOUT_MS=20000
-SBC_MAX_RETRIES=1
-```
+Windows: Task Scheduler -> Create Basic Task -> Daily -> Action "Start a
+program" -> `python.exe` with argument `futbin_sbc_sync.py`, "Start in"
+set to this folder, and `DATABASE_URL` set as a system/user environment
+variable (Task Scheduler doesn't read a local `.env` file).
 
-- **Railway Start Command should be left blank** so `Dockerfile.sbc`'s
-  own `CMD` (which runs `docker-entrypoint-sbc.sh` - starts Xvfb on a
-  fixed display, then the worker) is used. A manually configured Start
-  Command overrides the Dockerfile `CMD` entirely - if you do set one, it
-  must start Xvfb first (e.g. run `docker-entrypoint-sbc.sh` yourself),
-  or headed Chromium has no display to attach to and will fail to
-  launch. Deliberately not `xvfb-run` directly - its own display
-  auto-detection hung indefinitely on a real Railway deploy with zero
-  log output, which `docker-entrypoint-sbc.sh`'s fixed-display, bounded
-  readiness check avoids.
-- **Do not initially set `SBC_MAX_DETAIL_PAGES=0`.** Prove one detail
-  page works end-to-end first (`SBC_MAX_DETAIL_PAGES=1`), check the
-  heartbeat/log output, then increase it cautiously or move to `0`
-  (no limit) once you trust the run.
-- The scraper only ever uses the single "ALL SBCs" listing page - the
-  per-category filter URLs must not be reintroduced, they're the same
-  underlying dataset.
-- Headed-via-Xvfb fixes the headless-vs-headed 403 difference confirmed
-  in local testing. It does **not** prove Railway's datacentre IP will
-  be accepted by FUTBIN - that's only provable by watching the first
-  real deployed run's logs/heartbeat.
+`Dockerfile.sbc`/`docker-entrypoint-sbc.sh` are still in this repo and
+still work correctly (confirmed: Xvfb starts, Chromium launches headed,
+navigation is attempted) in case Railway's IP reputation ever changes or
+you want to try a different host later - the blocker is the network
+origin, not the container setup.
 
 ## 7. Card art backfill - NOT YET SCHEDULED, READ BEFORE DEPLOYING
 ```bash
