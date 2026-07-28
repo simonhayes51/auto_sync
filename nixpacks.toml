@@ -1,12 +1,16 @@
 # Needed only because futbin_sbc_sync.py uses Playwright (a real browser),
 # unlike every other collector here (aiohttp is enough for them - see
-# README.md). `playwright` the Python package is in requirements.txt and
-# gets installed by Nixpacks' normal pip install phase, but the actual
-# Chromium *browser binary* is a separate download - without this extra
-# build phase it would either be missing at runtime or get re-downloaded
-# on every Cron Job invocation, which is slow and wasteful.
-[phases.install]
-cmds = [
-  "pip install -r requirements.txt",
-  "playwright install --with-deps chromium",
-]
+# README.md). `playwright` the Python package is already installed by
+# Nixpacks' own auto-detected Python install phase (it's in
+# requirements.txt) - that phase also creates and activates the venv
+# `pip`/`python` actually live in, so it must NOT be overridden here (an
+# earlier version of this file replaced phases.install's cmds outright,
+# which dropped that venv setup entirely and broke `pip` for every
+# service built from this repo, not just this one).
+#
+# This only adds the separate Chromium *browser binary* Playwright needs,
+# as its own phase depending on "install" so it runs after and inherits
+# that already-activated venv/PATH.
+[phases.playwright]
+dependsOn = ["install"]
+cmds = ["playwright install --with-deps chromium"]
