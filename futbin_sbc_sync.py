@@ -1243,6 +1243,15 @@ async def create_browser(
 # =============================================================================
 
 async def crawl_once() -> None:
+    # A real deploy sat at "Starting Container" with zero further output for
+    # 3+ minutes - every step below this point used to have no timeout, so a
+    # stuck DB connection, a stuck ensure_tables() (e.g. lock contention), or
+    # a stuck Playwright driver/Xvfb handshake would hang forever with no
+    # diagnostic at all. This log line at least tells us Python itself
+    # started; the asyncio.wait_for() wrapping below tells us which specific
+    # step is stuck instead of an unbounded silent hang.
+    log.info("crawl_once() starting")
+
     diagnostics: Diagnostics = defaultdict(int)
 
     listing_items: Dict[str, Dict[str, Any]] = {}
@@ -1255,26 +1264,46 @@ async def crawl_once() -> None:
     failed_details = 0
     blocked = False
 
-    pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=4,
-        command_timeout=60,
-    )
+    log.info("Connecting to database...")
+    try:
+        pool = await asyncio.wait_for(
+            asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=4,
+                command_timeout=60,
+            ),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        log.error("Database pool creation timed out after 30s - DATABASE_URL unreachable?")
+        raise
+    log.info("Database pool ready")
 
     try:
         async with pool.acquire() as conn:
-            await ensure_tables(conn)
+            log.info("Ensuring tables exist...")
+            await asyncio.wait_for(ensure_tables(conn), timeout=30)
+            log.info("Tables ready")
 
+        log.info("Starting Playwright driver...")
         async with async_playwright() as playwright:
             browser: Optional[Browser] = None
             context: Optional[BrowserContext] = None
             page: Optional[Page] = None
 
             try:
-                browser, context, page = await create_browser(
-                    playwright
-                )
+                try:
+                    browser, context, page = await asyncio.wait_for(
+                        create_browser(playwright),
+                        timeout=60,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "Browser launch timed out after 60s - Xvfb/Chromium "
+                        "failed to start under headed mode?"
+                    )
+                    raise
 
                 install_network_observer(
                     page=page,
@@ -1647,6 +1676,12 @@ async def crawl_once() -> None:
 # =============================================================================
 
 if __name__ == "__main__":
+    # Distinguishes "the process never even reached Python" (e.g. xvfb-run
+    # itself stuck starting Xvfb, before the wrapped `python
+    # futbin_sbc_sync.py` command runs at all) from "Python started but hung
+    # somewhere inside crawl_once()" - the latter now has its own timeouts
+    # and logging (see crawl_once()'s own first log line).
+    log.info("SBC worker process started (module loaded, entering crawl_once())")
     try:
         asyncio.run(crawl_once())
 
