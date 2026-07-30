@@ -55,6 +55,14 @@ if not DATABASE_URL:
 BATCH_SIZE = int(os.getenv("RARITY_BATCH_SIZE", "300"))
 REQUEST_DELAY = float(os.getenv("RARITY_REQUEST_DELAY", "1.5"))
 MAX_RETRIES = int(os.getenv("RARITY_MAX_RETRIES", "3"))
+# Defaults to 1 (strictly serial, unchanged from the original behavior)
+# so the standing scheduled Cron Job stays at its original, already-
+# proven-safe pace. Raise via env var for a supervised one-off full-
+# catalog run instead of changing the default every scheduled run uses -
+# each concurrent worker still applies its own jittered per-request
+# delay, so this multiplies throughput without removing per-request
+# pacing entirely.
+CONCURRENCY = int(os.getenv("RARITY_CONCURRENCY", "1"))
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
@@ -148,38 +156,96 @@ async def _fetch_batch(conn: asyncpg.Connection) -> list:
     )
 
 
+async def _process_one(
+    conn: asyncpg.Connection,
+    session: aiohttp.ClientSession,
+    row,
+    diag: Dict[str, Any],
+    counters: Dict[str, int],
+    db_lock: asyncio.Lock,
+) -> None:
+    """The HTTP fetch runs fully concurrently (bounded only by the
+    semaphore in run_once()); the DB write is serialized under db_lock
+    since a single asyncpg.Connection can't be used from more than one
+    coroutine at once - fine because the write itself is cheap and HTTP
+    latency is the real bottleneck being parallelized here."""
+    status, html = await _get_with_retry(session, row["player_url"], diag)
+    await asyncio.sleep(_jittered_delay())
+    if status != 200 or not html:
+        async with db_lock:
+            counters["failed"] += 1
+        return
+    try:
+        rarity = parse_card_rarity(html)
+    except Exception as e:
+        log.warning("card_id=%s parse failed: %s", row["card_id"], e)
+        async with db_lock:
+            counters["failed"] += 1
+        return
+    async with db_lock:
+        if rarity is None:
+            # Page fetched fine but the card-type link wasn't found -
+            # leave rarity NULL rather than writing a false "checked,
+            # nothing there"; retried next run.
+            counters["not_found"] += 1
+        else:
+            try:
+                await conn.execute(
+                    "UPDATE fut_players SET rarity = $1 WHERE card_id = $2",
+                    rarity, row["card_id"],
+                )
+                counters["written"] += 1
+            except Exception as e:
+                log.warning("card_id=%s write failed: %s", row["card_id"], e)
+                counters["failed"] += 1
+
+
+async def _bounded(
+    sem: asyncio.Semaphore,
+    progress: Dict[str, int],
+    db_lock: asyncio.Lock,
+    conn: asyncpg.Connection,
+    session: aiohttp.ClientSession,
+    row,
+    diag: Dict[str, Any],
+    counters: Dict[str, int],
+) -> None:
+    async with sem:
+        await _process_one(conn, session, row, diag, counters, db_lock)
+    async with db_lock:
+        progress["done"] += 1
+        d, total = progress["done"], progress["total"]
+        if d % 25 == 0 or d == total:
+            log.info(
+                "progress %d/%d - written=%d not_found=%d failed=%d",
+                d, total, counters["written"], counters["not_found"], counters["failed"],
+            )
+
+
 async def run_once() -> None:
     conn = await asyncpg.connect(DATABASE_URL)
     diag: Dict[str, Any] = {"http_429_hits": 0, "http_exceptions": 0}
-    written = not_found = failed = 0
+    counters: Dict[str, int] = {"written": 0, "not_found": 0, "failed": 0}
+    db_lock = asyncio.Lock()
     try:
         await ensure_rarity_column(conn)
         rows = await _fetch_batch(conn)
+        # At CONCURRENCY=1 / REQUEST_DELAY=1.5s, jittered per-card delay
+        # alone adds up to ~8+ minutes per 300 cards before real HTTP
+        # time on top - with no log line until the run finished, a
+        # legitimately-still-working run was indistinguishable from a
+        # hung one on Railway's deploy log ("Starting Container" then
+        # nothing for minutes). Log the batch size/concurrency up front
+        # and progress every 25 cards so "still working" is visible.
+        log.info("starting batch of %d card(s), concurrency=%d", len(rows), CONCURRENCY)
+        progress = {"done": 0, "total": len(rows)}
+        sem = asyncio.Semaphore(CONCURRENCY)
         async with aiohttp.ClientSession() as session:
-            for r in rows:
-                status, html = await _get_with_retry(session, r["player_url"], diag)
-                if status != 200 or not html:
-                    failed += 1
-                    await asyncio.sleep(_jittered_delay())
-                    continue
-                try:
-                    rarity = parse_card_rarity(html)
-                    if rarity is None:
-                        # Page fetched fine but the card-type link wasn't
-                        # found - leave rarity NULL rather than writing a
-                        # false "checked, nothing there"; retried next run.
-                        not_found += 1
-                    else:
-                        await conn.execute(
-                            "UPDATE fut_players SET rarity = $1 WHERE card_id = $2",
-                            rarity, r["card_id"],
-                        )
-                        written += 1
-                except Exception as e:
-                    log.warning("card_id=%s parse/write failed: %s", r["card_id"], e)
-                    failed += 1
-                await asyncio.sleep(_jittered_delay())
+            await asyncio.gather(*[
+                _bounded(sem, progress, db_lock, conn, session, r, diag, counters) for r in rows
+            ])
 
+        written, not_found, failed = counters["written"], counters["not_found"], counters["failed"]
         detail = (
             f"batch={len(rows)} written={written} not_found={not_found} failed={failed} "
             f"http_429={diag['http_429_hits']} http_exc={diag['http_exceptions']}"
