@@ -257,3 +257,45 @@ one. Same volume/rate-limit caution as the card art backfill above
 applies here too (same fetch pattern, same host) - do a small manual run
 first (`RARITY_BATCH_SIZE=10 python futbin_rarity_backfill.py`) and
 check `http_429`/`http_exc` before scheduling as a real Cron Job.
+
+## 9. Promo/event detector - NOT YET SCHEDULED, READ BEFORE DEPLOYING
+```bash
+python promo_event_detector.py
+```
+Populates `market_events` for anything that isn't an SBC (TOTW/TOTS/Icon/
+Hero drops, other campaign releases). Every existing `market_events`
+writer (`futbin_sbc_sync.py`, `easysbc_sbc_sync.py`) only ever writes
+`kind='sbc'` - this was a real, live gap, not a hypothetical one, since
+promo timing is one of the most predictable signals in FUT trading.
+
+**Deliberately does not scrape a new page.** Every other writer in this
+file works against a live futbin page with selectors confirmed against
+real markup this sandbox could load - there's no "promo calendar" page
+already scraped here, and guessing new CSS selectors blind is a good way
+to ship something that silently parses zero rows on day one. Instead it
+reads `fut_players.version` (already the authoritative edition field -
+see `bin_sales_history_sync.py`'s docstring) plus a new `first_seen_at`
+column it adds itself: when a cluster of newly-discovered cards shares a
+non-"Normal" version within `PROMO_DETECT_WINDOW_HOURS` (default 48),
+that cluster IS a promo event. Zero new HTTP requests to futbin, so
+unlike section 6 this can't be blocked by Cloudflare - safe to run as a
+normal Railway Cron Job, no `Dockerfile.sbc`-style workaround needed.
+
+**Real trade-off, not free**: a card discovered via `futbin_full_sync.py`'s
+`crawl_latest()` has no `version` yet (that field isn't scraped by the
+lightweight `/latest` parser) until the next full `crawl()` classifies
+it - so detection lags a promo's real start by however long that gap is
+in your deployment. Detects real promos, later than a live-page scrape
+would, rather than not at all.
+
+`first_seen_at` is backfilled from `price_updated_at` for every existing
+row on first run (not `NOW()`, which would make every card in the
+database look newly-discovered and fire a false event for every version
+at once) - **do one supervised manual run and check the log/heartbeat
+output before scheduling this as a real Cron Job**, same discipline as
+every other worker in this file, to confirm the backfill and first
+detection pass look sane against your real data before it runs
+unattended.
+
+Env vars: `PROMO_DETECT_WINDOW_HOURS=48`, `PROMO_MIN_NEW_CARDS=5`,
+`PROMO_EXCLUDED_VERSIONS=normal` (comma-separated, case-insensitive).
