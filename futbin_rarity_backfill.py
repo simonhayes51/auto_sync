@@ -155,8 +155,16 @@ async def run_once() -> None:
     try:
         await ensure_rarity_column(conn)
         rows = await _fetch_batch(conn)
+        # At the default BATCH_SIZE=300 / REQUEST_DELAY=1.5s, jittered
+        # per-card delay alone adds up to ~8+ minutes before real HTTP
+        # time on top - with no log line until the run finished, a
+        # legitimately-still-working run was indistinguishable from a
+        # hung one on Railway's deploy log ("Starting Container" then
+        # nothing for minutes). Log the batch size up front and progress
+        # every 25 cards so "still working" is visible, not silent.
+        log.info("starting batch of %d card(s)", len(rows))
         async with aiohttp.ClientSession() as session:
-            for r in rows:
+            for i, r in enumerate(rows, start=1):
                 status, html = await _get_with_retry(session, r["player_url"], diag)
                 if status != 200 or not html:
                     failed += 1
@@ -178,6 +186,11 @@ async def run_once() -> None:
                 except Exception as e:
                     log.warning("card_id=%s parse/write failed: %s", r["card_id"], e)
                     failed += 1
+                if i % 25 == 0 or i == len(rows):
+                    log.info(
+                        "progress %d/%d - written=%d not_found=%d failed=%d",
+                        i, len(rows), written, not_found, failed,
+                    )
                 await asyncio.sleep(_jittered_delay())
 
         detail = (
