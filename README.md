@@ -223,3 +223,37 @@ and check the resulting heartbeat's `http_429`/`http_exc` counts before
 scheduling this as a real Cron Job, and if adding it, prefer a small batch
 size and a generous interval (e.g. every 15-30 minutes) over a big
 one-shot sweep.
+
+## 8. Rarity backfill - NOT YET SCHEDULED, READ BEFORE DEPLOYING
+```bash
+python futbin_rarity_backfill.py
+```
+Fills `fut_players.rarity` (backend migration 025) - the card TYPE
+(Bronze/Silver/Gold Common/Gold Rare/etc), a different concept from
+`fut_players.version` (card EDITION - Normal/TOTW/TOTS/Icon/etc, see
+`bin_sales_history_sync.py`'s own docstring). Nothing in this repo has
+ever populated `rarity`; `futbin_full_sync.py`'s listing-page crawl
+never sees this value, only the individual player page's Nation/League/
+Club/Card-type info row does (a link to `/26/players?version=<slug>` -
+futbin's own query-param name, unrelated to this schema's `version`
+column - with a visible text label like "Gold Rare").
+
+Deliberately kept as its own script rather than folded into
+`futbin_card_art_backfill.py` - that one's job is card art, this one's
+job is rarity; they happen to share the same one-GET-per-card fetch
+pattern but nothing else, so either can be scheduled/tuned/disabled
+without touching the other's already-deployed logic. Same one-shot-per-
+invocation Cron Job design, same `CARD_ART_BATCH_SIZE`-style env vars
+(`RARITY_BATCH_SIZE`/`RARITY_REQUEST_DELAY`/`RARITY_MAX_RETRIES`), no
+Procfile entry yet.
+
+`parse_card_rarity()`'s selector (the `?version=` link + its
+`text-ellipsis` span) is confirmed against real sampled futbin markup
+for a Gold Rare card, but **unlike `parse_card_layers()` in the card art
+script, it is not scoped to a specific "hero" container** - the sampled
+markup didn't show one for this info row. If futbin ever renders more
+than one player's info row on the same page, this could grab the wrong
+one. Same volume/rate-limit caution as the card art backfill above
+applies here too (same fetch pattern, same host) - do a small manual run
+first (`RARITY_BATCH_SIZE=10 python futbin_rarity_backfill.py`) and
+check `http_429`/`http_exc` before scheduling as a real Cron Job.
