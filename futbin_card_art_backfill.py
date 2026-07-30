@@ -8,14 +8,6 @@ detail view - ported here (not imported: auto_sync is a separate deployable
 from backend, same convention bin_sales_history_sync.py's own ported _num()
 already follows) because these two repos don't share a package today.
 
-Also backfills fut_players.rarity (backend/migrations/025_fut_players_rarity.sql)
-on the same per-card page fetch - the card TYPE (Bronze/Silver/Gold Common/
-Gold Rare/etc), which is a different concept from fut_players.version
-(card EDITION - Normal/TOTW/TOTS/Icon/etc - see bin_sales_history_sync.py's
-own docstring) and was never scraped by anything until now. Only available
-on this per-card page (see parse_card_rarity() below), never on
-futbin_full_sync.py's listing rows.
-
 Unlike futbin_full_sync.py's listing-page crawl (one GET covers ~25 cards
 at once), this needs ONE request PER CARD - the listing rows never carry
 this background/cutout markup, confirmed by reading futbin_full_sync.py's
@@ -41,7 +33,6 @@ rest of the batch, and a failed card is simply retried on the next
 invocation (card_bg_image stays NULL until a fetch actually succeeds).
 """
 import os
-import re
 import random
 import asyncio
 import logging
@@ -122,57 +113,16 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     }
 
 
-# The player page's Nation/League/Club/Card-type info row - the last item
-# is the card's TYPE (e.g. "Gold Rare"), a link to
-# /26/players?version=gold_rare with a visible <span class="text-ellipsis">
-# label. futbin's own query-param happens to be named "version" here -
-# pure naming coincidence with this schema's unrelated fut_players.version
-# column (card EDITION), not the same concept.
-#
-# FLAGGED: matches the first such link found on the page. The sampled
-# markup this was built from didn't show a class scoping this info row
-# the way playercard-l scopes the hero card art in parse_card_layers()
-# above, so if futbin ever renders more than one player's info row on the
-# same page (e.g. inside a "similar players" section), this could grab
-# the wrong one - revisit if a bad rarity value is ever observed on a
-# real card.
-RARITY_HREF_RE = re.compile(r"/players\?version=([a-z0-9_]+)", re.I)
-
-
-def parse_card_rarity(html: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=RARITY_HREF_RE):
-        span = a.find("span", class_="text-ellipsis")
-        label = span.get_text(strip=True) if span else None
-        if label:
-            return label
-    return None
-
-
-async def ensure_rarity_column(conn: asyncpg.Connection) -> None:
-    """rarity already exists ad hoc on some live deployments (never
-    defined by a migration until backend's 025_fut_players_rarity.sql) -
-    IF NOT EXISTS makes this a true no-op there, and self-heals any
-    environment that hasn't run that migration yet, same convention
-    futbin_full_sync.py's own ensure_new_columns() already follows."""
-    await conn.execute("ALTER TABLE fut_players ADD COLUMN IF NOT EXISTS rarity TEXT")
-
-
 async def _fetch_batch(conn: asyncpg.Connection) -> list:
-    """Cards with a real player_url and (card art OR rarity) still
-    missing, prioritized toward cards that actually appear in
-    fair_value_mv (real trading activity) so the backfill's limited
-    per-run budget goes to the cards v2's list surfaces actually render
-    first. Matches on card_bg_image OR rarity (not AND-only on
-    card_bg_image, the original condition) so a card that already got
-    its art backfilled by an earlier run before rarity existed still
-    gets revisited once to pick up rarity, instead of being permanently
-    skipped by the card_bg_image IS NULL check."""
+    """Cards with a real player_url but no card art yet, prioritized
+    toward cards that actually appear in fair_value_mv (real trading
+    activity) so the backfill's limited per-run budget goes to the cards
+    v2's list surfaces actually render first."""
     return await conn.fetch(
         """
         SELECT p.card_id, p.player_url
         FROM fut_players p
-        WHERE (p.card_bg_image IS NULL OR p.rarity IS NULL) AND p.player_url IS NOT NULL
+        WHERE p.card_bg_image IS NULL AND p.player_url IS NOT NULL
         ORDER BY (EXISTS (SELECT 1 FROM fair_value_mv f WHERE f.card_id = p.card_id)) DESC,
                  p.price_num DESC NULLS LAST
         LIMIT $1
@@ -186,7 +136,6 @@ async def run_once() -> None:
     diag: Dict[str, Any] = {"http_429_hits": 0, "http_exceptions": 0}
     written = failed = 0
     try:
-        await ensure_rarity_column(conn)
         rows = await _fetch_batch(conn)
         async with aiohttp.ClientSession() as session:
             for r in rows:
@@ -197,17 +146,15 @@ async def run_once() -> None:
                     continue
                 try:
                     layers = parse_card_layers(html)
-                    rarity = parse_card_rarity(html)
                     await conn.execute(
                         """
                         UPDATE fut_players
                         SET card_bg_image = $1, card_cutout_image = $2,
-                            card_cutout_type = $3, card_name = $4,
-                            rarity = COALESCE($5, rarity)
-                        WHERE card_id = $6
+                            card_cutout_type = $3, card_name = $4
+                        WHERE card_id = $5
                         """,
                         layers["bgImageUrl"], layers["cutoutImageUrl"],
-                        layers["cutoutType"], layers["cardName"], rarity, r["card_id"],
+                        layers["cutoutType"], layers["cardName"], r["card_id"],
                     )
                     written += 1
                 except Exception as e:
