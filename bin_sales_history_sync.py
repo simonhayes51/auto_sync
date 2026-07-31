@@ -125,6 +125,20 @@ PLAYWRIGHT_HEADLESS = (
 )
 PLAYWRIGHT_NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "20000"))
 
+# Mirrors a standalone single-page Playwright connectivity test (not part
+# of this repo) that got a real 200 on a real player URL from this same
+# home connection/IP, where this worker was still getting 403'd - a real
+# Chrome UA string, not the bot-identifying "SBCSolver/1.5" one this
+# worker used before Playwright was even introduced, and not left to
+# whatever default Chromium negotiates on its own (which is a real
+# Chromium UA too, but unproven against FUTBIN; this exact string is the
+# one already confirmed to get a 200).
+PLAYWRIGHT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/150.0.0.0 Safari/537.36"
+)
+
 # Run-level circuit breaker (item 8): a hard Cloudflare block shows up as a
 # burst of 403s/challenge pages, not the 429 rate-limit this file was
 # originally tuned around - stop scheduling new work well before grinding
@@ -922,13 +936,18 @@ async def crawl_once() -> None:
         if PLAYWRIGHT_HEADLESS is not None:
             launch_kwargs["headless"] = PLAYWRIGHT_HEADLESS
         browser = await playwright_ctx.chromium.launch(**launch_kwargs)
-        # No user_agent override - a real Playwright test succeeded from
-        # this same connection with Chromium's own native UA, while the
-        # worker's own custom string ("...SBCSolver/1.5)") explicitly
-        # identifies it as a bot, unlike any real browser fingerprint.
+        # Mirrors the standalone test_futbin.py connectivity test exactly
+        # (same UA, viewport, locale) - that script gets a real 200 on the
+        # same URL from the same home IP where this worker was still
+        # getting 403'd, so the fix is to match it precisely rather than
+        # rely on Chromium's own unproven default fingerprint. No extra
+        # request headers, no persisted browser storage, no resource
+        # blocking, no disabled JS, and no Playwright request API fallback
+        # anywhere in this file.
         context = await browser.new_context(
+            user_agent=PLAYWRIGHT_USER_AGENT,
+            viewport={"width": 1365, "height": 768},
             locale="en-GB",
-            viewport={"width": 1440, "height": 900},
         )
 
         # Small reusable page pool (item 3) - this, not a separate
