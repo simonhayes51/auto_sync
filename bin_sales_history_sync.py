@@ -87,6 +87,17 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 # phase drifts out of sync with the real invocation cadence.
 CRON_INTERVAL_SECONDS = int(os.getenv("CRON_INTERVAL_SECONDS", "600"))
 
+# Distinct from every REFRESH_LOCK_KEY in backend/app/services/*.py
+# (7741001-7741002, 7741004-7741007, 7741009-7741010 are all taken there -
+# same Postgres instance/key space as those processes). Guards against
+# overlapping Cron invocations: Tier A alone can now take well over the
+# 10-minute Cron interval (candidate count has grown ~1.7x since the
+# ~37-47min/2500-candidate baseline this schedule was tuned against), and
+# with no lock, multiple containers ended up scraping futbin concurrently -
+# multiplying effective request volume well past the level (concurrency=6
+# in a single process) already known to trigger sustained 429s/403s.
+OVERLAP_LOCK_KEY = 7741011
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
 
 # ---------------------------------------------------------------------------
@@ -645,6 +656,20 @@ async def _scrape_batch(pool, session, sem, rows, diag) -> None:
 
 
 async def crawl_once() -> None:
+    # Held on a dedicated connection (not one from the pool below) for the
+    # entire run - pg_advisory_lock/unlock are session-scoped, so the same
+    # connection must hold it start to finish. If a previous invocation is
+    # still in flight (a real sweep can now run well past the 10-minute
+    # Cron interval - see OVERLAP_LOCK_KEY's comment), this exits
+    # immediately rather than piling up a second concurrent scrape against
+    # futbin - a skip, not a failure, so __main__'s sys.exit(0) path is taken.
+    lock_conn = await asyncpg.connect(DATABASE_URL)
+    got_lock = await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", OVERLAP_LOCK_KEY)
+    if not got_lock:
+        log.info("Previous bin_sales_history_sync run still in flight - skipping this invocation.")
+        await lock_conn.close()
+        return
+
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=HISTORY_CONCURRENCY + 2)
     try:
         async with pool.acquire() as conn:
@@ -743,6 +768,8 @@ async def crawl_once() -> None:
             )
     finally:
         await pool.close()
+        await lock_conn.execute("SELECT pg_advisory_unlock($1)", OVERLAP_LOCK_KEY)
+        await lock_conn.close()
 
 
 # ================== ONE-SHOT ENTRY POINT ==================
