@@ -132,26 +132,34 @@ def test_looks_like_challenge(status, html, expected):
 # ---------------------------------------------------------------------------
 # Circuit breaker
 # ---------------------------------------------------------------------------
-def test_circuit_breaker_trips_on_403_threshold():
+def test_circuit_breaker_trips_on_blocked_navigation_threshold():
     diag = defaultdict(int)
     abort_event = asyncio.Event()
-    diag["http_403_hits"] = mod.HISTORY_403_ABORT_THRESHOLD - 1
+    diag["blocked_navigation_attempts"] = mod.HISTORY_403_ABORT_THRESHOLD - 1
     mod._check_circuit_breaker(diag, abort_event)
     assert not abort_event.is_set()
 
-    diag["http_403_hits"] += 1
+    diag["blocked_navigation_attempts"] += 1
     mod._check_circuit_breaker(diag, abort_event)
     assert abort_event.is_set()
     assert diag["circuit_breaker_tripped"] == 1
 
 
-def test_circuit_breaker_trips_on_combined_403_and_challenge():
+def test_circuit_breaker_does_not_double_count_one_challenged_navigation():
+    """A single Cloudflare-403-challenge navigation increments BOTH
+    http_403_hits and cloudflare_challenge_hits (see fetch_page_html) -
+    the breaker must count that as exactly one blocked attempt, not two,
+    so summing the two diagnostic-only counters must not be what trips
+    it."""
     diag = defaultdict(int)
     abort_event = asyncio.Event()
-    diag["http_403_hits"] = 2
-    diag["cloudflare_challenge_hits"] = mod.HISTORY_403_ABORT_THRESHOLD - 2
+    # One real blocked navigation below threshold, but the two diagnostic
+    # counters alone would (incorrectly, pre-fix) sum to the threshold.
+    diag["blocked_navigation_attempts"] = mod.HISTORY_403_ABORT_THRESHOLD - 1
+    diag["http_403_hits"] = mod.HISTORY_403_ABORT_THRESHOLD
+    diag["cloudflare_challenge_hits"] = mod.HISTORY_403_ABORT_THRESHOLD
     mod._check_circuit_breaker(diag, abort_event)
-    assert abort_event.is_set()
+    assert not abort_event.is_set()
 
 
 def test_circuit_breaker_trips_on_429_threshold():
@@ -165,13 +173,13 @@ def test_circuit_breaker_trips_on_429_threshold():
 def test_circuit_breaker_idempotent_once_tripped():
     diag = defaultdict(int)
     abort_event = asyncio.Event()
-    diag["http_403_hits"] = mod.HISTORY_403_ABORT_THRESHOLD
+    diag["blocked_navigation_attempts"] = mod.HISTORY_403_ABORT_THRESHOLD
     mod._check_circuit_breaker(diag, abort_event)
     assert diag["circuit_breaker_tripped"] == 1
 
     # Further calls (even with counts still over threshold) must not
     # re-trip/re-log - abort_event.is_set() short-circuits immediately.
-    diag["http_403_hits"] += 100
+    diag["blocked_navigation_attempts"] += 100
     mod._check_circuit_breaker(diag, abort_event)
     assert abort_event.is_set()
 
@@ -179,7 +187,7 @@ def test_circuit_breaker_idempotent_once_tripped():
 def test_circuit_breaker_does_not_trip_below_thresholds():
     diag = defaultdict(int)
     abort_event = asyncio.Event()
-    diag["http_403_hits"] = 1
+    diag["blocked_navigation_attempts"] = 1
     diag["http_429_hits"] = 1
     mod._check_circuit_breaker(diag, abort_event)
     assert not abort_event.is_set()
@@ -341,3 +349,22 @@ def test_fetch_market_page_url_is_market_not_sales():
 
 def test_no_aiohttp_import():
     assert "aiohttp" not in sys.modules or not hasattr(mod, "aiohttp")
+
+
+# ---------------------------------------------------------------------------
+# No custom/bot-identifying user-agent override on the browser context
+# ---------------------------------------------------------------------------
+def test_headers_constant_removed():
+    assert not hasattr(mod, "HEADERS")
+
+
+def test_new_context_has_no_user_agent_override():
+    import inspect
+
+    src = inspect.getsource(mod.crawl_once)
+    assert "new_context(" in src
+    # Check the actual kwarg usage, not just the substring "user_agent" -
+    # a nearby explanatory comment mentions it by name for context.
+    assert "user_agent=" not in src
+    assert 'locale="en-GB"' in src
+    assert '"width": 1440' in src
