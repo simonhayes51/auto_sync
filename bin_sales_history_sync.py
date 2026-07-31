@@ -171,27 +171,33 @@ CRON_INTERVAL_SECONDS = int(os.getenv("CRON_INTERVAL_SECONDS", "600"))
 # in a single process) already known to trigger sustained 429s/403s.
 OVERLAP_LOCK_KEY = 7741011
 
-_CHALLENGE_MARKERS = (
-    "just a moment",
-    "attention required",
-    "challenge-platform",
-    "cf-browser-verification",
-)
-
-
-def _looks_like_challenge(status: int, html: Optional[str]) -> bool:
+def _looks_like_challenge(status: int, title: Optional[str], body_excerpt: Optional[str]) -> bool:
     """A Cloudflare block/challenge, not real player HTML - never hand this
-    to a parser. Checked via response status plus HTML markers (checking
-    the HTML source also covers the page's <title> text, so no separate
-    page.title() call is needed)."""
+    to a parser. A 403 status is always a block, full stop.
+
+    For a 200 status, do NOT classify based on the full HTML containing
+    generic Cloudflare script/marker strings (e.g. "challenge-platform",
+    "cf-browser-verification") - real FUTBIN pages can embed Cloudflare's
+    own anti-bot JS even when NOT actively challenging, and that produced
+    false positives (confirmed live: a one-card test run with only 1 real
+    403 across 2 navigations still recorded cloudflare_challenge_hits=2,
+    because the old full-HTML substring check fired on both). Only strong,
+    page-level evidence counts here: an exact "Just a moment..."/
+    "Attention Required" title, or the explicit block message in the
+    visible body text - both read from the live page (page.title(),
+    page.locator("body").inner_text()), not the raw HTML source.
+    """
     if status == 403:
         return True
-    if not html:
+    if status != 200:
         return False
-    lower = html.lower()
-    if any(marker in lower for marker in _CHALLENGE_MARKERS):
+    title_norm = (title or "").strip().lower()
+    if title_norm == "just a moment...":
         return True
-    return "oops, there was an error" in lower and "403" in lower
+    if title_norm.startswith("attention required"):
+        return True
+    body_norm = (body_excerpt or "").strip().lower()
+    return "oops, there was an error - 403" in body_norm
 
 
 def _jittered_backoff(base: float) -> float:
@@ -248,8 +254,10 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
     tracking scripts can keep the network "busy" indefinitely, which would
     make networkidle hang or time out for reasons unrelated to whether the
     page we actually want already loaded). A Cloudflare challenge/block
-    page is detected via _looks_like_challenge() and never returned as
-    valid HTML, even if Cloudflare served it with a 200 status.
+    page is detected via _looks_like_challenge() (page title + a visible-
+    body excerpt, not a naive full-HTML substring scan - see its own
+    docstring for why) and never returned as valid HTML, even if
+    Cloudflare served it with a 200 status.
     """
     backoff = 1.0
     for attempt in range(HISTORY_MAX_RETRIES + 1):
@@ -276,7 +284,22 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
         except Exception:
             html = None
 
-        if _looks_like_challenge(status, html):
+        # Title/body-excerpt are only needed to disambiguate a 200 (a 403
+        # is already conclusively blocked via status alone - see
+        # _looks_like_challenge) - skip the extra page reads otherwise.
+        title = None
+        body_excerpt = None
+        if status == 200:
+            try:
+                title = await page.title()
+            except Exception:
+                title = None
+            try:
+                body_excerpt = (await page.locator("body").inner_text(timeout=2000))[:300]
+            except Exception:
+                body_excerpt = None
+
+        if _looks_like_challenge(status, title, body_excerpt):
             # One navigation, one blocked attempt - cloudflare_challenge_hits
             # and http_403_hits can both fire for the very same event (a
             # 403-status challenge page), so blocked_navigation_attempts is
@@ -287,6 +310,14 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
             diag["cloudflare_challenge_hits"] += 1
             if status == 403:
                 diag["http_403_hits"] += 1
+            # Once-per-run diagnostic sample (matches this file's existing
+            # sample-capture idiom, e.g. sales_market_fetch_sample) - not
+            # logged on every retry, just the first classified occurrence,
+            # so a real block is debuggable without spamming the log.
+            diag.setdefault(
+                "challenge_page_sample",
+                f"url={url} status={status} title={title!r} body_excerpt={body_excerpt!r}",
+            )
             if attempt < HISTORY_MAX_RETRIES:
                 await asyncio.sleep(_jittered_backoff(backoff))
                 backoff *= 2
@@ -1018,6 +1049,7 @@ async def crawl_once() -> None:
             log.info("Sales pipeline diagnostics: %s", {k: diag[k] for k in diagnostic_keys if diag.get(k)})
         for sample_key in (
             "sales_market_fetch_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
+            "challenge_page_sample",
         ):
             if sample_key in diag:
                 log.info("%s: %s", sample_key, diag[sample_key])
