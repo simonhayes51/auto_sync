@@ -352,19 +352,36 @@ def test_no_aiohttp_import():
 
 
 # ---------------------------------------------------------------------------
-# No custom/bot-identifying user-agent override on the browser context
+# Browser context mirrors the proven standalone test_futbin.py connectivity
+# test exactly (real Chrome UA, not the old bot-identifying string; same
+# viewport/locale) - that script gets a real 200 from the same home IP
+# where this worker was still getting 403'd.
 # ---------------------------------------------------------------------------
 def test_headers_constant_removed():
     assert not hasattr(mod, "HEADERS")
 
 
-def test_new_context_has_no_user_agent_override():
+def test_playwright_user_agent_is_not_bot_identifying():
+    ua = mod.PLAYWRIGHT_USER_AGENT.lower()
+    assert "sbcsolver" not in ua
+    assert "bot" not in ua
+    assert "chrome" in ua
+
+
+def test_new_context_uses_real_chrome_user_agent_and_matching_viewport():
     import inspect
 
     src = inspect.getsource(mod.crawl_once)
     assert "new_context(" in src
-    # Check the actual kwarg usage, not just the substring "user_agent" -
-    # a nearby explanatory comment mentions it by name for context.
-    assert "user_agent=" not in src
+    assert "user_agent=PLAYWRIGHT_USER_AGENT" in src
     assert 'locale="en-GB"' in src
-    assert '"width": 1440' in src
+    assert '"width": 1365' in src
+    assert '"height": 768' in src
+
+
+def test_no_route_blocking_storage_state_or_request_api():
+    import inspect
+
+    src = inspect.getsource(mod)
+    for forbidden in (".route(", "storage_state", "java_script_enabled", ".request."):
+        assert forbidden not in src, f"found disallowed pattern: {forbidden}"
