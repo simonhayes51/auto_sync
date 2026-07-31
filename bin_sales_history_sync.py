@@ -200,39 +200,54 @@ def _num(txt: str) -> int:
 
 def parse_lowest_bin(html: str, platform: str, diag: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """
-    platform-ps-only/platform-pc-only aren't exclusive to the price widget -
-    futbin reuses those same classes for the bio text, stats sections, etc.
-    (confirmed live: this is the exact convention parse_bio_stats below also
-    relies on). Searching the WHOLE page for the first element with that
-    class - which is what this used to do - often lands on a non-price
-    section first, then silently falls through to a shared fallback that
-    isn't platform-scoped at all, returning the same value for both
-    platforms. Scope to the price box FIRST, then look for the
-    platform-specific element inside it, so we're never matching some other
-    part of the page.
+    Confirmed live 2026-07-31 via real browser-captured HTML: each
+    platform gets its own top-level price-box div (class="price-box
+    platform-ps-only price-box-original-player" / "...platform-pc-only
+    ..."), not one shared box with nested per-platform children - the
+    platform marker is a class ON the box itself, not a descendant's.
+    The previous version here scoped to the FIRST price-box div in the
+    whole page (always the same one, regardless of which platform was
+    requested), then searched for a DESCENDANT with the platform class -
+    which never matched, since that class is on the box itself, not a
+    child. Confirmed via 10 hours of real production logs: this made
+    bin_platform_scoped_hit == 0 on every single run, so every price
+    this scraper has ever recorded came from the (explicitly not
+    platform-scoped) fallback below - the reason PS and PC prices have
+    always come out identical.
+
+    Select the box whose OWN class list contains the platform marker
+    (bs4's plain-string class_ argument matches an exact class TOKEN,
+    not a substring - matters here since sibling classes like
+    "price-box-original-player" share a "price-box" prefix). The actual
+    price value is a child div whose exact class token is "price" -
+    exact-token matching (not a \\bprice\\b regex) avoids falsely
+    matching "price-header"/"price-box-full-width"/etc, which a
+    word-boundary regex would also match (a hyphen counts as a boundary).
     """
     soup = BeautifulSoup(html, "html.parser")
     plat_class = _PLATFORM_CLASS.get(platform, "platform-ps-only")
 
-    box = (
-        soup.find("div", class_=re.compile(r"price[- ]?box", re.I))
-        or soup.find("div", class_=re.compile(r"price-box-original-player", re.I))
-    )
+    box = None
+    for candidate in soup.find_all("div", class_="price-box"):
+        if plat_class in (candidate.get("class") or []):
+            box = candidate
+            break
+
     if box:
-        cell = box.find(class_=re.compile(rf"\b{plat_class}\b"))
-        if cell:
-            price_div = cell.find("div", class_=re.compile(r"\bprice\b"))
-            val = _num((price_div or cell).get_text(strip=True))
+        price_div = box.find("div", class_="price")
+        if price_div:
+            val = _num(price_div.get_text(strip=True))
             if val:
                 if diag is not None:
                     diag["bin_platform_scoped_hit"] += 1
                 return val
 
-    # Last-resort fallback only - NOT platform-scoped, so it can return the
-    # same value for both ps and pc if reached. Kept so a markup variant
-    # without the expected classes still yields something rather than
-    # nothing, but every hit here is logged so this staying at 0 (or not)
-    # is visible in the run summary instead of silently masking bad data.
+    # Last-resort fallback only - NOT platform-scoped if `box` above
+    # wasn't found (falls back to the whole page), so it can return the
+    # same value for both ps and pc in that case. Kept so a further
+    # markup change still yields something rather than nothing, but
+    # every hit here is logged so this staying at 0 (or not) is visible
+    # in the run summary instead of silently masking bad data.
     if diag is not None:
         diag["bin_platform_fallback_used"] += 1
     box = box or soup
