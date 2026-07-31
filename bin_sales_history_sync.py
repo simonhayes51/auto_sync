@@ -35,15 +35,22 @@ scheduling loop anymore. Each invocation:
 Nothing is ever deleted. A per-player failure is logged and skipped; it
 never aborts the run for the rest of the batch.
 
-Confirmed against a real "Player Sales History" table (futbin.com/26/sales/{id}/{slug}?platform=ps):
-columns are Date | Listed For | Sold For | EA Tax | Net Price | Type, in
-that order, with EA Tax and Net Price already computed by futbin itself -
-all four figures are read straight from their own columns (tds[1..4]) rather
-than re-derived, so this stores exactly what futbin displays. In every
+Confirmed against a real "Player Sales History" table: columns are Date |
+Listed For | Sold For | EA Tax | Net Price | Type, in that order, with EA
+Tax and Net Price already computed by futbin itself - all four figures
+are read straight from their own columns (tds[1..4]) rather than
+re-derived, so this stores exactly what futbin displays. In every
 observed row Listed For equals Sold For, consistent with FUT's own market
 mechanics (a completed sale always settles at its Buy-Now listed price,
 there's no partial-bid/negotiation mechanic) - but the real column is what's
 stored, not an assumption of equality.
+
+The dedicated futbin.com/26/sales/{id}/{slug} endpoint that table used to
+live on is now blocked by Cloudflare and is never requested - the same
+table is confirmed present inline on the /market page
+(player_url + "/market", already fetched here for other reasons), so
+sales history is parsed straight from that page's HTML instead (see
+fetch_market_page/parse_market_page below).
 """
 import os
 import re
@@ -275,8 +282,8 @@ def parse_lowest_bin(html: str, platform: str, diag: Optional[Dict[str, Any]] = 
 # twice, once per platform, in platform-ps-only/platform-pc-only spans -
 # the same convention already used for BIN price on this page. This data
 # only lives on the main player page (not /market or the sales page), so
-# it piggybacks on the same fetch fetch_lowest_bin already makes rather
-# than costing an extra request.
+# it piggybacks on the same player-page fetch _scrape_one already makes
+# for BIN price rather than costing an extra request.
 _BIO_GAMES_GOALS_RE = re.compile(r"used in ([\d,]+) games with a GPG \(goals per game\) of (\d+(?:\.\d+)?)\.")
 _BIO_CHEM_RE = re.compile(r"best chemistry style for \w+ is ([A-Za-z][A-Za-z \-]*?)\.")
 
@@ -304,55 +311,6 @@ def parse_bio_stats(html: str, platform: str) -> Dict[str, Any]:
             top_chem_style = m.group(1).strip()
 
     return {"games": games, "avg_goals": avg_goals, "top_chem_style": top_chem_style}
-
-
-async def fetch_lowest_bin(
-    session: aiohttp.ClientSession, player_url: str, platform: str, diag: Dict[str, Any]
-) -> "tuple[Optional[int], Dict[str, Any]]":
-    status, html = await _get_with_retry(session, player_url, diag)
-    if status != 200 or html is None:
-        return None, {}
-    return parse_lowest_bin(html, platform, diag), parse_bio_stats(html, platform)
-
-
-async def _resolve_sales_path(
-    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int]
-) -> Optional[str]:
-    market_url = player_url.rstrip("/") + "/market"
-    status, html = await _get_with_retry(session, market_url, diag)
-    if status != 200 or html is None:
-        diag["sales_market_fetch_failed"] += 1
-        diag.setdefault("sales_market_fetch_sample", f"status={status} url={market_url}")
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    a = soup.find("a", class_=re.compile(r"\bmarket-grid-lates-sale-link\b"))
-    if not a or not a.get("href"):
-        diag["sales_no_history_link"] += 1
-        diag.setdefault("sales_no_history_link_sample", f"html_len={len(html)} url={market_url}")
-        return None
-    return a["href"].split("?")[0]
-
-
-async def _sales_url(
-    session: aiohttp.ClientSession, player_url: str, platform: str, diag: Dict[str, int]
-) -> Optional[str]:
-    fb_plat = "pc" if platform == "pc" else "ps"
-    path = await _resolve_sales_path(session, player_url, diag)
-    if path:
-        return f"https://www.futbin.com{path}?platform={fb_plat}"
-    # No naive "/player/ -> /sales/" fallback: confirmed live that this
-    # collides with unrelated cards for brand-new cards whose /market page
-    # has no "latest sale" link yet - the numeric id does NOT reliably
-    # mean the same card across both URL namespaces, contrary to what this
-    # fallback used to assume. Real incident: a 97 Star Performer Mbappé
-    # and several new TOTW cards each recorded real, internally-consistent
-    # sales (correct EA tax math) for a DIFFERENT, unrelated card, because
-    # this fallback guessed a URL instead of confirming one. No sales data
-    # is a correct "we don't know yet" state; a wrong number silently
-    # accumulated into sales_history forever is not.
-    diag["sales_no_history_link_no_fallback"] += 1
-    return None
 
 
 def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -439,19 +397,42 @@ def parse_sales_table(html: str, diag: Dict[str, int], limit: int = 30) -> List[
     return sales
 
 
-async def fetch_sales_history(
-    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int], platform: str = "ps"
-) -> List[Dict[str, Any]]:
-    url = await _sales_url(session, player_url, platform, diag)
-    if not url:
-        return []
-    diag.setdefault("sales_first_resolved_url", url)
-    status, html = await _get_with_retry(session, url, diag)
-    if status != 200 or html is None:
-        diag["sales_page_fetch_failed"] += 1
-        diag.setdefault("sales_page_fetch_sample", f"status={status} url={url}")
-        return []
-    return parse_sales_table(html, diag)
+async def fetch_market_page(
+    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int]
+) -> "tuple[int, Optional[str]]":
+    """The dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked -
+    confirmed the /market page (already fetched here previously, only to
+    find the "latest sale" link that pointed at /sales/...) contains the
+    full Player Sales History table inline, so that endpoint is never
+    requested at all anymore. One fetch replaces the old two-hop
+    market-page-for-a-link + dedicated-sales-page dance."""
+    market_url = player_url.rstrip("/") + "/market"
+    return await _get_with_retry(session, market_url, diag)
+
+
+def parse_market_prices(html: str, diag: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[int]]:
+    """BIN prices as they'd be read from the /market page, reusing the
+    already-correct, real-HTML-verified parse_lowest_bin. NOT currently
+    wired in as a live BIN source anywhere - the /market page's price-box
+    markup has never been confirmed against real captured HTML the way
+    the player page's was (see parse_lowest_bin's own docstring for that
+    verification history), so BIN stays sourced from the player page.
+    Kept available for a future follow-up once that's confirmed."""
+    return {
+        "ps": parse_lowest_bin(html, "ps", diag),
+        "pc": parse_lowest_bin(html, "pc", diag),
+    }
+
+
+def parse_market_page(html: str, diag: Dict[str, int]) -> Dict[str, Any]:
+    """Single entry point for everything this scraper reads off the
+    /market page. Only "sales" is consumed by _scrape_one today; "prices"
+    exists for the same not-yet-verified reason documented on
+    parse_market_prices()."""
+    return {
+        "prices": parse_market_prices(html, diag),
+        "sales": parse_sales_table(html, diag),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -544,24 +525,38 @@ async def _scrape_one(
         # cards). backend's migration 036 now filters NULLs out
         # defensively too, but the correct fix is here: never claim to
         # have observed a price we didn't actually get.
+        # Both platforms' price-box divs live on the one player-page fetch
+        # (confirmed against real captured HTML - see parse_lowest_bin's
+        # docstring), so this used to fetch the identical player_url twice
+        # (once "for ps", once "for pc") for no reason - one fetch, parsed
+        # twice against the same HTML, halves this request.
         bio_by_platform: Dict[str, Dict[str, Any]] = {}
-        for platform in ("ps", "pc"):
-            try:
-                bin_price, bio_stats = await fetch_lowest_bin(session, player_url, platform, diag)
-                bio_by_platform[platform] = bio_stats
-                if bin_price is not None:
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
-                            "VALUES ($1, $2, $3, NOW())",
-                            card_id, platform, bin_price,
-                        )
-                    diag["bin_price_found"] += 1
-                else:
-                    diag["bin_price_null"] += 1
-            except Exception as e:
-                diag["bin_failed"] += 1
-                log.warning("BIN scrape failed for card_id=%s platform=%s: %s", card_id, platform, e)
+        try:
+            status, player_html = await _get_with_retry(session, player_url, diag)
+        except Exception as e:
+            status, player_html = 0, None
+            log.warning("Player page fetch failed for card_id=%s: %s", card_id, e)
+
+        if status != 200 or player_html is None:
+            diag["bin_failed"] += 2  # both platforms, one shared fetch failed
+        else:
+            for platform in ("ps", "pc"):
+                try:
+                    bin_price = parse_lowest_bin(player_html, platform, diag)
+                    bio_by_platform[platform] = parse_bio_stats(player_html, platform)
+                    if bin_price is not None:
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
+                                "VALUES ($1, $2, $3, NOW())",
+                                card_id, platform, bin_price,
+                            )
+                        diag["bin_price_found"] += 1
+                    else:
+                        diag["bin_price_null"] += 1
+                except Exception as e:
+                    diag["bin_failed"] += 1
+                    log.warning("BIN parse failed for card_id=%s platform=%s: %s", card_id, platform, e)
 
         # --- Bio stats: games played / avg goals / top chem style, parsed
         # from the same page fetched above - zero extra requests. Only
@@ -597,9 +592,21 @@ async def _scrape_one(
                 diag["bio_stats_failed"] += 1
                 log.warning("Bio stats update failed for card_id=%s: %s", card_id, e)
 
-        # --- Sales history: dedupe on (player_id, sold_at, sold_price) ---
+        # --- Sales history: parsed directly from the /market page (the
+        # dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked;
+        # the /market page already contains the full auctions-table inline,
+        # so this is one fetch, no link-following, no second request) -
+        # dedupe on (player_id, sold_at, sold_price) ---
         try:
-            sales = await fetch_sales_history(session, player_url, diag, "ps")
+            status, market_html = await fetch_market_page(session, player_url, diag)
+            if status != 200 or market_html is None:
+                diag["sales_market_fetch_failed"] += 1
+                diag.setdefault(
+                    "sales_market_fetch_sample",
+                    f"status={status} url={player_url.rstrip('/')}/market",
+                )
+                return
+            sales = parse_sales_table(market_html, diag)
         except Exception as e:
             diag["sales_failed"] += 1
             log.warning("Sales scrape failed for card_id=%s: %s", card_id, e)
@@ -745,15 +752,13 @@ async def crawl_once() -> None:
         # other than a clean "no history yet" is going on, so a healthy run
         # doesn't spam the log with a wall of zeros.
         diagnostic_keys = [
-            "sales_market_fetch_failed", "sales_no_history_link", "sales_used_fallback_url",
-            "sales_no_url_at_all", "sales_page_fetch_failed", "sales_no_table", "sales_no_tbody",
+            "sales_market_fetch_failed", "sales_no_table", "sales_no_tbody",
             "sales_rows_too_few_tds", "sales_rows_not_sold", "sales_rows_bad_date", "sales_rows_zero_price",
         ]
         if any(diag.get(k) for k in diagnostic_keys):
             log.info("Sales pipeline diagnostics: %s", {k: diag[k] for k in diagnostic_keys if diag.get(k)})
         for sample_key in (
-            "sales_first_resolved_url", "sales_market_fetch_sample", "sales_no_history_link_sample",
-            "sales_page_fetch_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
+            "sales_market_fetch_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
         ):
             if sample_key in diag:
                 log.info("%s: %s", sample_key, diag[sample_key])
