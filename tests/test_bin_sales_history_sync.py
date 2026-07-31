@@ -23,6 +23,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import pytest
+from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # The module raises at import time if DATABASE_URL is unset (same
@@ -109,24 +110,75 @@ def test_parse_sales_table_missing_table():
 
 
 # ---------------------------------------------------------------------------
-# Cloudflare challenge detection
+# Cloudflare challenge detection - title + visible-body-excerpt based, NOT
+# a full-HTML substring scan (that scan produced false positives: a real
+# FUTBIN page can embed Cloudflare's own anti-bot JS even when not
+# actively challenging - confirmed live, see _looks_like_challenge's
+# docstring).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "status,html,expected",
+    "status,title,body_excerpt,expected",
     [
-        (403, "<html><body>anything</body></html>", True),
-        (200, "<html><title>Just a moment...</title></html>", True),
-        (200, "<html><body>Attention Required! | Cloudflare</body></html>", True),
-        (200, '<html><body><div class="challenge-platform"></div></body></html>', True),
-        (200, "<html><body>cf-browser-verification</body></html>", True),
-        (403, None, True),
-        (200, "<html><body>Oops, there was an error - 403</body></html>", True),
-        (200, "<html><body>real player page content</body></html>", False),
-        (200, None, False),
+        (403, None, None, True),
+        (403, "anything", "anything", True),
+        (200, "Just a moment...", None, True),
+        (200, "  JUST A MOMENT...  ", None, True),  # case/whitespace-insensitive
+        (200, "Attention Required! | Cloudflare", None, True),
+        (200, None, "Oops, there was an error - 403 - please try again later", True),
+        (200, "Kenan Yıldız - FUTBIN", None, False),
+        (200, None, None, False),
+        (200, "Some other page", "nothing suspicious here", False),
     ],
 )
-def test_looks_like_challenge(status, html, expected):
-    assert mod._looks_like_challenge(status, html) is expected
+def test_looks_like_challenge(status, title, body_excerpt, expected):
+    assert mod._looks_like_challenge(status, title, body_excerpt) is expected
+
+
+def test_looks_like_challenge_ignores_cloudflare_script_markers_in_a_real_page():
+    """Regression test: a real, valid player page's raw HTML can embed
+    Cloudflare's own script tags (e.g. mentioning "challenge-platform" or
+    "cf-browser-verification") purely as normal anti-bot tooling, without
+    the page actually being a block/challenge. Since _looks_like_challenge
+    only ever looks at title/body-excerpt (extracted from the live page,
+    not the raw HTML source), these markers being present in <script>
+    tags elsewhere in the document must never affect the result - this is
+    exactly the false-positive class that a naive full-HTML substring scan
+    produced live (a one-card test recorded 2 challenge hits for only 1
+    real 403 across 2 navigations).
+
+    Synthetic fixture (no real captured Pogba HTML exists in this sandbox -
+    see the module-level fixture note at the top of this file) shaped like
+    a real player page: a real <title>, a real visible body excerpt, and
+    an embedded Cloudflare script block containing both marker strings.
+    """
+    synthetic_pogba_html = """
+    <html>
+      <head>
+        <title>Paul Pogba - FUTBIN</title>
+        <script>
+          // Cloudflare's own anti-bot tooling, present on real pages too
+          window.__CF$cv$params = {r: 'challenge-platform', t: 'cf-browser-verification'};
+        </script>
+      </head>
+      <body>
+        <div class="price-box platform-ps-only price-box-original-player">
+          <div class="price inline-with-icon lowest-price-1">120,000</div>
+        </div>
+        <p>Paul Pogba is a French footballer...</p>
+      </body>
+    </html>
+    """
+    soup = BeautifulSoup(synthetic_pogba_html, "html.parser")
+    title = soup.title.get_text(strip=True)
+    body_excerpt = soup.body.get_text(" ", strip=True)[:300]
+
+    # Sanity check the fixture actually contains the markers that used to
+    # false-positive, so this test would have failed against the old
+    # full-HTML-scan implementation.
+    assert "challenge-platform" in synthetic_pogba_html
+    assert "cf-browser-verification" in synthetic_pogba_html
+
+    assert mod._looks_like_challenge(200, title, body_excerpt) is False
 
 
 # ---------------------------------------------------------------------------
