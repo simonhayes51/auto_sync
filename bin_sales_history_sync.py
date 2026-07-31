@@ -51,12 +51,31 @@ table is confirmed present inline on the /market page
 (player_url + "/market", already fetched here for other reasons), so
 sales history is parsed straight from that page's HTML instead (see
 fetch_market_page/parse_market_page below).
+
+Transport: plain aiohttp now gets an HTTP 403 Cloudflare challenge on
+every request (confirmed live - a 10-player test produced bin_price_found=0,
+sales_market_fetch_failed=10, status=403), while a real Playwright
+Chromium session loads the same pages successfully from the same
+connection. All FUTBIN page loads go through one persistent Chromium
+browser context per run (see crawl_once()) and a small pool of reusable
+pages (PLAYWRIGHT_CONCURRENCY, default 1) instead of an aiohttp
+ClientSession - see fetch_page_html() below. A run-level circuit breaker
+(HISTORY_403_ABORT_THRESHOLD/HISTORY_429_ABORT_THRESHOLD) stops scheduling
+new work if FUTBIN starts hard-blocking mid-run.
+
+For a local manual test against a small batch:
+    $env:TEST_LIMIT="10"
+    $env:PLAYWRIGHT_CONCURRENCY="1"
+    $env:PLAYWRIGHT_HEADLESS="false"
+    python bin_sales_history_sync.py
+TEST_LIMIT=0 (the default) preserves full, unmodified production behavior.
 """
 import os
 import re
 import sys
 import asyncio
 import logging
+import random
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -66,8 +85,8 @@ _FUTBIN_TZ = ZoneInfo("Europe/London")
 from typing import Any, Dict, List, Optional
 
 import asyncpg
-import aiohttp
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from monitoring import heartbeat, alert
 
@@ -78,14 +97,47 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not found!")
 
-# Lowered from 6 to 3 after the first run against the real Gold Rare
-# population (2463 candidates, up to 4 requests each) got rate-limited
-# (HTTP 429) by futbin. With _get_with_retry's backoff now absorbing 429s,
-# nudged back up to 5 to shrink the ~37min crawl time (the real bottleneck
-# on cadence, not the 10min sleep) - watch http_429_hits after this change.
-HISTORY_CONCURRENCY = int(os.getenv("HISTORY_CONCURRENCY", "5"))
 HISTORY_MAX_RETRIES = int(os.getenv("HISTORY_MAX_RETRIES", "3"))
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# A real Playwright Chromium session loads FUTBIN pages successfully where
+# plain aiohttp now gets Cloudflare 403s on every request (confirmed live -
+# see the module docstring). One persistent browser context per run, with a
+# small pool of pre-opened pages, replaces the old aiohttp ClientSession -
+# HISTORY_CONCURRENCY (the old semaphore size) is retired in favor of this
+# pool's size, since page count is now the real concurrency ceiling.
+#
+# PLAYWRIGHT_HEADLESS is deliberately NOT given a hardcoded default here:
+# this repo already tried Playwright for a different FUTBIN worker
+# (futbin_sbc_sync.py, see README.md section 6) and found headless
+# Chromium ALSO gets 403'd, and headed Chromium is additionally blocked
+# outright when the request comes from Railway's own datacentre IP - only
+# working from a home/residential connection. Whether this worker ends up
+# running headless, headed, or off-Railway entirely is an open question
+# this change deliberately does not prejudge - if the env var is unset,
+# Playwright's own upstream default applies (headless), not a "production"
+# assumption encoded in this file.
+PLAYWRIGHT_CONCURRENCY = int(os.getenv("PLAYWRIGHT_CONCURRENCY", "1"))
+_PLAYWRIGHT_HEADLESS_RAW = os.getenv("PLAYWRIGHT_HEADLESS")
+PLAYWRIGHT_HEADLESS = (
+    _PLAYWRIGHT_HEADLESS_RAW.strip().lower() in ("1", "true", "yes")
+    if _PLAYWRIGHT_HEADLESS_RAW is not None
+    else None
+)
+PLAYWRIGHT_NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "20000"))
+
+# Run-level circuit breaker (item 8): a hard Cloudflare block shows up as a
+# burst of 403s/challenge pages, not the 429 rate-limit this file was
+# originally tuned around - stop scheduling new work well before grinding
+# through the whole candidate list against a site that's actively blocking
+# this IP/session.
+HISTORY_403_ABORT_THRESHOLD = int(os.getenv("HISTORY_403_ABORT_THRESHOLD", "5"))
+HISTORY_429_ABORT_THRESHOLD = int(os.getenv("HISTORY_429_ABORT_THRESHOLD", "20"))
+
+# 0 = full production behavior (no limit). Set >0 to cap each tier's
+# candidate count for a local manual test run (see README/module docstring
+# for the exact PowerShell invocation). Bound as a real SQL parameter in
+# _fetch_tier() below - never string-interpolated.
+TEST_LIMIT = int(os.getenv("TEST_LIMIT", "0"))
 
 # How often this script is actually invoked - purely a phase-math input for
 # _tier_b_due() below, not an in-process sleep interval (this became a
@@ -106,6 +158,32 @@ CRON_INTERVAL_SECONDS = int(os.getenv("CRON_INTERVAL_SECONDS", "600"))
 OVERLAP_LOCK_KEY = 7741011
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
+
+_CHALLENGE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "challenge-platform",
+    "cf-browser-verification",
+)
+
+
+def _looks_like_challenge(status: int, html: Optional[str]) -> bool:
+    """A Cloudflare block/challenge, not real player HTML - never hand this
+    to a parser. Checked via response status plus HTML markers (checking
+    the HTML source also covers the page's <title> text, so no separate
+    page.title() call is needed)."""
+    if status == 403:
+        return True
+    if not html:
+        return False
+    lower = html.lower()
+    if any(marker in lower for marker in _CHALLENGE_MARKERS):
+        return True
+    return "oops, there was an error" in lower and "403" in lower
+
+
+def _jittered_backoff(base: float) -> float:
+    return base * random.uniform(0.5, 1.5)
 
 # ---------------------------------------------------------------------------
 # Tiered coverage
@@ -147,40 +225,111 @@ _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
 
 
-async def _get_with_retry(
-    session: aiohttp.ClientSession, url: str, diag: Dict[str, Any]
-) -> "tuple[int, Optional[str]]":
-    """GET with 429-aware backoff retry.
+async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, Optional[str]]":
+    """Loads `url` in a real Playwright Chromium page and returns
+    (status, html) - the direct replacement for the old aiohttp-based
+    _get_with_retry, same retry-count/doubling-backoff shape (now with
+    jitter) and same (status, html-or-None) contract, so every call site
+    below is otherwise unchanged.
 
-    A run against the real ~2500-card Gold Rare population (up to 4 requests
-    each) got HTTP 429s back from futbin - this is a rate limit, not a hard
-    block like fut.gg's 403, so it's worth backing off and retrying rather
-    than counting the very first 429 as a permanent failure for that player.
+    wait_until="domcontentloaded" (never "networkidle" - FUTBIN's ads and
+    tracking scripts can keep the network "busy" indefinitely, which would
+    make networkidle hang or time out for reasons unrelated to whether the
+    page we actually want already loaded). A Cloudflare challenge/block
+    page is detected via _looks_like_challenge() and never returned as
+    valid HTML, even if Cloudflare served it with a 200 status.
     """
     backoff = 1.0
     for attempt in range(HISTORY_MAX_RETRIES + 1):
         try:
-            async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
-                if r.status == 429:
-                    diag["http_429_hits"] += 1
-                    if attempt < HISTORY_MAX_RETRIES:
-                        retry_after = r.headers.get("Retry-After")
-                        wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
-                        await asyncio.sleep(wait)
-                        backoff *= 2
-                        continue
-                    return 429, None
-                if r.status != 200:
-                    return r.status, None
-                return 200, await r.text()
-        except Exception:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            diag["browser_timeouts"] += 1
             if attempt < HISTORY_MAX_RETRIES:
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(_jittered_backoff(backoff))
                 backoff *= 2
                 continue
-            diag["http_exceptions"] += 1
             return 0, None
+        except Exception:
+            diag["browser_navigation_failures"] += 1
+            if attempt < HISTORY_MAX_RETRIES:
+                await asyncio.sleep(_jittered_backoff(backoff))
+                backoff *= 2
+                continue
+            return 0, None
+
+        status = response.status if response else 0
+        try:
+            html = await page.content()
+        except Exception:
+            html = None
+
+        if _looks_like_challenge(status, html):
+            diag["cloudflare_challenge_hits"] += 1
+            if status == 403:
+                diag["http_403_hits"] += 1
+            if attempt < HISTORY_MAX_RETRIES:
+                await asyncio.sleep(_jittered_backoff(backoff))
+                backoff *= 2
+                continue
+            return status or 403, None
+
+        if status == 429:
+            diag["http_429_hits"] += 1
+            if attempt < HISTORY_MAX_RETRIES:
+                await asyncio.sleep(_jittered_backoff(backoff))
+                backoff *= 2
+                continue
+            return 429, None
+
+        if status != 200:
+            if attempt < HISTORY_MAX_RETRIES:
+                await asyncio.sleep(_jittered_backoff(backoff))
+                backoff *= 2
+                continue
+            return status, None
+
+        return 200, html
     return 0, None
+
+
+async def _dismiss_cookie_banner(page) -> None:
+    """Best-effort, once per run (see crawl_once) - OneTrust's overlay can
+    intercept clicks on some layouts. Navigation itself doesn't need it
+    (nothing here clicks a Market tab; /market is always a direct goto),
+    so this is purely a courtesy and never allowed to fail the scrape."""
+    try:
+        btn = page.locator("#onetrust-accept-btn-handler")
+        if await btn.count() > 0:
+            await btn.click(timeout=2000)
+    except Exception:
+        pass
+
+
+def _check_circuit_breaker(diag: Dict[str, Any], abort_event: asyncio.Event) -> None:
+    """Trips the shared abort_event once either threshold is crossed - a
+    burst of 403s/challenge pages (a hard block) or 429s (rate limiting)
+    across the whole run, not per-card. Idempotent: does nothing once
+    already tripped, so concurrent workers calling this don't re-log."""
+    if abort_event.is_set():
+        return
+    combined_blocked = diag["http_403_hits"] + diag["cloudflare_challenge_hits"]
+    if combined_blocked >= HISTORY_403_ABORT_THRESHOLD:
+        abort_event.set()
+        diag["circuit_breaker_tripped"] = 1
+        log.warning(
+            "Circuit breaker tripped: %d combined 403/challenge hits >= threshold %d - "
+            "stopping new work, letting in-flight work finish.",
+            combined_blocked, HISTORY_403_ABORT_THRESHOLD,
+        )
+    elif diag["http_429_hits"] >= HISTORY_429_ABORT_THRESHOLD:
+        abort_event.set()
+        diag["circuit_breaker_tripped"] = 1
+        log.warning(
+            "Circuit breaker tripped: %d HTTP 429s >= threshold %d - "
+            "stopping new work, letting in-flight work finish.",
+            diag["http_429_hits"], HISTORY_429_ABORT_THRESHOLD,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -397,9 +546,7 @@ def parse_sales_table(html: str, diag: Dict[str, int], limit: int = 30) -> List[
     return sales
 
 
-async def fetch_market_page(
-    session: aiohttp.ClientSession, player_url: str, diag: Dict[str, int]
-) -> "tuple[int, Optional[str]]":
+async def fetch_market_page(page, player_url: str, diag: Dict[str, int]) -> "tuple[int, Optional[str]]":
     """The dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked -
     confirmed the /market page (already fetched here previously, only to
     find the "latest sale" link that pointed at /sales/...) contains the
@@ -407,7 +554,7 @@ async def fetch_market_page(
     requested at all anymore. One fetch replaces the old two-hop
     market-page-for-a-link + dedicated-sales-page dance."""
     market_url = player_url.rstrip("/") + "/market"
-    return await _get_with_retry(session, market_url, diag)
+    return await fetch_page_html(page, market_url, diag)
 
 
 def parse_market_prices(html: str, diag: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[int]]:
@@ -493,150 +640,152 @@ async def ensure_tables(conn: asyncpg.Connection) -> None:
 # ---------------------------------------------------------------------------
 async def _scrape_one(
     pool: asyncpg.Pool,
-    session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
+    page,
     card_id: int,
     player_url: str,
     diag: Dict[str, Any],
+    abort_event: asyncio.Event,
 ) -> None:
-    async with sem:
-        # This script trusts fut_players.player_url completely - it has no
-        # site of its own to fetch from. If the main futbin_full_sync.py
-        # worker hasn't (re)crawled a given row since before the futbin
-        # migration, that column can still hold an old fut.gg URL, which
-        # 403s on every request (fut.gg blocks scrapers - the whole reason
-        # this project moved to futbin). Catch that up front with zero
-        # requests wasted, instead of taking a market-page fetch + a sales
-        # fetch to eventually surface a generic 403.
-        if "futbin.com" not in player_url:
-            diag["stale_non_futbin_url"] += 1
-            diag.setdefault("stale_non_futbin_url_sample", f"card_id={card_id} url={player_url}")
-            return
+    # This script trusts fut_players.player_url completely - it has no
+    # site of its own to fetch from. If the main futbin_full_sync.py
+    # worker hasn't (re)crawled a given row since before the futbin
+    # migration, that column can still hold an old fut.gg URL, which
+    # 403s on every request (fut.gg blocks scrapers - the whole reason
+    # this project moved to futbin). Catch that up front with zero
+    # requests wasted, instead of taking a market-page fetch + a sales
+    # fetch to eventually surface a generic 403.
+    if "futbin.com" not in player_url:
+        diag["stale_non_futbin_url"] += 1
+        diag.setdefault("stale_non_futbin_url_sample", f"card_id={card_id} url={player_url}")
+        return
 
-        # --- BIN history: both markets, only insert a real observation ---
-        # Used to always insert regardless of whether a price was found -
-        # a failed/blocked fetch (futbin 403/429) wrote a NULL lowest_bin
-        # row just as "successfully" as a real number, and since
-        # backend's fair_value_mv picks its current_bin from the single
-        # MOST RECENT bin_history row per card with no NULL check, a bad
-        # scraper run could silently overwrite everyone's real price with
-        # NULL pool-wide (confirmed live: a run that got 403/429'd on
-        # nearly every request wiped current_bin for all 3,147 tracked
-        # cards). backend's migration 036 now filters NULLs out
-        # defensively too, but the correct fix is here: never claim to
-        # have observed a price we didn't actually get.
-        # Both platforms' price-box divs live on the one player-page fetch
-        # (confirmed against real captured HTML - see parse_lowest_bin's
-        # docstring), so this used to fetch the identical player_url twice
-        # (once "for ps", once "for pc") for no reason - one fetch, parsed
-        # twice against the same HTML, halves this request.
-        bio_by_platform: Dict[str, Dict[str, Any]] = {}
-        try:
-            status, player_html = await _get_with_retry(session, player_url, diag)
-        except Exception as e:
-            status, player_html = 0, None
-            log.warning("Player page fetch failed for card_id=%s: %s", card_id, e)
+    # --- BIN history: both markets, only insert a real observation ---
+    # Used to always insert regardless of whether a price was found -
+    # a failed/blocked fetch (futbin 403/429) wrote a NULL lowest_bin
+    # row just as "successfully" as a real number, and since
+    # backend's fair_value_mv picks its current_bin from the single
+    # MOST RECENT bin_history row per card with no NULL check, a bad
+    # scraper run could silently overwrite everyone's real price with
+    # NULL pool-wide (confirmed live: a run that got 403/429'd on
+    # nearly every request wiped current_bin for all 3,147 tracked
+    # cards). backend's migration 036 now filters NULLs out
+    # defensively too, but the correct fix is here: never claim to
+    # have observed a price we didn't actually get.
+    # Both platforms' price-box divs live on the one player-page fetch
+    # (confirmed against real captured HTML - see parse_lowest_bin's
+    # docstring), so this used to fetch the identical player_url twice
+    # (once "for ps", once "for pc") for no reason - one fetch, parsed
+    # twice against the same HTML, halves this request.
+    bio_by_platform: Dict[str, Dict[str, Any]] = {}
+    try:
+        status, player_html = await fetch_page_html(page, player_url, diag)
+    except Exception as e:
+        status, player_html = 0, None
+        log.warning("Player page fetch failed for card_id=%s: %s", card_id, e)
+    _check_circuit_breaker(diag, abort_event)
 
-        if status != 200 or player_html is None:
-            diag["bin_failed"] += 2  # both platforms, one shared fetch failed
-        else:
-            for platform in ("ps", "pc"):
-                try:
-                    bin_price = parse_lowest_bin(player_html, platform, diag)
-                    bio_by_platform[platform] = parse_bio_stats(player_html, platform)
-                    if bin_price is not None:
-                        async with pool.acquire() as conn:
-                            await conn.execute(
-                                "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
-                                "VALUES ($1, $2, $3, NOW())",
-                                card_id, platform, bin_price,
-                            )
-                        diag["bin_price_found"] += 1
-                    else:
-                        diag["bin_price_null"] += 1
-                except Exception as e:
-                    diag["bin_failed"] += 1
-                    log.warning("BIN parse failed for card_id=%s platform=%s: %s", card_id, platform, e)
-
-        # --- Bio stats: games played / avg goals / top chem style, parsed
-        # from the same page fetched above - zero extra requests. Only
-        # covers these three (not avg assists/yellow/red - those aren't in
-        # the bio text, only on the separate /pgp bulk listing). COALESCE
-        # against the existing value so a failed/partial parse this run
-        # doesn't blow away a good value from a previous run.
-        console_bio = bio_by_platform.get("ps") or {}
-        pc_bio = bio_by_platform.get("pc") or {}
-        if any(v is not None for v in (
-            console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
-            pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
-        )):
+    if status != 200 or player_html is None:
+        diag["bin_failed"] += 2  # both platforms, one shared fetch failed
+    else:
+        await _dismiss_cookie_banner(page)
+        for platform in ("ps", "pc"):
             try:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE fut_players SET
-                            games_played_console = COALESCE($1, games_played_console),
-                            avg_goals_console = COALESCE($2, avg_goals_console),
-                            top_chem_style_console = COALESCE($3, top_chem_style_console),
-                            games_played_pc = COALESCE($4, games_played_pc),
-                            avg_goals_pc = COALESCE($5, avg_goals_pc),
-                            top_chem_style_pc = COALESCE($6, top_chem_style_pc)
-                        WHERE card_id = $7
-                        """,
-                        console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
-                        pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
-                        card_id,
-                    )
-                diag["bio_stats_updated"] += 1
+                bin_price = parse_lowest_bin(player_html, platform, diag)
+                bio_by_platform[platform] = parse_bio_stats(player_html, platform)
+                if bin_price is not None:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
+                            "VALUES ($1, $2, $3, NOW())",
+                            card_id, platform, bin_price,
+                        )
+                    diag["bin_price_found"] += 1
+                else:
+                    diag["bin_price_null"] += 1
             except Exception as e:
-                diag["bio_stats_failed"] += 1
-                log.warning("Bio stats update failed for card_id=%s: %s", card_id, e)
+                diag["bin_failed"] += 1
+                log.warning("BIN parse failed for card_id=%s platform=%s: %s", card_id, platform, e)
 
-        # --- Sales history: parsed directly from the /market page (the
-        # dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked;
-        # the /market page already contains the full auctions-table inline,
-        # so this is one fetch, no link-following, no second request) -
-        # dedupe on (player_id, sold_at, sold_price) ---
+    # --- Bio stats: games played / avg goals / top chem style, parsed
+    # from the same page fetched above - zero extra requests. Only
+    # covers these three (not avg assists/yellow/red - those aren't in
+    # the bio text, only on the separate /pgp bulk listing). COALESCE
+    # against the existing value so a failed/partial parse this run
+    # doesn't blow away a good value from a previous run.
+    console_bio = bio_by_platform.get("ps") or {}
+    pc_bio = bio_by_platform.get("pc") or {}
+    if any(v is not None for v in (
+        console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
+        pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
+    )):
         try:
-            status, market_html = await fetch_market_page(session, player_url, diag)
-            if status != 200 or market_html is None:
-                diag["sales_market_fetch_failed"] += 1
-                diag.setdefault(
-                    "sales_market_fetch_sample",
-                    f"status={status} url={player_url.rstrip('/')}/market",
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE fut_players SET
+                        games_played_console = COALESCE($1, games_played_console),
+                        avg_goals_console = COALESCE($2, avg_goals_console),
+                        top_chem_style_console = COALESCE($3, top_chem_style_console),
+                        games_played_pc = COALESCE($4, games_played_pc),
+                        avg_goals_pc = COALESCE($5, avg_goals_pc),
+                        top_chem_style_pc = COALESCE($6, top_chem_style_pc)
+                    WHERE card_id = $7
+                    """,
+                    console_bio.get("games"), console_bio.get("avg_goals"), console_bio.get("top_chem_style"),
+                    pc_bio.get("games"), pc_bio.get("avg_goals"), pc_bio.get("top_chem_style"),
+                    card_id,
                 )
-                return
-            sales = parse_sales_table(market_html, diag)
+            diag["bio_stats_updated"] += 1
+        except Exception as e:
+            diag["bio_stats_failed"] += 1
+            log.warning("Bio stats update failed for card_id=%s: %s", card_id, e)
+
+    # --- Sales history: parsed directly from the /market page (the
+    # dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked;
+    # the /market page already contains the full auctions-table inline,
+    # so this is one fetch, no link-following, no second request) -
+    # dedupe on (player_id, sold_at, sold_price) ---
+    try:
+        status, market_html = await fetch_market_page(page, player_url, diag)
+        _check_circuit_breaker(diag, abort_event)
+        if status != 200 or market_html is None:
+            diag["sales_market_fetch_failed"] += 1
+            diag.setdefault(
+                "sales_market_fetch_sample",
+                f"status={status} url={player_url.rstrip('/')}/market",
+            )
+            return
+        sales = parse_sales_table(market_html, diag)
+    except Exception as e:
+        diag["sales_failed"] += 1
+        log.warning("Sales scrape failed for card_id=%s: %s", card_id, e)
+        return
+
+    for s in sales:
+        try:
+            async with pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    INSERT INTO sales_history
+                        (player_id, listed_price, sold_price, ea_tax, net_price, sold_at, captured_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    ON CONFLICT (player_id, sold_at, sold_price) DO NOTHING
+                    """,
+                    card_id, s["listed_price"], s["sold_price"], s["ea_tax"], s["net_price"], s["sold_at"],
+                )
+            # asyncpg's execute() returns a command tag "INSERT <oid> <rowcount>" -
+            # rowcount is 0 when ON CONFLICT DO NOTHING skipped an existing row.
+            rowcount = int(result.rsplit(" ", 1)[-1])
+            if rowcount == 0:
+                diag["sales_dupe"] += 1
+            else:
+                diag["sales_new"] += 1
         except Exception as e:
             diag["sales_failed"] += 1
-            log.warning("Sales scrape failed for card_id=%s: %s", card_id, e)
-            return
-
-        for s in sales:
-            try:
-                async with pool.acquire() as conn:
-                    result = await conn.execute(
-                        """
-                        INSERT INTO sales_history
-                            (player_id, listed_price, sold_price, ea_tax, net_price, sold_at, captured_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                        ON CONFLICT (player_id, sold_at, sold_price) DO NOTHING
-                        """,
-                        card_id, s["listed_price"], s["sold_price"], s["ea_tax"], s["net_price"], s["sold_at"],
-                    )
-                # asyncpg's execute() returns a command tag "INSERT <oid> <rowcount>" -
-                # rowcount is 0 when ON CONFLICT DO NOTHING skipped an existing row.
-                rowcount = int(result.rsplit(" ", 1)[-1])
-                if rowcount == 0:
-                    diag["sales_dupe"] += 1
-                else:
-                    diag["sales_new"] += 1
-            except Exception as e:
-                diag["sales_failed"] += 1
-                log.warning("Sales insert failed for card_id=%s sold_at=%s: %s", card_id, s["sold_at"], e)
+            log.warning("Sales insert failed for card_id=%s sold_at=%s: %s", card_id, s["sold_at"], e)
 
 
-async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
+async def _fetch_tier(conn: asyncpg.Connection, where: str, limit: int = 0) -> list:
     """
     Ordered oldest-refreshed-first (nulls - never captured - first), not
     left to whatever order Postgres happens to return. A full Tier A sweep
@@ -648,8 +797,7 @@ async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
     spends its budget where it matters most, and no card can starve forever
     even if a sweep never fully completes within one invocation.
     """
-    return await conn.fetch(
-        f"""
+    sql = f"""
         SELECT fp.card_id, fp.player_url
         FROM fut_players fp
         LEFT JOIN LATERAL (
@@ -659,8 +807,13 @@ async def _fetch_tier(conn: asyncpg.Connection, where: str) -> list:
         ) lb ON true
         WHERE {where} AND fp.player_url IS NOT NULL
         ORDER BY lb.last_captured_at ASC NULLS FIRST
-        """
-    )
+    """
+    # TEST_LIMIT support (item 9): bound as a real asyncpg parameter, never
+    # string-interpolated - 0 (the default) means no LIMIT clause at all,
+    # i.e. full, unmodified production behavior.
+    if limit and limit > 0:
+        return await conn.fetch(sql + " LIMIT $1", limit)
+    return await conn.fetch(sql)
 
 
 def _tier_b_due(now_epoch: Optional[int] = None) -> bool:
@@ -670,10 +823,39 @@ def _tier_b_due(now_epoch: Optional[int] = None) -> bool:
     return (now_epoch // CRON_INTERVAL_SECONDS) % TIER_B_EVERY == 0
 
 
-async def _scrape_batch(pool, session, sem, rows, diag) -> None:
+async def _worker_loop(
+    pool: asyncpg.Pool,
+    page_pool: "asyncio.Queue",
+    queue: "asyncio.Queue",
+    diag: Dict[str, Any],
+    abort_event: asyncio.Event,
+) -> None:
+    """One page-pool slot's worth of sequential work. Pulls the next row
+    only if the circuit breaker hasn't tripped yet - this is what actually
+    stops scheduling new players after a clear block (asyncio.gather over
+    every candidate up front, the old approach, has no way to do that once
+    started). A page is always returned to the pool in `finally`, success
+    or failure, so a mid-scrape exception can't leak it."""
+    while not abort_event.is_set():
+        try:
+            row = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        page = await page_pool.get()
+        try:
+            await _scrape_one(pool, page, row["card_id"], row["player_url"], diag, abort_event)
+        finally:
+            await page_pool.put(page)
+            queue.task_done()
+
+
+async def _scrape_batch(pool, page_pool: "asyncio.Queue", rows, diag, abort_event: asyncio.Event) -> None:
+    queue: asyncio.Queue = asyncio.Queue()
+    for r in rows:
+        queue.put_nowait(r)
     await asyncio.gather(*[
-        _scrape_one(pool, session, sem, r["card_id"], r["player_url"], diag)
-        for r in rows
+        _worker_loop(pool, page_pool, queue, diag, abort_event)
+        for _ in range(page_pool.qsize())
     ])
 
 
@@ -692,54 +874,92 @@ async def crawl_once() -> None:
         await lock_conn.close()
         return
 
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=HISTORY_CONCURRENCY + 2)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=PLAYWRIGHT_CONCURRENCY + 2)
+    playwright_ctx = None
+    browser = None
+    context = None
+    page_pool: Optional["asyncio.Queue"] = None
     try:
         async with pool.acquire() as conn:
             await ensure_tables(conn)
-            tier_a = await _fetch_tier(conn, TIER_A_WHERE)
+            tier_a = await _fetch_tier(conn, TIER_A_WHERE, TEST_LIMIT)
             b_due = _tier_b_due()
-            tier_b = await _fetch_tier(conn, TIER_B_WHERE) if b_due else []
+            tier_b = await _fetch_tier(conn, TIER_B_WHERE, TEST_LIMIT) if b_due else []
 
         log.info(
-            "Candidates this run: tier_a=%d (specials + golds 82+) tier_b=%d (golds 75-81, due=%s)",
+            "Candidates this run: tier_a=%d (specials + golds 82+) tier_b=%d (golds 75-81, due=%s)%s",
             len(tier_a), len(tier_b), b_due,
+            f" [TEST_LIMIT={TEST_LIMIT}]" if TEST_LIMIT else "",
         )
         rows = list(tier_a) + list(tier_b)
         if not rows:
             return
 
-        sem = asyncio.Semaphore(HISTORY_CONCURRENCY)
         diag: Dict[str, Any] = defaultdict(int)
+        abort_event = asyncio.Event()
 
-        async with aiohttp.ClientSession() as session:
-            # Hot tier first, always.
-            await _scrape_batch(pool, session, sem, tier_a, diag)
+        # One persistent browser context for the whole run (item 2) - a
+        # real Playwright Chromium session loads FUTBIN pages successfully
+        # where plain aiohttp now gets Cloudflare 403s on every request
+        # (confirmed live - see module docstring). headless is only passed
+        # at all if PLAYWRIGHT_HEADLESS is explicitly set (see its own
+        # comment above) - otherwise Playwright's own upstream default
+        # applies, deliberately not a "production" assumption this file
+        # encodes itself.
+        playwright_ctx = await async_playwright().start()
+        launch_kwargs: Dict[str, Any] = {"args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+        if PLAYWRIGHT_HEADLESS is not None:
+            launch_kwargs["headless"] = PLAYWRIGHT_HEADLESS
+        browser = await playwright_ctx.chromium.launch(**launch_kwargs)
+        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
 
+        # Small reusable page pool (item 3) - this, not a separate
+        # semaphore, is what bounds concurrency now (HISTORY_CONCURRENCY is
+        # retired). Sized conservatively (PLAYWRIGHT_CONCURRENCY=1 default)
+        # so the worker cannot accidentally run several browser pages at
+        # once unless explicitly configured.
+        page_pool = asyncio.Queue()
+        for _ in range(PLAYWRIGHT_CONCURRENCY):
+            page_pool.put_nowait(await context.new_page())
+
+        # Hot tier first, always.
+        await _scrape_batch(pool, page_pool, tier_a, diag, abort_event)
+
+        if abort_event.is_set() and tier_b:
+            diag["tier_b_skipped_circuit_breaker"] = len(tier_b)
+            log.warning(
+                "Skipping tier B (%d cards) this run: circuit breaker already tripped during tier A.",
+                len(tier_b),
+            )
+        elif tier_b:
             # Fodder tier only if the sweep isn't being throttled - promo
             # nights are exactly when 429s spike AND when Tier A freshness
             # matters most, so a constrained budget goes to A alone.
-            if tier_b:
-                if diag["http_429_hits"] > TIER_B_SKIP_429_THRESHOLD:
-                    diag["tier_b_skipped_throttled"] = len(tier_b)
-                    log.warning(
-                        "Skipping tier B (%d cards) this run: %d 429s during tier A - throttled, "
-                        "keeping remaining budget on the hot tier.",
-                        len(tier_b), diag["http_429_hits"],
-                    )
-                else:
-                    await _scrape_batch(pool, session, sem, tier_b, diag)
+            if diag["http_429_hits"] > TIER_B_SKIP_429_THRESHOLD:
+                diag["tier_b_skipped_throttled"] = len(tier_b)
+                log.warning(
+                    "Skipping tier B (%d cards) this run: %d 429s during tier A - throttled, "
+                    "keeping remaining budget on the hot tier.",
+                    len(tier_b), diag["http_429_hits"],
+                )
+            else:
+                await _scrape_batch(pool, page_pool, tier_b, diag, abort_event)
 
         log.info(
             "Run complete. stale_non_futbin_url=%d | bin_price_found=%d bin_price_null=%d bin_failed=%d "
             "bin_platform_scoped_hit=%d bin_platform_fallback_used=%d | "
             "sales_new=%d sales_dupe=%d sales_failed=%d | bio_stats_updated=%d bio_stats_failed=%d | "
-            "http_429_hits=%d http_exceptions=%d",
+            "http_429_hits=%d http_exceptions=%d http_403_hits=%d cloudflare_challenge_hits=%d "
+            "browser_navigation_failures=%d browser_timeouts=%d circuit_breaker_tripped=%s",
             diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
             diag["bin_platform_scoped_hit"], diag["bin_platform_fallback_used"],
             diag["sales_new"], diag["sales_dupe"], diag["sales_failed"],
             diag["bio_stats_updated"], diag["bio_stats_failed"],
             diag["http_429_hits"], diag["http_exceptions"],
+            diag["http_403_hits"], diag["cloudflare_challenge_hits"],
+            diag["browser_navigation_failures"], diag["browser_timeouts"],
+            bool(diag.get("circuit_breaker_tripped")),
         )
         if diag["stale_non_futbin_url"]:
             log.warning(
@@ -766,8 +986,15 @@ async def crawl_once() -> None:
         # Heartbeat for /api/ops/freshness. A run where every single scrape
         # failed (and nothing new landed) is a markup change or a block -
         # that's the failure mode that silently kills the fair-value data.
+        # A tripped circuit breaker is unconditionally unhealthy, even in
+        # the edge case where bin_failed's own accounting looks fine (e.g.
+        # the breaker tripped on 429s partway through, not 403s/challenges) -
+        # a blocked run must never be reported healthy.
         total_attempted = diag["bin_price_found"] + diag["bin_price_null"] + diag["bin_failed"]
-        run_ok = total_attempted == 0 or diag["bin_failed"] < total_attempted
+        run_ok = (
+            not diag.get("circuit_breaker_tripped")
+            and (total_attempted == 0 or diag["bin_failed"] < total_attempted)
+        )
         async with pool.acquire() as hb_conn:
             await heartbeat(
                 hb_conn,
@@ -776,17 +1003,49 @@ async def crawl_once() -> None:
                 detail=(
                     f"tier_a={len(tier_a)} tier_b={len(tier_b)}"
                     + (f" (skipped, throttled)" if diag.get("tier_b_skipped_throttled") else "")
+                    + (f" (skipped, circuit breaker)" if diag.get("tier_b_skipped_circuit_breaker") else "")
                     + f" sales_new={diag['sales_new']} bin_found={diag['bin_price_found']} "
-                    f"bin_failed={diag['bin_failed']} http_429={diag['http_429_hits']}"
+                    f"bin_failed={diag['bin_failed']} http_429={diag['http_429_hits']} "
+                    f"http_403={diag['http_403_hits']} cf_challenge={diag['cloudflare_challenge_hits']} "
+                    f"circuit_breaker_tripped={bool(diag.get('circuit_breaker_tripped'))}"
                 ),
             )
         if not run_ok:
             await alert(
-                "bin_sales_history_sync: every BIN scrape failed this run "
-                f"(bin_failed={diag['bin_failed']}/{total_attempted}, 429s={diag['http_429_hits']}) - "
-                "futbin markup change or block? Sales/BIN history has stopped growing."
+                "bin_sales_history_sync: "
+                + (
+                    "circuit breaker tripped this run "
+                    f"(http_403={diag['http_403_hits']} cf_challenge={diag['cloudflare_challenge_hits']} "
+                    f"http_429={diag['http_429_hits']}) - "
+                    if diag.get("circuit_breaker_tripped")
+                    else "every BIN scrape failed this run "
+                    f"(bin_failed={diag['bin_failed']}/{total_attempted}, 429s={diag['http_429_hits']}) - "
+                )
+                + "futbin markup change or block? Sales/BIN history has stopped growing."
             )
     finally:
+        if page_pool is not None:
+            while not page_pool.empty():
+                try:
+                    page = page_pool.get_nowait()
+                    await page.close()
+                except Exception:
+                    pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if playwright_ctx is not None:
+            try:
+                await playwright_ctx.stop()
+            except Exception:
+                pass
         await pool.close()
         await lock_conn.execute("SELECT pg_advisory_unlock($1)", OVERLAP_LOCK_KEY)
         await lock_conn.close()
