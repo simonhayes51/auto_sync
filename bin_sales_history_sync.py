@@ -123,7 +123,7 @@ PLAYWRIGHT_HEADLESS = (
     if _PLAYWRIGHT_HEADLESS_RAW is not None
     else None
 )
-PLAYWRIGHT_NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "20000"))
+PLAYWRIGHT_NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "60000"))
 
 # Mirrors a standalone single-page Playwright connectivity test (not part
 # of this repo) that got a real 200 on a real player URL from this same
@@ -243,6 +243,36 @@ _PLATFORM_CLASS = {"ps": "platform-ps-only", "pc": "platform-pc-only"}
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
 
 
+async def _locator_present(page, selector: str) -> Optional[bool]:
+    """Best-effort DOM-presence check for diagnostics only - never raises,
+    returns None (unknown) rather than False on error so a check failure
+    can't be misread as "confirmed absent"."""
+    try:
+        return await page.locator(selector).count() > 0
+    except Exception:
+        return None
+
+
+async def _save_debug_block_artifacts(page, diag: Dict[str, Any]) -> None:
+    """Saves the FIRST blocked page this run as debug_last_block.html/.png
+    (current working directory) - guarded so it only happens once per run,
+    not once per retry/per card. Best-effort: a save failure must never
+    break the scrape."""
+    if diag.get("debug_block_artifacts_saved"):
+        return
+    diag["debug_block_artifacts_saved"] = True
+    try:
+        html = await page.content()
+        with open("debug_last_block.html", "w", encoding="utf-8", errors="replace") as f:
+            f.write(html)
+    except Exception as e:
+        log.warning("Failed to save debug_last_block.html: %s", e)
+    try:
+        await page.screenshot(path="debug_last_block.png", full_page=True)
+    except Exception as e:
+        log.warning("Failed to save debug_last_block.png: %s", e)
+
+
 async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, Optional[str]]":
     """Loads `url` in a real Playwright Chromium page and returns
     (status, html) - the direct replacement for the old aiohttp-based
@@ -253,11 +283,24 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
     wait_until="domcontentloaded" (never "networkidle" - FUTBIN's ads and
     tracking scripts can keep the network "busy" indefinitely, which would
     make networkidle hang or time out for reasons unrelated to whether the
-    page we actually want already loaded). A Cloudflare challenge/block
-    page is detected via _looks_like_challenge() (page title + a visible-
-    body excerpt, not a naive full-HTML substring scan - see its own
-    docstring for why) and never returned as valid HTML, even if
-    Cloudflare served it with a 200 status.
+    page we actually want already loaded).
+
+    Read order deliberately mirrors the standalone test_futbin.py
+    connectivity test exactly, which succeeds every time from this same
+    home IP/URL where this worker was still getting blocked: title, then
+    a body-locator read (Playwright auto-waits up to its timeout for the
+    element to become actionable - this is the wait that actually matters,
+    giving any client-side Cloudflare challenge-resolution JS time to
+    finish before anything is read), and ONLY THEN page.content(). This
+    worker previously read page.content() FIRST and only conditionally
+    (and with a much shorter timeout) checked title/body afterward -
+    likely capturing a still-mid-challenge page before it had time to
+    settle. Both reads now happen unconditionally, regardless of status,
+    matching the script (which never special-cases status before them).
+
+    A Cloudflare challenge/block page is detected via _looks_like_
+    challenge() only AFTER these waits complete, and is never returned as
+    valid HTML, even if Cloudflare served it with a 200 status.
     """
     backoff = 1.0
     for attempt in range(HISTORY_MAX_RETRIES + 1):
@@ -279,25 +322,37 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
             return 0, None
 
         status = response.status if response else 0
+
+        try:
+            title = await page.title()
+        except Exception:
+            title = None
+        try:
+            body_excerpt = (await page.locator("body").inner_text(timeout=15000))[:300]
+        except Exception:
+            body_excerpt = None
+
+        # Pre-content() diagnostics (logged every navigation, not just
+        # blocked ones) - .price-box/.auctions-table are the real,
+        # already-confirmed selectors parse_lowest_bin/parse_sales_table
+        # use. No confirmed "player heading" selector exists anywhere in
+        # this codebase, so .player-text-section (the one real container
+        # parse_bio_stats already selects against) stands in as the best
+        # available proxy rather than guessing a new one blind.
+        price_box_present = await _locator_present(page, ".price-box")
+        auctions_table_present = await _locator_present(page, ".auctions-table")
+        player_heading_present = await _locator_present(page, ".player-text-section")
+        log.info(
+            "Pre-content() check: url=%s status=%s title=%r page.url=%s "
+            "player_heading_present=%s price_box_present=%s auctions_table_present=%s",
+            url, status, title, page.url,
+            player_heading_present, price_box_present, auctions_table_present,
+        )
+
         try:
             html = await page.content()
         except Exception:
             html = None
-
-        # Title/body-excerpt are only needed to disambiguate a 200 (a 403
-        # is already conclusively blocked via status alone - see
-        # _looks_like_challenge) - skip the extra page reads otherwise.
-        title = None
-        body_excerpt = None
-        if status == 200:
-            try:
-                title = await page.title()
-            except Exception:
-                title = None
-            try:
-                body_excerpt = (await page.locator("body").inner_text(timeout=2000))[:300]
-            except Exception:
-                body_excerpt = None
 
         if _looks_like_challenge(status, title, body_excerpt):
             # One navigation, one blocked attempt - cloudflare_challenge_hits
@@ -318,6 +373,7 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
                 "challenge_page_sample",
                 f"url={url} status={status} title={title!r} body_excerpt={body_excerpt!r}",
             )
+            await _save_debug_block_artifacts(page, diag)
             if attempt < HISTORY_MAX_RETRIES:
                 await asyncio.sleep(_jittered_backoff(backoff))
                 backoff *= 2
@@ -971,13 +1027,15 @@ async def crawl_once() -> None:
         # (same UA, viewport, locale) - that script gets a real 200 on the
         # same URL from the same home IP where this worker was still
         # getting 403'd, so the fix is to match it precisely rather than
-        # rely on Chromium's own unproven default fingerprint. No extra
-        # request headers, no persisted browser storage, no resource
-        # blocking, no disabled JS, and no Playwright request API fallback
-        # anywhere in this file.
+        # rely on Chromium's own unproven default fingerprint. viewport
+        # corrected to 1440x900 - a prior turn's instruction used 1365x768,
+        # which does not match the actual test_futbin.py file (confirmed
+        # by direct line-by-line comparison). No extra request headers, no
+        # persisted browser storage, no resource blocking, no disabled JS,
+        # and no Playwright request API fallback anywhere in this file.
         context = await browser.new_context(
             user_agent=PLAYWRIGHT_USER_AGENT,
-            viewport={"width": 1365, "height": 768},
+            viewport={"width": 1440, "height": 900},
             locale="en-GB",
         )
 

@@ -1,3 +1,5 @@
 __pycache__/
 .env
 *.sqlite
+debug_last_block.html
+debug_last_block.png

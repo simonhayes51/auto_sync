@@ -421,14 +421,21 @@ def test_playwright_user_agent_is_not_bot_identifying():
 
 
 def test_new_context_uses_real_chrome_user_agent_and_matching_viewport():
+    # 1440x900 matches the actual test_futbin.py file exactly (confirmed
+    # by direct line-by-line comparison) - a prior turn's instruction used
+    # 1365x768, which did not match the real script and has been corrected.
     import inspect
 
     src = inspect.getsource(mod.crawl_once)
     assert "new_context(" in src
     assert "user_agent=PLAYWRIGHT_USER_AGENT" in src
     assert 'locale="en-GB"' in src
-    assert '"width": 1365' in src
-    assert '"height": 768' in src
+    assert '"width": 1440' in src
+    assert '"height": 900' in src
+
+
+def test_nav_timeout_matches_test_futbin():
+    assert mod.PLAYWRIGHT_NAV_TIMEOUT_MS == 60000
 
 
 def test_no_route_blocking_storage_state_or_request_api():
@@ -437,3 +444,137 @@ def test_no_route_blocking_storage_state_or_request_api():
     src = inspect.getsource(mod)
     for forbidden in (".route(", "storage_state", "java_script_enabled", ".request."):
         assert forbidden not in src, f"found disallowed pattern: {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# fetch_page_html() mirrors test_futbin.py's exact read order: title, then
+# a body-locator read, and ONLY THEN page.content() - not the other way
+# round, and not gated on status. Plus the new pre-content() diagnostics
+# and once-per-run debug-artifact save.
+# ---------------------------------------------------------------------------
+class _FakeLocator:
+    def __init__(self, count=0, text="", raise_on_count=False, raise_on_text=False):
+        self._count = count
+        self._text = text
+        self._raise_on_count = raise_on_count
+        self._raise_on_text = raise_on_text
+
+    async def count(self):
+        if self._raise_on_count:
+            raise RuntimeError("locator count failed")
+        return self._count
+
+    async def inner_text(self, timeout=None):
+        if self._raise_on_text:
+            raise RuntimeError("inner_text failed")
+        return self._text
+
+
+class _FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeRecordingPage:
+    """Records the order of calls that matter for the mirrored flow -
+    title() and body.inner_text() must both happen before content()."""
+
+    def __init__(self, status=200, title="Kenan Yıldız - FUTBIN", body="real player content", html="<html>real</html>"):
+        self.calls = []
+        self.url = "https://www.futbin.com/26/player/24583/kenan-yldz"
+        self._status = status
+        self._title = title
+        self._body = body
+        self._html = html
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.calls.append("goto")
+        return _FakeResponse(self._status)
+
+    async def title(self):
+        self.calls.append("title")
+        return self._title
+
+    def locator(self, selector):
+        if selector == "body":
+            self.calls.append("body_locator")
+            return _FakeLocator(text=self._body)
+        return _FakeLocator(count=1)
+
+    async def content(self):
+        self.calls.append("content")
+        return self._html
+
+    async def screenshot(self, path=None, full_page=None):
+        self.calls.append("screenshot")
+
+
+@run_async
+async def test_fetch_page_html_reads_title_and_body_before_content():
+    diag = defaultdict(int)
+    page = _FakeRecordingPage()
+    status, html = await mod.fetch_page_html(page, "https://example.com", diag)
+
+    title_idx = page.calls.index("title")
+    body_idx = page.calls.index("body_locator")
+    content_idx = page.calls.index("content")
+    assert title_idx < content_idx
+    assert body_idx < content_idx
+    assert status == 200
+    assert html == "<html>real</html>"
+
+
+def test_fetch_page_html_reads_title_and_body_even_on_403(monkeypatch, tmp_path):
+    """test_futbin.py never special-cases status before reading title/body -
+    this worker previously skipped both entirely for a non-200 status.
+    HISTORY_MAX_RETRIES patched to 0 just to keep this test fast (a 403
+    still retries by default, each with a real jittered sleep) - retry
+    behavior itself is untouched by this change and not what's under test
+    here. Runs from tmp_path since a 403 also triggers the real
+    debug-artifact save (_save_debug_block_artifacts), which must not
+    write into this repo's working directory."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod, "HISTORY_MAX_RETRIES", 0)
+    diag = defaultdict(int)
+    page = _FakeRecordingPage(status=403)
+    status, html = asyncio.run(mod.fetch_page_html(page, "https://example.com", diag))
+
+    assert "title" in page.calls
+    assert "body_locator" in page.calls
+    assert status == 403
+    assert html is None
+
+
+def test_locator_present_returns_bool_and_none_on_error():
+    async def _run():
+        class _Page:
+            def locator(self, selector):
+                if selector == ".raises":
+                    return _FakeLocator(raise_on_count=True)
+                return _FakeLocator(count=1 if selector == ".present" else 0)
+
+        page = _Page()
+        present = await mod._locator_present(page, ".present")
+        absent = await mod._locator_present(page, ".absent")
+        unknown = await mod._locator_present(page, ".raises")
+        return present, absent, unknown
+
+    present, absent, unknown = asyncio.run(_run())
+    assert present is True
+    assert absent is False
+    assert unknown is None
+
+
+@run_async
+async def test_save_debug_block_artifacts_once_per_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    diag = defaultdict(int)
+    page = _FakeRecordingPage()
+
+    await mod._save_debug_block_artifacts(page, diag)
+    await mod._save_debug_block_artifacts(page, diag)  # second call must be a no-op
+
+    assert page.calls.count("content") == 1
+    assert page.calls.count("screenshot") == 1
+    assert diag["debug_block_artifacts_saved"] is True
+    assert (tmp_path / "debug_last_block.html").read_text(encoding="utf-8") == "<html>real</html>"
