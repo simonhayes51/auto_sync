@@ -299,3 +299,78 @@ unattended.
 
 Env vars: `PROMO_DETECT_WINDOW_HOURS=48`, `PROMO_MIN_NEW_CARDS=5`,
 `PROMO_EXCLUDED_VERSIONS=normal` (comma-separated, case-insensitive).
+
+## 8. Production-crawler redesign (bin_worker / sales_worker / metadata_worker)
+
+`bin_sales_history_sync.py` (section 5) is a one-shot **full-sweep**
+design: every invocation re-scans its whole Tier A/B candidate pool, with
+only a fixed `HISTORY_CONCURRENCY` semaphore and an advisory-lock overlap
+guard protecting futbin from too much load. That was enough to stop the
+scraper actively corrupting data (see the overlap-guard/null-write-skip/
+`parse_lowest_bin` fixes already shipped), but it can't do incremental,
+priority-ordered scheduling, and every worker's request budget is
+independent - nothing coordinates bin/sales/metadata scraping against a
+single shared rate limit.
+
+`bin_worker.py`, `sales_worker.py`, and `metadata_worker.py` are a
+queue-driven replacement, built on three new shared modules:
+
+- **`config.py`** - every tuning knob (rate limit, circuit-breaker
+  thresholds, backoff, batch sizing, failure-cache TTL) as an env var
+  with a documented default. No hardcoded constants in the workers.
+- **`http_client.py`** - a global, DB-row-backed (`crawler_rate_state`)
+  smoothed token-bucket rate limiter; a global, persisted
+  (`crawler_circuit_breaker`) circuit breaker that trips on ~20
+  consecutive 429s or ~5 consecutive 403s and cools down for 30-60
+  minutes (config-driven) - the cooldown is a DB row, so it survives
+  container restarts and every future Cron tick respects it; jittered
+  exponential backoff; and adaptive batch sizing off `crawler_metrics`
+  (shrinks after a run with a rising error rate, grows back after a few
+  clean runs). This replaces the near-duplicate `_get_with_retry` found
+  in `bin_sales_history_sync.py`/`futbin_card_art_backfill.py`/
+  `futbin_rarity_backfill.py` with one shared implementation.
+- **`scrape_queue.py`** - persistent per-card-per-worktype scheduling
+  (`scrape_queue` table, `backend/migrations/037_scrape_queue.sql`).
+  Workers claim a bounded, priority-ordered batch via
+  `FOR UPDATE SKIP LOCKED` (the row-level equivalent of this codebase's
+  `pg_try_advisory_lock` idiom) instead of re-scanning the whole
+  candidate table. A failed fetch that matches a known "won't change
+  soon" reason (404, no market page, no sales-history link) sets
+  `failure_expires_at`, which the claiming query excludes until the TTL
+  passes - a TTL'd failure cache with no separate cache table.
+
+**Worker split** (bio stats stay piggybacked on the BIN fetch, not their
+own worker - same HTTP request already fetches both, splitting it would
+double requests against futbin for no freshness benefit):
+- `bin_worker.py` - claims `worktype='bin'`, fetches the player page once,
+  writes `bin_history` + `fut_players`' bio columns.
+- `sales_worker.py` - claims `worktype='sales'`, pages futbin's
+  sales-history table only until it reaches a sale at-or-before the
+  card's own `newest_known_sale_at` cursor (persisted on the queue row) -
+  a caught-up card stops after the first row instead of always scanning a
+  fixed depth.
+- `metadata_worker.py` - recomputes `scrape_queue.priority` (promo/special
+  version, rating, popularity score if present, recent sale velocity,
+  current staleness) and backfills newly-catalogued cards into the queue.
+  Run periodically (e.g. hourly Cron) alongside, not instead of, the
+  existing daily `futbin_full_sync.py` catalog crawl.
+
+**Rollout**: all additive (new tables only). `bin_sales_history_sync.py`
+keeps running unmodified while `scrape_queue` is backfilled and the new
+workers are validated in parallel; cut over one worktype's Cron job at a
+time once `crawler_metrics` shows healthy throughput and `fair_value_mv`
+staleness stays low for a few days. The old script stays in the repo,
+disabled, until the new workers have a proven track record - not deleted
+in this pass.
+
+Env vars (all in `config.py`, defaults documented there):
+`RATE_LIMIT_REQUESTS_PER_SEC`, `RATE_LIMIT_BURST_CAPACITY`,
+`CIRCUIT_BREAKER_429_THRESHOLD`, `CIRCUIT_BREAKER_403_THRESHOLD`,
+`CIRCUIT_BREAKER_COOLDOWN_MINUTES`, `BACKOFF_BASE_SECONDS`,
+`BACKOFF_MAX_SECONDS`, `BACKOFF_JITTER_FRACTION`, `MAX_RETRIES`,
+`BATCH_SIZE_MIN`, `BATCH_SIZE_MAX`, `BATCH_SIZE_DEFAULT`,
+`BATCH_SIZE_SHRINK_FACTOR`, `BATCH_SIZE_GROW_FACTOR`,
+`BATCH_SIZE_ERROR_RATE_THRESHOLD`, `BATCH_SIZE_HEALTHY_RUNS_TO_GROW`,
+`FAILURE_CACHE_TTL_MINUTES`, plus per-worker
+`BIN_SUCCESS_REFRESH_MINUTES`/`BIN_WORKER_CONCURRENCY`/
+`SALES_SUCCESS_REFRESH_MINUTES`/`SALES_WORKER_CONCURRENCY`.
