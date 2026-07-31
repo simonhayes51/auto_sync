@@ -157,8 +157,6 @@ CRON_INTERVAL_SECONDS = int(os.getenv("CRON_INTERVAL_SECONDS", "600"))
 # in a single process) already known to trigger sustained 429s/403s.
 OVERLAP_LOCK_KEY = 7741011
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SBCSolver/1.5)"}
-
 _CHALLENGE_MARKERS = (
     "just a moment",
     "attention required",
@@ -265,6 +263,13 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
             html = None
 
         if _looks_like_challenge(status, html):
+            # One navigation, one blocked attempt - cloudflare_challenge_hits
+            # and http_403_hits can both fire for the very same event (a
+            # 403-status challenge page), so blocked_navigation_attempts is
+            # the single counter the circuit breaker actually checks
+            # (see _check_circuit_breaker). The other two stay as separate,
+            # more granular diagnostics (hard-403 vs soft-JS-challenge).
+            diag["blocked_navigation_attempts"] += 1
             diag["cloudflare_challenge_hits"] += 1
             if status == 403:
                 diag["http_403_hits"] += 1
@@ -308,19 +313,25 @@ async def _dismiss_cookie_banner(page) -> None:
 
 def _check_circuit_breaker(diag: Dict[str, Any], abort_event: asyncio.Event) -> None:
     """Trips the shared abort_event once either threshold is crossed - a
-    burst of 403s/challenge pages (a hard block) or 429s (rate limiting)
-    across the whole run, not per-card. Idempotent: does nothing once
-    already tripped, so concurrent workers calling this don't re-log."""
+    burst of blocked navigations (403s/challenge pages - a hard block) or
+    429s (rate limiting) across the whole run, not per-card. Idempotent:
+    does nothing once already tripped, so concurrent workers calling this
+    don't re-log.
+
+    Uses blocked_navigation_attempts, not http_403_hits + cloudflare_
+    challenge_hits summed - those two can both increment for the exact
+    same navigation (a 403-status challenge page), which previously
+    double-counted a single blocked attempt as 2 toward the threshold."""
     if abort_event.is_set():
         return
-    combined_blocked = diag["http_403_hits"] + diag["cloudflare_challenge_hits"]
-    if combined_blocked >= HISTORY_403_ABORT_THRESHOLD:
+    blocked = diag["blocked_navigation_attempts"]
+    if blocked >= HISTORY_403_ABORT_THRESHOLD:
         abort_event.set()
         diag["circuit_breaker_tripped"] = 1
         log.warning(
-            "Circuit breaker tripped: %d combined 403/challenge hits >= threshold %d - "
+            "Circuit breaker tripped: %d blocked navigation attempts (403/challenge) >= threshold %d - "
             "stopping new work, letting in-flight work finish.",
-            combined_blocked, HISTORY_403_ABORT_THRESHOLD,
+            blocked, HISTORY_403_ABORT_THRESHOLD,
         )
     elif diag["http_429_hits"] >= HISTORY_429_ABORT_THRESHOLD:
         abort_event.set()
@@ -911,7 +922,14 @@ async def crawl_once() -> None:
         if PLAYWRIGHT_HEADLESS is not None:
             launch_kwargs["headless"] = PLAYWRIGHT_HEADLESS
         browser = await playwright_ctx.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
+        # No user_agent override - a real Playwright test succeeded from
+        # this same connection with Chromium's own native UA, while the
+        # worker's own custom string ("...SBCSolver/1.5)") explicitly
+        # identifies it as a bot, unlike any real browser fingerprint.
+        context = await browser.new_context(
+            locale="en-GB",
+            viewport={"width": 1440, "height": 900},
+        )
 
         # Small reusable page pool (item 3) - this, not a separate
         # semaphore, is what bounds concurrency now (HISTORY_CONCURRENCY is
@@ -950,6 +968,7 @@ async def crawl_once() -> None:
             "bin_platform_scoped_hit=%d bin_platform_fallback_used=%d | "
             "sales_new=%d sales_dupe=%d sales_failed=%d | bio_stats_updated=%d bio_stats_failed=%d | "
             "http_429_hits=%d http_exceptions=%d http_403_hits=%d cloudflare_challenge_hits=%d "
+            "blocked_navigation_attempts=%d "
             "browser_navigation_failures=%d browser_timeouts=%d circuit_breaker_tripped=%s",
             diag["stale_non_futbin_url"],
             diag["bin_price_found"], diag["bin_price_null"], diag["bin_failed"],
@@ -958,6 +977,7 @@ async def crawl_once() -> None:
             diag["bio_stats_updated"], diag["bio_stats_failed"],
             diag["http_429_hits"], diag["http_exceptions"],
             diag["http_403_hits"], diag["cloudflare_challenge_hits"],
+            diag["blocked_navigation_attempts"],
             diag["browser_navigation_failures"], diag["browser_timeouts"],
             bool(diag.get("circuit_breaker_tripped")),
         )
@@ -1007,6 +1027,7 @@ async def crawl_once() -> None:
                     + f" sales_new={diag['sales_new']} bin_found={diag['bin_price_found']} "
                     f"bin_failed={diag['bin_failed']} http_429={diag['http_429_hits']} "
                     f"http_403={diag['http_403_hits']} cf_challenge={diag['cloudflare_challenge_hits']} "
+                    f"blocked_nav={diag['blocked_navigation_attempts']} "
                     f"circuit_breaker_tripped={bool(diag.get('circuit_breaker_tripped'))}"
                 ),
             )
@@ -1015,7 +1036,8 @@ async def crawl_once() -> None:
                 "bin_sales_history_sync: "
                 + (
                     "circuit breaker tripped this run "
-                    f"(http_403={diag['http_403_hits']} cf_challenge={diag['cloudflare_challenge_hits']} "
+                    f"(blocked_nav={diag['blocked_navigation_attempts']} "
+                    f"http_403={diag['http_403_hits']} cf_challenge={diag['cloudflare_challenge_hits']} "
                     f"http_429={diag['http_429_hits']}) - "
                     if diag.get("circuit_breaker_tripped")
                     else "every BIN scrape failed this run "
