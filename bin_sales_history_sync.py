@@ -506,23 +506,30 @@ async def _scrape_one(
             diag.setdefault("stale_non_futbin_url_sample", f"card_id={card_id} url={player_url}")
             return
 
-        # --- BIN history: both markets, always insert, never overwrite ---
+        # --- BIN history: both markets, only insert a real observation ---
+        # Used to always insert regardless of whether a price was found -
+        # a failed/blocked fetch (futbin 403/429) wrote a NULL lowest_bin
+        # row just as "successfully" as a real number, and since
+        # backend's fair_value_mv picks its current_bin from the single
+        # MOST RECENT bin_history row per card with no NULL check, a bad
+        # scraper run could silently overwrite everyone's real price with
+        # NULL pool-wide (confirmed live: a run that got 403/429'd on
+        # nearly every request wiped current_bin for all 3,147 tracked
+        # cards). backend's migration 036 now filters NULLs out
+        # defensively too, but the correct fix is here: never claim to
+        # have observed a price we didn't actually get.
         bio_by_platform: Dict[str, Dict[str, Any]] = {}
         for platform in ("ps", "pc"):
             try:
                 bin_price, bio_stats = await fetch_lowest_bin(session, player_url, platform, diag)
                 bio_by_platform[platform] = bio_stats
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
-                        "VALUES ($1, $2, $3, NOW())",
-                        card_id, platform, bin_price,
-                    )
-                # A successful INSERT doesn't mean a real price was found - a
-                # None scrape result inserts a NULL just as "successfully" as
-                # a real number does, so those are counted separately here
-                # rather than both landing in one misleading "ok" bucket.
                 if bin_price is not None:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO bin_history (player_id, platform, lowest_bin, captured_at) "
+                            "VALUES ($1, $2, $3, NOW())",
+                            card_id, platform, bin_price,
+                        )
                     diag["bin_price_found"] += 1
                 else:
                     diag["bin_price_null"] += 1
