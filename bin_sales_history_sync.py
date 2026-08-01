@@ -46,22 +46,26 @@ there's no partial-bid/negotiation mechanic) - but the real column is what's
 stored, not an assumption of equality.
 
 The dedicated futbin.com/26/sales/{id}/{slug} endpoint that table used to
-live on is now blocked by Cloudflare and is never requested - the same
-table is confirmed present inline on the /market page
-(player_url + "/market", already fetched here for other reasons), so
-sales history is parsed straight from that page's HTML instead (see
-fetch_market_page/parse_market_page below).
+live on is blocked by Cloudflare and is never requested. The /market page
+was tried as a replacement source and also confirmed hard-blocked live
+(HTTP 403 on every /market navigation, even after BIN/bio were confirmed
+working again on the player page itself) - so that's not requested
+either. The same auctions-table is also present inline on the ordinary
+player page (confirmed against real captured HTML), so sales history is
+parsed straight from the SAME player_html already fetched for BIN/bio -
+one browser navigation per card covers all three. fetch_market_page()/
+parse_market_page()/parse_market_prices() are kept in this file for
+tests/future reference only - not called anywhere in the live scrape
+path (_scrape_one).
 
-Transport: plain aiohttp now gets an HTTP 403 Cloudflare challenge on
-every request (confirmed live - a 10-player test produced bin_price_found=0,
-sales_market_fetch_failed=10, status=403), while a real Playwright
-Chromium session loads the same pages successfully from the same
-connection. All FUTBIN page loads go through one persistent Chromium
-browser context per run (see crawl_once()) and a small pool of reusable
-pages (PLAYWRIGHT_CONCURRENCY, default 1) instead of an aiohttp
-ClientSession - see fetch_page_html() below. A run-level circuit breaker
-(HISTORY_403_ABORT_THRESHOLD/HISTORY_429_ABORT_THRESHOLD) stops scheduling
-new work if FUTBIN starts hard-blocking mid-run.
+Transport: plain aiohttp gets an HTTP 403 Cloudflare challenge on every
+request, while a real Playwright Chromium session loads the player page
+successfully from the same connection. All FUTBIN page loads go through
+one persistent Chromium browser context per run (see crawl_once()) and a
+small pool of reusable pages (PLAYWRIGHT_CONCURRENCY, default 1) instead
+of an aiohttp ClientSession - see fetch_page_html() below. A run-level
+circuit breaker (HISTORY_403_ABORT_THRESHOLD/HISTORY_429_ABORT_THRESHOLD)
+stops scheduling new work if FUTBIN starts hard-blocking mid-run.
 
 For a local manual test against a small batch:
     $env:TEST_LIMIT="10"
@@ -366,9 +370,10 @@ async def fetch_page_html(page, url: str, diag: Dict[str, Any]) -> "tuple[int, O
             if status == 403:
                 diag["http_403_hits"] += 1
             # Once-per-run diagnostic sample (matches this file's existing
-            # sample-capture idiom, e.g. sales_market_fetch_sample) - not
-            # logged on every retry, just the first classified occurrence,
-            # so a real block is debuggable without spamming the log.
+            # sample-capture idiom, e.g. sales_player_page_no_table_sample) -
+            # not logged on every retry, just the first classified
+            # occurrence, so a real block is debuggable without spamming
+            # the log.
             diag.setdefault(
                 "challenge_page_sample",
                 f"url={url} status={status} title={title!r} body_excerpt={body_excerpt!r}",
@@ -659,24 +664,26 @@ def parse_sales_table(html: str, diag: Dict[str, int], limit: int = 30) -> List[
 
 
 async def fetch_market_page(page, player_url: str, diag: Dict[str, int]) -> "tuple[int, Optional[str]]":
-    """The dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked -
-    confirmed the /market page (already fetched here previously, only to
-    find the "latest sale" link that pointed at /sales/...) contains the
-    full Player Sales History table inline, so that endpoint is never
-    requested at all anymore. One fetch replaces the old two-hop
-    market-page-for-a-link + dedicated-sales-page dance."""
+    """NOT called anywhere in the live scrape path (_scrape_one) - kept
+    for tests/future reference only. The /market page was tried as the
+    sales source after the dedicated /sales/{id}/{slug} endpoint got
+    Cloudflare-blocked, but /market navigations were then confirmed
+    hard-blocked too (HTTP 403 on every request, even after BIN/bio were
+    working again on the player page). Sales are parsed from the player
+    page's own HTML instead - see parse_sales_table's call site in
+    _scrape_one."""
     market_url = player_url.rstrip("/") + "/market"
     return await fetch_page_html(page, market_url, diag)
 
 
 def parse_market_prices(html: str, diag: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[int]]:
-    """BIN prices as they'd be read from the /market page, reusing the
-    already-correct, real-HTML-verified parse_lowest_bin. NOT currently
-    wired in as a live BIN source anywhere - the /market page's price-box
-    markup has never been confirmed against real captured HTML the way
-    the player page's was (see parse_lowest_bin's own docstring for that
-    verification history), so BIN stays sourced from the player page.
-    Kept available for a future follow-up once that's confirmed."""
+    """NOT called anywhere in the live scrape path - kept for tests/future
+    reference only (see fetch_market_page's docstring for why /market
+    itself is no longer requested at all). BIN prices as they'd be read
+    from /market HTML, reusing the already-correct, real-HTML-verified
+    parse_lowest_bin - was never wired in as a live BIN source even
+    before /market was found to be blocked, since /market's price-box
+    markup was never separately confirmed against real captured HTML."""
     return {
         "ps": parse_lowest_bin(html, "ps", diag),
         "pc": parse_lowest_bin(html, "pc", diag),
@@ -684,10 +691,10 @@ def parse_market_prices(html: str, diag: Optional[Dict[str, Any]] = None) -> Dic
 
 
 def parse_market_page(html: str, diag: Dict[str, int]) -> Dict[str, Any]:
-    """Single entry point for everything this scraper reads off the
-    /market page. Only "sales" is consumed by _scrape_one today; "prices"
-    exists for the same not-yet-verified reason documented on
-    parse_market_prices()."""
+    """NOT called anywhere in the live scrape path - kept for tests/future
+    reference only. Was the single entry point for everything this
+    scraper used to read off the /market page, before /market navigations
+    were confirmed hard-blocked (see fetch_market_page's docstring)."""
     return {
         "prices": parse_market_prices(html, diag),
         "sales": parse_sales_table(html, diag),
@@ -852,22 +859,27 @@ async def _scrape_one(
             diag["bio_stats_failed"] += 1
             log.warning("Bio stats update failed for card_id=%s: %s", card_id, e)
 
-    # --- Sales history: parsed directly from the /market page (the
-    # dedicated /sales/{id}/{slug} endpoint is now Cloudflare-blocked;
-    # the /market page already contains the full auctions-table inline,
-    # so this is one fetch, no link-following, no second request) -
-    # dedupe on (player_id, sold_at, sold_price) ---
+    # --- Sales history: parsed from the SAME player_html already fetched
+    # above for BIN/bio - zero extra requests. Both the dedicated
+    # /sales/{id}/{slug} endpoint AND the /market page are Cloudflare-
+    # blocked (confirmed live: /market navigations return a hard 403 even
+    # after the player-page navigation-flow fix), but the earlier real
+    # captured player-page HTML already showed <table class="auctions-
+    # table"> present inline on the player page itself, not just /market -
+    # so this scraper now makes exactly ONE browser navigation per card
+    # (player_url) and parses BIN, bio, AND sales all from it. Dedupe on
+    # (player_id, sold_at, sold_price) ---
+    if player_html is None:
+        # The player-page fetch above already failed (bin_failed reflects
+        # this) - nothing to parse sales from either.
+        diag["sales_player_page_no_table"] += 1
+        diag.setdefault(
+            "sales_player_page_no_table_sample",
+            f"card_id={card_id} url={player_url} status={status}",
+        )
+        return
     try:
-        status, market_html = await fetch_market_page(page, player_url, diag)
-        _check_circuit_breaker(diag, abort_event)
-        if status != 200 or market_html is None:
-            diag["sales_market_fetch_failed"] += 1
-            diag.setdefault(
-                "sales_market_fetch_sample",
-                f"status={status} url={player_url.rstrip('/')}/market",
-            )
-            return
-        sales = parse_sales_table(market_html, diag)
+        sales = parse_sales_table(player_html, diag)
     except Exception as e:
         diag["sales_failed"] += 1
         log.warning("Sales scrape failed for card_id=%s: %s", card_id, e)
@@ -1100,13 +1112,13 @@ async def crawl_once() -> None:
         # other than a clean "no history yet" is going on, so a healthy run
         # doesn't spam the log with a wall of zeros.
         diagnostic_keys = [
-            "sales_market_fetch_failed", "sales_no_table", "sales_no_tbody",
+            "sales_player_page_no_table", "sales_no_table", "sales_no_tbody",
             "sales_rows_too_few_tds", "sales_rows_not_sold", "sales_rows_bad_date", "sales_rows_zero_price",
         ]
         if any(diag.get(k) for k in diagnostic_keys):
             log.info("Sales pipeline diagnostics: %s", {k: diag[k] for k in diagnostic_keys if diag.get(k)})
         for sample_key in (
-            "sales_market_fetch_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
+            "sales_player_page_no_table_sample", "sales_no_table_sample", "sales_rows_bad_date_sample",
             "challenge_page_sample",
         ):
             if sample_key in diag:

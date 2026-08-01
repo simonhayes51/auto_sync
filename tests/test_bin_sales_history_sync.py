@@ -481,6 +481,7 @@ class _FakeRecordingPage:
 
     def __init__(self, status=200, title="Kenan Yıldız - FUTBIN", body="real player content", html="<html>real</html>"):
         self.calls = []
+        self.goto_urls = []
         self.url = "https://www.futbin.com/26/player/24583/kenan-yldz"
         self._status = status
         self._title = title
@@ -489,6 +490,7 @@ class _FakeRecordingPage:
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.calls.append("goto")
+        self.goto_urls.append(url)
         return _FakeResponse(self._status)
 
     async def title(self):
@@ -578,3 +580,137 @@ async def test_save_debug_block_artifacts_once_per_run(tmp_path, monkeypatch):
     assert page.calls.count("screenshot") == 1
     assert diag["debug_block_artifacts_saved"] is True
     assert (tmp_path / "debug_last_block.html").read_text(encoding="utf-8") == "<html>real</html>"
+
+
+# ---------------------------------------------------------------------------
+# _scrape_one() - exactly one browser navigation per card: BIN, bio, AND
+# sales all parsed from the same player_html. fetch_market_page() must
+# never be called; no /market URL is ever navigated to.
+# ---------------------------------------------------------------------------
+class _FakeExecConn:
+    def __init__(self):
+        self.executed = []
+
+    async def execute(self, sql, *params):
+        self.executed.append((sql, params))
+        return "INSERT 0 1"
+
+
+class _FakeAcquireCtx:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FakePool:
+    def __init__(self):
+        self.conn = _FakeExecConn()
+
+    def acquire(self):
+        return _FakeAcquireCtx(self.conn)
+
+
+# Combines the real, already-verified price-box structure (see
+# test_parse_lowest_bin-style fixtures used elsewhere this session) with
+# the synthetic auctions-table fixture above - a single player_html that
+# should yield BIN (both platforms), bio, AND sales all from one page.
+COMBINED_PLAYER_PAGE_HTML = """
+<html><head><title>Kenan Yildiz - FUTBIN</title></head><body>
+<div class="price-box platform-ps-only price-box-original-player" data-id="24583">
+  <div class="column">
+    <div class="price inline-with-icon lowest-price-1">120,000<img alt="Coin" src="x"></div>
+  </div>
+</div>
+<div class="price-box platform-pc-only price-box-original-player" data-id="24583">
+  <div class="column">
+    <div class="price inline-with-icon lowest-price-1">130,000<img alt="Coin" src="x"></div>
+  </div>
+</div>
+<div class="player-text-section">
+  <span class="platform-ps-only">He has been used in 1,234 games with a GPG (goals per game) of 0.500. The best chemistry style for him is Basic.</span>
+  <span class="platform-pc-only">He has been used in 500 games with a GPG (goals per game) of 0.400. The best chemistry style for him is Basic.</span>
+</div>
+<table class="auctions-table">
+  <tbody>
+    <tr>
+      <td><div><i class="fa fa-check"></i><span class="sales-date-time">Jul 30, 6:32 PM</span></div></td>
+      <td>115,000</td>
+      <td>115,000</td>
+      <td>5,750</td>
+      <td>109,250</td>
+      <td>Buy Now</td>
+    </tr>
+  </tbody>
+</table>
+</body></html>
+"""
+
+
+@run_async
+async def test_scrape_one_makes_exactly_one_navigation_and_parses_sales_from_player_html():
+    pool = _FakePool()
+    page = _FakeRecordingPage(html=COMBINED_PLAYER_PAGE_HTML)
+    diag = defaultdict(int)
+    abort_event = asyncio.Event()
+
+    await mod._scrape_one(pool, page, 24583, "https://www.futbin.com/26/player/24583/kenan-yldz", diag, abort_event)
+
+    # Exactly one navigation - no /market, no /sales/ URL ever visited.
+    assert page.calls.count("goto") == 1
+    assert page.goto_urls == ["https://www.futbin.com/26/player/24583/kenan-yldz"]
+    assert not any("/market" in u for u in page.goto_urls)
+    assert not any("/sales/" in u for u in page.goto_urls)
+
+    assert diag["bin_price_found"] == 2
+    assert diag["bin_failed"] == 0
+    assert diag["sales_new"] == 1
+    assert diag["sales_player_page_no_table"] == 0
+
+    # BIN inserts (2) + bio update (1) + sales insert (1) = 4 DB calls.
+    insert_bin_calls = [c for c in pool.conn.executed if "INSERT INTO bin_history" in c[0]]
+    sales_calls = [c for c in pool.conn.executed if "INSERT INTO sales_history" in c[0]]
+    assert len(insert_bin_calls) == 2
+    assert len(sales_calls) == 1
+
+
+@run_async
+async def test_scrape_one_never_calls_fetch_market_page(monkeypatch):
+    called = {"count": 0}
+
+    async def fake_fetch_market_page(page, player_url, diag):
+        called["count"] += 1
+        return 200, "<html></html>"
+
+    monkeypatch.setattr(mod, "fetch_market_page", fake_fetch_market_page)
+
+    pool = _FakePool()
+    page = _FakeRecordingPage(html=COMBINED_PLAYER_PAGE_HTML)
+    diag = defaultdict(int)
+    abort_event = asyncio.Event()
+
+    await mod._scrape_one(pool, page, 24583, "https://www.futbin.com/26/player/24583/kenan-yldz", diag, abort_event)
+
+    assert called["count"] == 0
+
+
+def test_scrape_one_sets_sales_player_page_no_table_when_player_fetch_fails(monkeypatch, tmp_path):
+    # 403 also triggers the real debug-artifact save - run from tmp_path so
+    # it can't write into this repo's working directory.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod, "HISTORY_MAX_RETRIES", 0)  # keep the 403 retry path fast
+    pool = _FakePool()
+    page = _FakeRecordingPage(status=403, html=None)
+    diag = defaultdict(int)
+    abort_event = asyncio.Event()
+
+    asyncio.run(mod._scrape_one(
+        pool, page, 24583, "https://www.futbin.com/26/player/24583/kenan-yldz", diag, abort_event,
+    ))
+
+    assert diag["sales_player_page_no_table"] == 1
+    assert diag["sales_new"] == 0
