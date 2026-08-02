@@ -168,15 +168,33 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
         )
         """
     )
+    # is_tradeable starts NULL ("unknown, never priced") - futgg_price_sync.py
+    # sets it TRUE/FALSE once a real price observation confirms which. NULL
+    # cards are still eligible for price selection (see fetch_due_cards);
+    # only a confirmed FALSE (SBC/objective/untradeable) is excluded, so
+    # metadata sync never has to guess tradeability itself.
+    await conn.execute(
+        "ALTER TABLE futgg_players ADD COLUMN IF NOT EXISTS is_tradeable BOOLEAN"
+    )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS futgg_players_price_due_idx "
-        "ON futgg_players (next_price_due_at, price_tier) WHERE is_active"
+        "ON futgg_players (next_price_due_at, price_tier) "
+        "WHERE is_active AND is_tradeable IS DISTINCT FROM FALSE"
     )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS futgg_players_player_idx ON futgg_players (source_player_id)"
     )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS futgg_players_name_idx ON futgg_players (LOWER(name))"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS futgg_players_rarity_idx ON futgg_players (rarity)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS futgg_players_rating_idx ON futgg_players (rating)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS futgg_players_active_idx ON futgg_players (is_active)"
     )
 
 

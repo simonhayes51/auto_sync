@@ -28,6 +28,12 @@ Environment variables:
   FUTGG_GOLD_COMMON_INTERVAL_MIN  720
   FUTGG_SILVER_INTERVAL_MIN       2880
   FUTGG_BRONZE_INTERVAL_MIN       4320
+  FUTGG_CIRCUIT_BREAKER_THRESHOLD 5 (consecutive 403/429/failed navigations before this run stops)
+
+Price outcomes (futgg_players.last_price_status): success, untradeable,
+no_active_market, price_section_missing, page_failed, parse_failed,
+rate_limited, blocked. A confirmed "untradeable" card gets is_tradeable=FALSE
+and next_price_due_at=NULL - it drops out of fetch_due_cards for good.
 """
 
 from __future__ import annotations
@@ -56,10 +62,19 @@ if not DATABASE_URL:
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TIMEOUT_MS = max(5000, int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "45000")))
-BATCH_SIZE = max(1, int(os.getenv("FUTGG_PRICE_BATCH_SIZE", "500")))
-CONCURRENCY = max(1, int(os.getenv("FUTGG_PRICE_CONCURRENCY", "2")))
-REQUEST_DELAY = max(0.0, float(os.getenv("FUTGG_PRICE_REQUEST_DELAY", "0.25")))
+# Conservative starting point per the migration plan - raise only after
+# measuring reliability and run duration in production.
+BATCH_SIZE = max(1, int(os.getenv("FUTGG_PRICE_BATCH_SIZE", "100")))
+CONCURRENCY = max(1, int(os.getenv("FUTGG_PRICE_CONCURRENCY", "1")))
+REQUEST_DELAY = max(0.0, float(os.getenv("FUTGG_PRICE_REQUEST_DELAY", "0.5")))
 OVERLAP_LOCK_KEY = int(os.getenv("FUTGG_PRICE_LOCK_KEY", "7741022"))
+
+# Circuit breaker: a burst of blocked/rate-limited responses means FUT.GG is
+# actively pushing back, and hammering it through that is exactly what the
+# migration plan forbids. Trips after CIRCUIT_BREAKER_THRESHOLD consecutive
+# 403/429/navigation failures and stops scheduling new cards for this run.
+CIRCUIT_BREAKER_THRESHOLD = max(1, int(os.getenv("FUTGG_CIRCUIT_BREAKER_THRESHOLD", "5")))
+BLOCKED_STATUS_CODES = {403, 429}
 
 INTERVALS = {
     "special": max(10, int(os.getenv("FUTGG_SPECIAL_INTERVAL_MIN", "60"))),
@@ -126,6 +141,7 @@ async def fetch_due_cards(conn: asyncpg.Connection) -> list[asyncpg.Record]:
         SELECT source_card_id, source_url, price_tier
         FROM futgg_players
         WHERE is_active
+          AND is_tradeable IS DISTINCT FROM FALSE
           AND (next_price_due_at IS NULL OR next_price_due_at <= NOW())
         ORDER BY next_price_due_at ASC NULLS FIRST, price_updated_at ASC NULLS FIRST
         LIMIT $1
@@ -190,14 +206,43 @@ async def record_success(
         else:
             sales_dupe += 1
 
-    interval = INTERVALS.get(row["price_tier"], INTERVALS["bronze"])
-    status = "ok" if card.lowest_bin is not None or card.recent_sales else "no_market_data"
+    status = card.price_outcome  # success | untradeable | no_active_market | price_section_missing
+
+    if status == "untradeable":
+        # No regular price scrape for confirmed-untradeable cards (SBC /
+        # objective rewards) - park them far out instead of retrying every
+        # cron tick. is_tradeable=FALSE also removes them from
+        # fetch_due_cards entirely going forward.
+        await conn.execute(
+            """
+            UPDATE futgg_players
+            SET price_updated_at = $2,
+                next_price_due_at = NULL,
+                last_price_status = $3,
+                is_tradeable = FALSE,
+                last_seen_at = NOW()
+            WHERE source_card_id = $1
+            """,
+            card.source_card_id, captured_at, status,
+        )
+        return bin_rows, sales_new, sales_dupe
+
+    # Back off cards that repeatedly have no market data instead of
+    # retrying at the normal tier cadence - a card with no price for
+    # several consecutive runs is very likely illiquid/delisted, not a
+    # transient miss.
+    if status in ("no_active_market", "price_section_missing"):
+        interval = min(INTERVALS.get(row["price_tier"], INTERVALS["bronze"]) * 3, 4320 * 3)
+    else:
+        interval = INTERVALS.get(row["price_tier"], INTERVALS["bronze"])
+
     await conn.execute(
         """
         UPDATE futgg_players
         SET price_updated_at = $2,
             next_price_due_at = $2 + ($3 * INTERVAL '1 minute'),
             last_price_status = $4,
+            is_tradeable = COALESCE($5, is_tradeable),
             last_seen_at = NOW()
         WHERE source_card_id = $1
         """,
@@ -205,11 +250,12 @@ async def record_success(
         captured_at,
         interval,
         status,
+        True if status == "success" else None,
     )
     return bin_rows, sales_new, sales_dupe
 
 
-async def record_failure(conn: asyncpg.Connection, row: asyncpg.Record, reason: str) -> None:
+async def record_failure(conn: asyncpg.Connection, row: asyncpg.Record, reason: str, status: str = "page_failed") -> None:
     interval = min(INTERVALS.get(row["price_tier"], 720), 360)
     await conn.execute(
         """
@@ -220,8 +266,29 @@ async def record_failure(conn: asyncpg.Connection, row: asyncpg.Record, reason: 
         """,
         row["source_card_id"],
         interval,
-        reason[:200],
+        status[:200],
     )
+
+
+class CircuitBreaker:
+    """Trips after CIRCUIT_BREAKER_THRESHOLD consecutive blocked/failed
+    navigations, so a degraded or actively-blocking FUT.GG stops the run
+    from continuing to hammer it. Any success resets the streak."""
+
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
+        self._consecutive = 0
+        self.tripped = False
+        self.trip_reason: str | None = None
+
+    def record_success(self) -> None:
+        self._consecutive = 0
+
+    def record_failure(self, reason: str) -> None:
+        self._consecutive += 1
+        if self._consecutive >= self.threshold:
+            self.tripped = True
+            self.trip_reason = reason
 
 
 async def worker_loop(
@@ -230,8 +297,12 @@ async def worker_loop(
     pool: asyncpg.Pool,
     queue: asyncio.Queue,
     stats: dict[str, int],
+    breaker: CircuitBreaker,
 ) -> None:
     while True:
+        if breaker.tripped:
+            log.warning("worker=%d stopping: circuit breaker tripped (%s)", worker_id, breaker.trip_reason)
+            return
         try:
             row = queue.get_nowait()
         except asyncio.QueueEmpty:
@@ -245,6 +316,14 @@ async def worker_loop(
                 timeout=TIMEOUT_MS,
             )
             status = response.status if response else 0
+            if status in BLOCKED_STATUS_CODES:
+                stats["blocked"] += 1
+                async with pool.acquire() as conn:
+                    reason = "rate_limited" if status == 429 else "blocked"
+                    await record_failure(conn, row, f"HTTP {status}", status=reason)
+                breaker.record_failure(f"HTTP {status}")
+                stats["cards_failed"] += 1
+                continue
             if status != 200:
                 raise RuntimeError(f"HTTP {status}")
 
@@ -259,22 +338,28 @@ async def worker_loop(
             async with pool.acquire() as conn:
                 bin_rows, sales_new, sales_dupe = await record_success(conn, row, card, captured_at)
 
+            breaker.record_success()
             stats["cards_ok"] += 1
             stats["bin_rows"] += bin_rows
             stats["sales_new"] += sales_new
             stats["sales_dupe"] += sales_dupe
-            if card.lowest_bin is None and not card.recent_sales:
+            if card.price_outcome == "untradeable":
+                stats["untradeable"] += 1
+            elif card.price_outcome in ("no_active_market", "price_section_missing"):
                 stats["no_market_data"] += 1
             log.info(
-                "worker=%d card=%s tier=%s bin=%s sales=%d new=%d",
+                "worker=%d card=%s tier=%s outcome=%s bin=%s sales=%d new=%d",
                 worker_id, row["source_card_id"], row["price_tier"],
-                card.lowest_bin, len(card.recent_sales), sales_new,
+                card.price_outcome, card.lowest_bin, len(card.recent_sales), sales_new,
             )
         except Exception as exc:
             stats["cards_failed"] += 1
+            stats["parse_failures" if isinstance(exc, (ValueError, KeyError)) else "navigation_failures"] += 1
             log.warning("worker=%d card=%s failed: %s", worker_id, row["source_card_id"], exc)
+            breaker.record_failure(f"{type(exc).__name__}: {exc}")
             async with pool.acquire() as conn:
-                await record_failure(conn, row, f"error:{type(exc).__name__}")
+                status = "parse_failed" if isinstance(exc, (ValueError, KeyError)) else "page_failed"
+                await record_failure(conn, row, f"error:{type(exc).__name__}", status=status)
         finally:
             queue.task_done()
 
@@ -300,7 +385,12 @@ async def crawl_once() -> None:
         "sales_new": 0,
         "sales_dupe": 0,
         "no_market_data": 0,
+        "untradeable": 0,
+        "blocked": 0,
+        "parse_failures": 0,
+        "navigation_failures": 0,
     }
+    breaker = CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD)
     try:
         async with pool.acquire() as conn:
             await ensure_schema(conn)
@@ -327,10 +417,13 @@ async def crawl_once() -> None:
 
         pages = [await context.new_page() for _ in range(CONCURRENCY)]
         await asyncio.gather(
-            *(worker_loop(index + 1, page, pool, queue, stats) for index, page in enumerate(pages))
+            *(worker_loop(index + 1, page, pool, queue, stats, breaker) for index, page in enumerate(pages))
         )
 
-        ok = stats["cards_ok"] > 0 and stats["cards_failed"] < stats["selected"]
+        if breaker.tripped:
+            log.warning("Circuit breaker tripped: %s - stopped scheduling new cards this run", breaker.trip_reason)
+
+        ok = stats["cards_ok"] > 0 and stats["cards_failed"] < stats["selected"] and not breaker.tripped
         async with pool.acquire() as conn:
             await heartbeat(
                 conn,

@@ -93,6 +93,7 @@ class FutggCard:
     price_range_low: int | None = None
     price_range_high: int | None = None
     recent_sales: list[SaleObservation] = field(default_factory=list)
+    price_outcome: str = "no_active_market"
 
     parse_warnings: list[str] = field(default_factory=list)
 
@@ -308,6 +309,32 @@ def _parse_player_information(soup: BeautifulSoup, card: FutggCard) -> None:
     card.age = _parse_int_field(age)
 
 
+UNTRADEABLE_MARKERS = (
+    "not tradeable",
+    "untradeable",
+    "this item cannot be sold",
+    "sbc reward",
+    "objective reward",
+)
+
+
+def detect_price_outcome(soup: BeautifulSoup, card: "FutggCard") -> str:
+    """Classifies why a card page did/did not yield a price, so an SBC or
+    objective-only card isn't treated the same as a genuine scrape
+    failure (see futgg_price_sync.py's status handling)."""
+    if card.lowest_bin is not None or card.recent_sales:
+        return "success"
+
+    page_text = clean_text(soup.get_text(" ", strip=True)).casefold()
+    if any(marker in page_text for marker in UNTRADEABLE_MARKERS):
+        return "untradeable"
+
+    if soup.select_one("#prices-overview") is None:
+        return "price_section_missing"
+
+    return "no_active_market"
+
+
 def _find_recent_sales_table(soup: BeautifulSoup):
     heading = _find_exact(soup, "Recent Sales")
     if heading is None:
@@ -401,6 +428,7 @@ def parse_futgg_card(html: str, url: str, captured_at: datetime | None = None) -
     _parse_card_visual(soup, card)
     _parse_player_information(soup, card)
     _parse_prices(soup, card, captured_at)
+    card.price_outcome = detect_price_outcome(soup, card)
     return card
 
 
