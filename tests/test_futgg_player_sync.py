@@ -366,3 +366,140 @@ def test_daily_mode_is_the_default():
 def test_scroll_round_config_removed():
     assert not hasattr(mod, "SCROLL_ROUNDS")
     assert not hasattr(mod, "LISTING_URL")
+
+
+class _FakeCardLocator:
+    def __init__(self, should_timeout=False):
+        self._should_timeout = should_timeout
+
+    @property
+    def first(self):
+        return self
+
+    async def wait_for(self, state=None, timeout=None):
+        if self._should_timeout:
+            raise mod.PlaywrightTimeoutError("card never appeared")
+
+
+class _FakeCardPage:
+    """Simulates a single card-detail page for _fetch_worker() tests -
+    goto() returns status codes from a per-URL map (default 200), so
+    tests can simulate specific cards failing/blocking without a real
+    browser or network."""
+
+    def __init__(self, statuses=None):
+        self.statuses = statuses or {}
+        self.visited: list[str] = []
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.visited.append(url)
+        return _FakeResponse(self.statuses.get(url, 200))
+
+    def locator(self, selector):
+        return _FakeCardLocator()
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+    async def content(self):
+        return "<html></html>"
+
+
+class _FakeAcquireCtx:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakePool:
+    def acquire(self):
+        return _FakeAcquireCtx()
+
+
+class _FetchWorkerHarness:
+    """Wires _fetch_worker()'s two real I/O dependencies (parse_futgg_card,
+    upsert_card, both DB/HTML-parsing in production) to fakes, so the
+    test only exercises queue distribution / stats / circuit-breaker
+    behaviour."""
+
+    def __init__(self, monkeypatch, card_ids_by_url):
+        self.upserted: list[int] = []
+        self.card_ids_by_url = card_ids_by_url
+
+        def fake_parse(html, url, *a, **kw):
+            from futgg_common import FutggCard
+            card_id = card_ids_by_url[url]
+            return FutggCard(
+                source_card_id=card_id, source_player_id=1, source_slug="x",
+                game_year=26, source_url=url, name=f"Card {card_id}",
+                rating=75, rarity="Rare",
+            )
+
+        async def fake_upsert(conn, card):
+            self.upserted.append(card.source_card_id)
+
+        monkeypatch.setattr(mod, "parse_futgg_card", fake_parse)
+        monkeypatch.setattr(mod, "upsert_card", fake_upsert)
+        monkeypatch.setattr(mod, "REQUEST_DELAY", 0)
+
+
+@run_async
+async def test_fetch_worker_pool_processes_every_target_exactly_once(monkeypatch):
+    urls = [f"https://www.fut.gg/players/{n}-p/26-{n}/" for n in range(1, 11)]
+    card_ids_by_url = {url: n for n, url in enumerate(urls, start=1)}
+    harness = _FetchWorkerHarness(monkeypatch, card_ids_by_url)
+
+    queue: "asyncio.Queue" = asyncio.Queue()
+    for index, url in enumerate(urls, start=1):
+        queue.put_nowait((index, url, False))
+
+    pages = [_FakeCardPage() for _ in range(3)]
+    stats = {"new": 0, "updated": 0, "failed": 0}
+    breaker = mod.CircuitBreaker(threshold=5)
+
+    await asyncio.gather(
+        *(
+            mod._fetch_worker(i + 1, page, pool=_FakePool(), queue=queue, total=len(urls), stats=stats, breaker=breaker)
+            for i, page in enumerate(pages)
+        )
+    )
+
+    assert sorted(harness.upserted) == list(range(1, 11))
+    assert stats["new"] == 10
+    assert stats["failed"] == 0
+    assert queue.empty()
+    # Total visits across the pool must equal the target count exactly
+    # once each - which page happened to visit which URL isn't asserted:
+    # with instant fake I/O (no real suspension point) a single worker
+    # can legitimately drain the whole queue before its siblings are
+    # ever scheduled, so "every page visited something" isn't a
+    # meaningful assertion here. Real Playwright navigations always
+    # suspend on actual I/O, which is what makes the pool actually
+    # concurrent in production.
+    assert sum(len(page.visited) for page in pages) == len(urls)
+
+
+@run_async
+async def test_fetch_worker_circuit_breaker_stops_remaining_work(monkeypatch):
+    urls = [f"https://www.fut.gg/players/{n}-p/26-{n}/" for n in range(1, 11)]
+    card_ids_by_url = {url: n for n, url in enumerate(urls, start=1)}
+    _FetchWorkerHarness(monkeypatch, card_ids_by_url)
+
+    queue: "asyncio.Queue" = asyncio.Queue()
+    for index, url in enumerate(urls, start=1):
+        queue.put_nowait((index, url, False))
+
+    # A single page that returns HTTP 403 for every URL - should trip
+    # the breaker well before all 10 targets are attempted.
+    page = _FakeCardPage(statuses={url: 403 for url in urls})
+    stats = {"new": 0, "updated": 0, "failed": 0}
+    breaker = mod.CircuitBreaker(threshold=3)
+
+    await mod._fetch_worker(1, page, pool=_FakePool(), queue=queue, total=len(urls), stats=stats, breaker=breaker)
+
+    assert breaker.tripped
+    assert stats["failed"] == 3
+    # The remaining targets were never dequeued/attempted once tripped.
+    assert not queue.empty()

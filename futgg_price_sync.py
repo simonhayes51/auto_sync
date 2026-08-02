@@ -49,7 +49,7 @@ from typing import Any
 import asyncpg
 from playwright.async_api import async_playwright
 
-from futgg_common import parse_futgg_card
+from futgg_common import CircuitBreaker, parse_futgg_card
 from futgg_player_sync import ensure_schema as ensure_player_schema
 from monitoring import alert, heartbeat
 
@@ -269,26 +269,6 @@ async def record_failure(conn: asyncpg.Connection, row: asyncpg.Record, reason: 
         status[:200],
     )
 
-
-class CircuitBreaker:
-    """Trips after CIRCUIT_BREAKER_THRESHOLD consecutive blocked/failed
-    navigations, so a degraded or actively-blocking FUT.GG stops the run
-    from continuing to hammer it. Any success resets the streak."""
-
-    def __init__(self, threshold: int) -> None:
-        self.threshold = threshold
-        self._consecutive = 0
-        self.tripped = False
-        self.trip_reason: str | None = None
-
-    def record_success(self) -> None:
-        self._consecutive = 0
-
-    def record_failure(self, reason: str) -> None:
-        self._consecutive += 1
-        if self._consecutive >= self.threshold:
-            self.tripped = True
-            self.trip_reason = reason
 
 
 async def worker_loop(

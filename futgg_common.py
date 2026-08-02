@@ -24,6 +24,29 @@ POSITIONS = {
 }
 
 
+class CircuitBreaker:
+    """Trips after `threshold` consecutive blocked/failed navigations, so
+    a degraded or actively-blocking FUT.GG stops a run from continuing
+    to hammer it. Any success resets the streak. Shared by
+    futgg_player_sync.py and futgg_price_sync.py - originally defined
+    only in the latter."""
+
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
+        self._consecutive = 0
+        self.tripped = False
+        self.trip_reason: str | None = None
+
+    def record_success(self) -> None:
+        self._consecutive = 0
+
+    def record_failure(self, reason: str) -> None:
+        self._consecutive += 1
+        if self._consecutive >= self.threshold:
+            self.tripped = True
+            self.trip_reason = reason
+
+
 @dataclass
 class SaleObservation:
     age_text: str
