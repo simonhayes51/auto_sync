@@ -70,14 +70,20 @@ class _FakeListingPage:
     """Simulates FUT.GG's paginated listing. pages_hrefs maps page number
     -> list of hrefs found there; a page number beyond the dict (or one
     marked in empty_from) simulates running past the end of the
-    catalogue (no card links present)."""
+    catalogue (no card links present). stale_reads maps page number -> how
+    many times reading that page's hrefs should return the PREVIOUS
+    page's content first (simulating the real observed client-render
+    race), before returning the real content - proves the stabilize-retry
+    loop in collect_listing_urls() actually retries instead of trusting
+    the first read."""
 
-    def __init__(self, pages_hrefs, status=200, empty_from=None):
+    def __init__(self, pages_hrefs, status=200, empty_from=None, stale_reads=None):
         self.goto_urls = []
         self._pages_hrefs = pages_hrefs
         self._status = status
         self._empty_from = empty_from
         self._current_page = 1
+        self._reads_remaining_stale = dict(stale_reads or {})
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.goto_urls.append(url)
@@ -85,12 +91,20 @@ class _FakeListingPage:
         self._current_page = int(match.group(1)) if match else 1
         return _FakeResponse(self._status)
 
+    async def wait_for_timeout(self, ms):
+        pass  # no real delay in tests - the stabilize-retry loop still runs its logic
+
     def locator(self, selector):
-        hrefs = self._pages_hrefs.get(self._current_page, [])
         if selector == "a[href*='/players/']":
             no_links = self._empty_from is not None and self._current_page >= self._empty_from
             return _FakeLocator(should_timeout=no_links)
         if selector == "a[href]":
+            remaining = self._reads_remaining_stale.get(self._current_page, 0)
+            if remaining > 0:
+                self._reads_remaining_stale[self._current_page] = remaining - 1
+                stale_hrefs = self._pages_hrefs.get(self._current_page - 1, [])
+                return _FakeLocator(hrefs=stale_hrefs)
+            hrefs = self._pages_hrefs.get(self._current_page, [])
             return _FakeLocator(hrefs=hrefs)
         return _FakeLocator()
 
@@ -160,6 +174,8 @@ async def test_collect_listing_urls_stops_early_after_idle_pages(monkeypatch):
     monkeypatch.setattr(mod, "PLAYER_LIMIT", 0)
     monkeypatch.setattr(mod, "IDLE_ROUNDS", 2)
     monkeypatch.setattr(mod, "PAGE_DELAY", 0)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_POLL_MS", 0)
     # Page 1 has cards; pages 2+ repeat the SAME cards (zero new) - should
     # stop after 2 consecutive idle pages (pages 2 and 3), well short of
     # the 400-page cap.
@@ -223,6 +239,63 @@ async def test_collect_listing_urls_respects_player_limit(monkeypatch):
     urls = await mod.collect_listing_urls(page)
 
     assert len(urls) == 3
+    assert page.goto_urls == [
+        "https://www.fut.gg/players/new/?page=1",
+        "https://www.fut.gg/players/new/?page=2",
+    ]
+
+
+@run_async
+async def test_collect_listing_urls_retries_stale_content_until_it_updates(monkeypatch):
+    """Regression test for the live bug: a full-scan run oscillated
+    30-new/0-new across pages instead of accumulating steadily, because
+    some pages were read before their client-rendered content had
+    actually swapped in from the previous page. Without the
+    stabilize-retry loop, page 2 here would read as "0 new" (still
+    showing page 1's cards) and the run would stop early via idle-page
+    detection, missing real content on pages 2 and 3."""
+    monkeypatch.setattr(mod, "MAX_PAGES", 3)
+    monkeypatch.setattr(mod, "PLAYER_LIMIT", 0)
+    monkeypatch.setattr(mod, "IDLE_ROUNDS", 10)
+    monkeypatch.setattr(mod, "PAGE_DELAY", 0)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_MAX_ATTEMPTS", 5)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_POLL_MS", 0)
+    pages_hrefs = {
+        1: [_card_href(1), _card_href(2)],
+        2: [_card_href(3), _card_href(4)],
+        3: [_card_href(5)],
+    }
+    # Page 2's first 2 reads return page 1's stale content; the 3rd read
+    # (within the 5-attempt budget) returns page 2's real content.
+    page = _FakeListingPage(pages_hrefs, stale_reads={2: 2})
+
+    urls = await mod.collect_listing_urls(page)
+
+    assert len(urls) == 5
+
+
+@run_async
+async def test_collect_listing_urls_gives_up_after_stabilize_attempts_exhausted(monkeypatch):
+    """If a page's content never stabilizes into something new within the
+    attempt budget (a genuine end-of-catalogue page re-serving the same
+    content, not just a slow render), the stabilize loop must give up and
+    treat it as a real zero-new page rather than retrying forever."""
+    monkeypatch.setattr(mod, "MAX_PAGES", 3)
+    monkeypatch.setattr(mod, "PLAYER_LIMIT", 0)
+    monkeypatch.setattr(mod, "IDLE_ROUNDS", 1)
+    monkeypatch.setattr(mod, "PAGE_DELAY", 0)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_POLL_MS", 0)
+    pages_hrefs = {
+        1: [_card_href(1)],
+        2: [_card_href(1)],  # genuinely identical to page 1, every read
+        3: [_card_href(1)],
+    }
+    page = _FakeListingPage(pages_hrefs)
+
+    urls = await mod.collect_listing_urls(page)
+
+    assert len(urls) == 1
     assert page.goto_urls == [
         "https://www.fut.gg/players/new/?page=1",
         "https://www.fut.gg/players/new/?page=2",

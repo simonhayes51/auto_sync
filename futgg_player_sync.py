@@ -31,6 +31,8 @@ Important environment variables:
   FUTGG_LISTING_MAX_PAGES_FULL    400 (full-scan mode)
   FUTGG_LISTING_IDLE_ROUNDS       4 (consecutive pages w/ 0 new cards before stopping)
   FUTGG_LISTING_PAGE_DELAY        0.5 seconds, between listing-page navigations
+  FUTGG_LISTING_STABILIZE_ATTEMPTS 6 (retries waiting for a page's cards to differ from the previous page's)
+  FUTGG_LISTING_STABILIZE_POLL_MS 400 (wait between stabilize retries)
   FUTGG_REFRESH_EXISTING          false
   FUTGG_PLAYER_REQUEST_DELAY      0.35 seconds
 """
@@ -78,6 +80,16 @@ MAX_PAGES = MAX_PAGES_FULL if FULL_SCAN else MAX_PAGES_DAILY
 # early-stop role either way.
 IDLE_ROUNDS = max(1, int(os.getenv("FUTGG_LISTING_IDLE_ROUNDS", "4")))
 PAGE_DELAY = max(0.0, float(os.getenv("FUTGG_LISTING_PAGE_DELAY", "0.5")))
+
+# FUT.GG's listing is client-rendered - the previous page's cards can
+# still be attached for a moment after a query-param-only navigation
+# while new content is still being fetched (confirmed live: a full-scan
+# run oscillated 30-new/0-new across pages instead of accumulating
+# steadily). collect_listing_urls() polls up to this many times, waiting
+# this long between attempts, until the visible cards differ from the
+# previous page's - see its own docstring.
+LISTING_STABILIZE_MAX_ATTEMPTS = max(1, int(os.getenv("FUTGG_LISTING_STABILIZE_ATTEMPTS", "6")))
+LISTING_STABILIZE_POLL_MS = max(50, int(os.getenv("FUTGG_LISTING_STABILIZE_POLL_MS", "400")))
 
 REFRESH_EXISTING = os.getenv("FUTGG_REFRESH_EXISTING", "false").strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_DELAY = max(0.0, float(os.getenv("FUTGG_PLAYER_REQUEST_DELAY", "0.35")))
@@ -184,6 +196,22 @@ async def dismiss_cookie_banner(page) -> None:
             pass
 
 
+async def _read_card_hrefs(page) -> set[str]:
+    """The set of canonical card URLs currently visible on the page."""
+    hrefs = await page.locator("a[href]").evaluate_all(
+        "nodes => nodes.map(node => node.getAttribute('href'))"
+    )
+    matched: set[str] = set()
+    for href in hrefs:
+        if not href:
+            continue
+        absolute = urljoin(BASE_URL, href)
+        parsed = urlparse(absolute)
+        if CARD_URL_RE.match(parsed.path):
+            matched.add(urljoin(BASE_URL, parsed.path))
+    return matched
+
+
 async def collect_listing_urls(page) -> list[str]:
     """Discovers card URLs via real pagination (?page=1, ?page=2, ...) -
     no window.scrollTo() or scroll-settle waits anywhere. Each page is a
@@ -194,6 +222,7 @@ async def collect_listing_urls(page) -> list[str]:
     run past the end of the catalogue."""
     seen: dict[str, None] = {}
     idle_pages = 0
+    previous_page_hrefs: set[str] = set()
 
     for page_number in range(1, MAX_PAGES + 1):
         listing_url = f"{BASE_URL}/players/new/?page={page_number}"
@@ -214,18 +243,31 @@ async def collect_listing_urls(page) -> list[str]:
             log.info("No card links on listing page %d - treating as end of catalogue", page_number)
             break
 
-        hrefs = await page.locator("a[href]").evaluate_all(
-            "nodes => nodes.map(node => node.getAttribute('href'))"
-        )
+        # FUT.GG's listing is client-rendered - a query-param-only
+        # navigation can leave the PREVIOUS page's cards still attached
+        # for a moment while the new content is still being fetched, so
+        # the "attached" wait above only confirms *some* /players/ link
+        # exists, not that it's THIS page's content. Confirmed live: a
+        # full-scan run oscillated between 30-new and 0-new pages instead
+        # of steadily accumulating, because some pages were read before
+        # their content had actually swapped in. Poll until the visible
+        # card hrefs differ from the previous page's, or give up after a
+        # bounded number of attempts - a genuine end-of-catalogue page
+        # that keeps re-serving the same content still correctly settles
+        # into "0 new" once attempts are exhausted; this only adds
+        # patience for the transient render-timing case.
+        current_hrefs = await _read_card_hrefs(page)
+        for _ in range(LISTING_STABILIZE_MAX_ATTEMPTS - 1):
+            if current_hrefs != previous_page_hrefs or not previous_page_hrefs:
+                break
+            await page.wait_for_timeout(LISTING_STABILIZE_POLL_MS)
+            current_hrefs = await _read_card_hrefs(page)
+
         before = len(seen)
-        for href in hrefs:
-            if not href:
-                continue
-            absolute = urljoin(BASE_URL, href)
-            parsed = urlparse(absolute)
-            if CARD_URL_RE.match(parsed.path):
-                seen[urljoin(BASE_URL, parsed.path)] = None
+        for card_url in current_hrefs:
+            seen[card_url] = None
         new_this_page = len(seen) - before
+        previous_page_hrefs = current_hrefs
 
         log.info(
             "Listing page %d: %d new cards, %d unique total", page_number, new_this_page, len(seen)
