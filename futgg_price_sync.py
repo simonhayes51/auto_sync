@@ -239,8 +239,8 @@ async def record_success(
     await conn.execute(
         """
         UPDATE futgg_players
-        SET price_updated_at = $2,
-            next_price_due_at = $2 + ($3 * INTERVAL '1 minute'),
+        SET price_updated_at = $2::timestamptz,
+            next_price_due_at = $2::timestamptz + ($3 * INTERVAL '1 minute'),
             last_price_status = $4,
             is_tradeable = COALESCE($5, is_tradeable),
             last_seen_at = NOW()
