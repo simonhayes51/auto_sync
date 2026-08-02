@@ -276,7 +276,16 @@ async def collect_listing_urls(page) -> list[str]:
         # patience for the transient render-timing case.
         current_hrefs = await _read_card_hrefs(page)
         for _ in range(LISTING_STABILIZE_MAX_ATTEMPTS - 1):
-            if current_hrefs != previous_page_hrefs or not previous_page_hrefs:
+            # Retry while the read looks untrustworthy: EMPTY (the client
+            # render hasn't populated the card grid yet - true on page 1
+            # too, not just later pages with something to compare
+            # against - the earlier "a[href*='/players/']" wait above can
+            # resolve instantly against the site's static nav link before
+            # the real listing has rendered) or IDENTICAL to the previous
+            # page's cards (stale content still attached). Only a
+            # non-empty read that actually differs from the previous page
+            # is trusted without retrying.
+            if current_hrefs and current_hrefs != previous_page_hrefs:
                 break
             await page.wait_for_timeout(LISTING_STABILIZE_POLL_MS)
             current_hrefs = await _read_card_hrefs(page)
