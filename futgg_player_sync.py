@@ -1,20 +1,36 @@
 #!/usr/bin/env python
 """Daily FUT.GG player catalogue sync.
 
-Discovers cards from https://www.fut.gg/players/new/, visits only cards that
-are new (unless FUTGG_REFRESH_EXISTING=true), and upserts metadata into the
+Discovers cards from https://www.fut.gg/players/new/?page=N (real
+pagination - see collect_listing_urls()), visits only cards that are new
+(unless FUTGG_REFRESH_EXISTING=true), and upserts metadata into the
 independent futgg_players table. It intentionally does not write prices or
 sales; futgg_price_sync.py owns those.
 
 Recommended Railway Cron: once daily, e.g. 15 5 * * *
+
+Two discovery modes, since new cards appear at the front of the listing:
+  - Daily (default): only the first FUTGG_LISTING_MAX_PAGES pages, enough
+    to catch what's new since yesterday without re-walking the whole
+    catalogue every run.
+  - Full scan (FUTGG_LISTING_FULL_SCAN=true): up to
+    FUTGG_LISTING_MAX_PAGES_FULL pages, for an occasional full-catalogue
+    sync (the real catalogue is 350+ pages as of writing).
+Either mode also stops early after FUTGG_LISTING_IDLE_ROUNDS consecutive
+pages with zero new cards - the real signal that pagination has run past
+the end of the catalogue, so a full scan doesn't have to walk its whole
+page cap every time and a daily run doesn't overrun a slow news day.
 
 Important environment variables:
   DATABASE_URL                    required
   PLAYWRIGHT_HEADLESS             true by default
   PLAYWRIGHT_TIMEOUT_MS           45000
   FUTGG_PLAYER_LIMIT              0 = no card limit
-  FUTGG_LISTING_SCROLL_ROUNDS     40
-  FUTGG_LISTING_IDLE_ROUNDS       4
+  FUTGG_LISTING_FULL_SCAN         false
+  FUTGG_LISTING_MAX_PAGES         5 (daily mode)
+  FUTGG_LISTING_MAX_PAGES_FULL    400 (full-scan mode)
+  FUTGG_LISTING_IDLE_ROUNDS       4 (consecutive pages w/ 0 new cards before stopping)
+  FUTGG_LISTING_PAGE_DELAY        0.5 seconds, between listing-page navigations
   FUTGG_REFRESH_EXISTING          false
   FUTGG_PLAYER_REQUEST_DELAY      0.35 seconds
 """
@@ -44,12 +60,25 @@ DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not found")
 
-LISTING_URL = f"{BASE_URL}/players/new/"
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TIMEOUT_MS = max(5000, int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "45000")))
 PLAYER_LIMIT = max(0, int(os.getenv("FUTGG_PLAYER_LIMIT", "0")))
-SCROLL_ROUNDS = max(1, int(os.getenv("FUTGG_LISTING_SCROLL_ROUNDS", "40")))
+
+# Pagination (replaces scroll-based discovery entirely - see
+# collect_listing_urls()). Two page caps, selected by FULL_SCAN: a small
+# one for the normal daily run (new cards appear at the front of the
+# listing, so a handful of pages is enough) and a large one for an
+# occasional full-catalogue sync (~350+ real pages as of writing).
+FULL_SCAN = os.getenv("FUTGG_LISTING_FULL_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+MAX_PAGES_DAILY = max(1, int(os.getenv("FUTGG_LISTING_MAX_PAGES", "5")))
+MAX_PAGES_FULL = max(1, int(os.getenv("FUTGG_LISTING_MAX_PAGES_FULL", "400")))
+MAX_PAGES = MAX_PAGES_FULL if FULL_SCAN else MAX_PAGES_DAILY
+# Same name/default as before scrolling was removed - now counts
+# consecutive PAGES with zero new cards instead of scroll rounds, same
+# early-stop role either way.
 IDLE_ROUNDS = max(1, int(os.getenv("FUTGG_LISTING_IDLE_ROUNDS", "4")))
+PAGE_DELAY = max(0.0, float(os.getenv("FUTGG_LISTING_PAGE_DELAY", "0.5")))
+
 REFRESH_EXISTING = os.getenv("FUTGG_REFRESH_EXISTING", "false").strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_DELAY = max(0.0, float(os.getenv("FUTGG_PLAYER_REQUEST_DELAY", "0.35")))
 OVERLAP_LOCK_KEY = int(os.getenv("FUTGG_PLAYER_LOCK_KEY", "7741021"))
@@ -156,25 +185,39 @@ async def dismiss_cookie_banner(page) -> None:
 
 
 async def collect_listing_urls(page) -> list[str]:
-    response = await page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-    status = response.status if response else 0
-    if status != 200:
-        raise RuntimeError(f"FUT.GG listing returned HTTP {status}")
-
-    await dismiss_cookie_banner(page)
-    try:
-        await page.locator("a[href*='/players/']").first.wait_for(state="attached", timeout=TIMEOUT_MS)
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError("No card links appeared on FUT.GG listing") from exc
-
+    """Discovers card URLs via real pagination (?page=1, ?page=2, ...) -
+    no window.scrollTo() or scroll-settle waits anywhere. Each page is a
+    direct navigation; MAX_PAGES caps how many pages are visited (small
+    for a daily run, large for FULL_SCAN - see module docstring), and
+    IDLE_ROUNDS consecutive pages with zero new cards stops early
+    regardless of the cap, since that's the real signal pagination has
+    run past the end of the catalogue."""
     seen: dict[str, None] = {}
-    previous_count = 0
-    idle = 0
+    idle_pages = 0
 
-    for round_number in range(1, SCROLL_ROUNDS + 1):
+    for page_number in range(1, MAX_PAGES + 1):
+        listing_url = f"{BASE_URL}/players/new/?page={page_number}"
+        response = await page.goto(listing_url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        status = response.status if response else 0
+        if status != 200:
+            if page_number == 1:
+                raise RuntimeError(f"FUT.GG listing returned HTTP {status}")
+            log.warning("FUT.GG listing page %d returned HTTP %d - stopping pagination", page_number, status)
+            break
+
+        await dismiss_cookie_banner(page)
+        try:
+            await page.locator("a[href*='/players/']").first.wait_for(state="attached", timeout=TIMEOUT_MS)
+        except PlaywrightTimeoutError as exc:
+            if page_number == 1:
+                raise RuntimeError("No card links appeared on FUT.GG listing") from exc
+            log.info("No card links on listing page %d - treating as end of catalogue", page_number)
+            break
+
         hrefs = await page.locator("a[href]").evaluate_all(
             "nodes => nodes.map(node => node.getAttribute('href'))"
         )
+        before = len(seen)
         for href in hrefs:
             if not href:
                 continue
@@ -182,22 +225,25 @@ async def collect_listing_urls(page) -> list[str]:
             parsed = urlparse(absolute)
             if CARD_URL_RE.match(parsed.path):
                 seen[urljoin(BASE_URL, parsed.path)] = None
+        new_this_page = len(seen) - before
+
+        log.info(
+            "Listing page %d: %d new cards, %d unique total", page_number, new_this_page, len(seen)
+        )
 
         if PLAYER_LIMIT and len(seen) >= PLAYER_LIMIT:
             break
 
-        if len(seen) == previous_count:
-            idle += 1
+        if new_this_page == 0:
+            idle_pages += 1
+            if idle_pages >= IDLE_ROUNDS:
+                log.info("%d consecutive pages with no new cards - stopping pagination", idle_pages)
+                break
         else:
-            idle = 0
-            previous_count = len(seen)
+            idle_pages = 0
 
-        log.info("Listing round %d: %d unique cards", round_number, len(seen))
-        if idle >= IDLE_ROUNDS:
-            break
-
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1200)
+        if page_number < MAX_PAGES and PAGE_DELAY:
+            await asyncio.sleep(random.uniform(PAGE_DELAY * 0.7, PAGE_DELAY * 1.3))
 
     urls = list(seen)
     return urls[:PLAYER_LIMIT] if PLAYER_LIMIT else urls
