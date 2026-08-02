@@ -34,7 +34,9 @@ Important environment variables:
   FUTGG_LISTING_STABILIZE_ATTEMPTS 6 (retries waiting for a page's cards to differ from the previous page's)
   FUTGG_LISTING_STABILIZE_POLL_MS 400 (wait between stabilize retries)
   FUTGG_REFRESH_EXISTING          false
-  FUTGG_PLAYER_REQUEST_DELAY      0.35 seconds
+  FUTGG_PLAYER_REQUEST_DELAY      0.35 seconds, per fetch worker
+  FUTGG_PLAYER_CONCURRENCY        3 (parallel card-detail fetch workers - see _fetch_worker())
+  FUTGG_CIRCUIT_BREAKER_THRESHOLD 5 (consecutive 403/429/failed navigations before this run stops)
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ import asyncpg
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from futgg_common import BASE_URL, CARD_URL_RE, FutggCard, classify_price_tier, parse_futgg_card
+from futgg_common import BASE_URL, CARD_URL_RE, CircuitBreaker, FutggCard, classify_price_tier, parse_futgg_card
 from monitoring import alert, heartbeat
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -94,6 +96,20 @@ LISTING_STABILIZE_POLL_MS = max(50, int(os.getenv("FUTGG_LISTING_STABILIZE_POLL_
 REFRESH_EXISTING = os.getenv("FUTGG_REFRESH_EXISTING", "false").strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_DELAY = max(0.0, float(os.getenv("FUTGG_PLAYER_REQUEST_DELAY", "0.35")))
 OVERLAP_LOCK_KEY = int(os.getenv("FUTGG_PLAYER_LOCK_KEY", "7741021"))
+
+# Card-detail fetching (not the listing/pagination phase, which stays on
+# its own single page - it's inherently sequential/stateful and capped
+# at a few hundred pages regardless) was fully sequential: one page, one
+# card at a time. For a 10,000+ card full-catalogue backfill that's
+# multiple hours. This runs FUTGG_PLAYER_CONCURRENCY pages in parallel
+# (same page-pool/queue pattern as futgg_price_sync.py's worker_loop),
+# each still respecting FUTGG_PLAYER_REQUEST_DELAY between its own
+# requests - so total throughput scales with concurrency while
+# per-connection request rate to FUT.GG stays exactly as polite as
+# before. Kept conservative by default; raise only after confirming no
+# increase in 403/429s.
+PLAYER_CONCURRENCY = max(1, int(os.getenv("FUTGG_PLAYER_CONCURRENCY", "3")))
+CIRCUIT_BREAKER_THRESHOLD = max(1, int(os.getenv("FUTGG_CIRCUIT_BREAKER_THRESHOLD", "5")))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -415,6 +431,58 @@ async def upsert_card(conn: asyncpg.Connection, card: FutggCard) -> None:
     )
 
 
+async def _fetch_worker(
+    worker_id: int,
+    page,
+    pool: asyncpg.Pool,
+    queue: "asyncio.Queue[tuple[int, str, bool]]",
+    total: int,
+    stats: dict[str, int],
+    breaker: CircuitBreaker,
+) -> None:
+    while True:
+        if breaker.tripped:
+            log.warning("worker=%d stopping: circuit breaker tripped (%s)", worker_id, breaker.trip_reason)
+            return
+        try:
+            index, url, existed = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+            status = response.status if response else 0
+            if status in (403, 429):
+                breaker.record_failure(f"HTTP {status}")
+                stats["failed"] += 1
+                log.warning("[%d/%d] worker=%d blocked HTTP %d: %s", index, total, worker_id, status, url)
+                queue.task_done()
+                continue
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}")
+            await page.locator(".fc-card").first.wait_for(state="attached", timeout=15000)
+            await page.wait_for_timeout(800)
+            card = parse_futgg_card(await page.content(), url)
+            async with pool.acquire() as conn:
+                await upsert_card(conn, card)
+            breaker.record_success()
+            stats["updated" if existed else "new"] += 1
+            log.info(
+                "[%d/%d] worker=%d upserted id=%s name=%r rating=%s rarity=%r tier=%s",
+                index, total, worker_id, card.source_card_id, card.name, card.rating,
+                card.rarity, classify_price_tier(card),
+            )
+        except Exception as exc:
+            stats["failed"] += 1
+            breaker.record_failure(f"{type(exc).__name__}: {exc}")
+            log.warning("[%d/%d] worker=%d failed %s: %s", index, total, worker_id, url, exc)
+        finally:
+            queue.task_done()
+
+        if REQUEST_DELAY:
+            await asyncio.sleep(random.uniform(REQUEST_DELAY * 0.7, REQUEST_DELAY * 1.3))
+
+
 async def crawl_once() -> None:
     lock_conn = await asyncpg.connect(DATABASE_URL)
     got_lock = await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", OVERLAP_LOCK_KEY)
@@ -423,9 +491,10 @@ async def crawl_once() -> None:
         await lock_conn.close()
         return
 
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=PLAYER_CONCURRENCY + 2)
     playwright = browser = context = None
     stats: dict[str, int] = {"discovered": 0, "new": 0, "updated": 0, "failed": 0, "skipped_existing": 0}
+    breaker = CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD)
     try:
         async with pool.acquire() as conn:
             await ensure_schema(conn)
@@ -440,9 +509,12 @@ async def crawl_once() -> None:
             locale="en-GB",
             viewport={"width": 1440, "height": 1000},
         )
-        page = await context.new_page()
+        # Listing/pagination stays on its own dedicated page - sequential
+        # by nature (stateful stabilize-retry against the previous page,
+        # capped at a few hundred pages regardless), not the bottleneck.
+        listing_page = await context.new_page()
 
-        urls = await collect_listing_urls(page)
+        urls = await collect_listing_urls(listing_page)
         stats["discovered"] = len(urls)
         async with pool.acquire() as conn:
             known = await existing_ids(conn, urls)
@@ -460,35 +532,30 @@ async def crawl_once() -> None:
             targets.append((url, existed))
 
         log.info(
-            "Discovered=%d known=%d targets=%d refresh_existing=%s",
-            len(urls), len(known), len(targets), REFRESH_EXISTING,
+            "Discovered=%d known=%d targets=%d refresh_existing=%s concurrency=%d",
+            len(urls), len(known), len(targets), REFRESH_EXISTING, PLAYER_CONCURRENCY,
         )
 
+        queue: "asyncio.Queue[tuple[int, str, bool]]" = asyncio.Queue()
         for index, (url, existed) in enumerate(targets, start=1):
-            try:
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-                status = response.status if response else 0
-                if status != 200:
-                    raise RuntimeError(f"HTTP {status}")
-                await page.locator(".fc-card").first.wait_for(state="attached", timeout=15000)
-                await page.wait_for_timeout(800)
-                card = parse_futgg_card(await page.content(), url)
-                async with pool.acquire() as conn:
-                    await upsert_card(conn, card)
-                stats["updated" if existed else "new"] += 1
-                log.info(
-                    "[%d/%d] upserted id=%s name=%r rating=%s rarity=%r tier=%s",
-                    index, len(targets), card.source_card_id, card.name, card.rating,
-                    card.rarity, classify_price_tier(card),
+            queue.put_nowait((index, url, existed))
+
+        fetch_pages = [await context.new_page() for _ in range(PLAYER_CONCURRENCY)]
+        try:
+            await asyncio.gather(
+                *(
+                    _fetch_worker(worker_id + 1, fetch_page, pool, queue, len(targets), stats, breaker)
+                    for worker_id, fetch_page in enumerate(fetch_pages)
                 )
-            except Exception as exc:
-                stats["failed"] += 1
-                log.warning("[%d/%d] failed %s: %s", index, len(targets), url, exc)
+            )
+        finally:
+            for fetch_page in fetch_pages:
+                await fetch_page.close()
 
-            if REQUEST_DELAY:
-                await asyncio.sleep(random.uniform(REQUEST_DELAY * 0.7, REQUEST_DELAY * 1.3))
+        if breaker.tripped:
+            log.warning("Circuit breaker tripped: %s - stopped fetching remaining cards this run", breaker.trip_reason)
 
-        ok = stats["failed"] == 0 or (stats["new"] + stats["updated"]) > 0
+        ok = (stats["failed"] == 0 or (stats["new"] + stats["updated"]) > 0) and not breaker.tripped
         async with pool.acquire() as conn:
             await heartbeat(
                 conn,
