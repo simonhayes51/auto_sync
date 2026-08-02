@@ -302,6 +302,44 @@ async def test_collect_listing_urls_gives_up_after_stabilize_attempts_exhausted(
     ]
 
 
+@run_async
+async def test_collect_listing_urls_retries_page_one_when_grid_not_yet_rendered(monkeypatch):
+    """Regression test for a live failure: every page logged '0 new
+    cards' and pagination stopped immediately. Root cause - the earlier
+    "a[href*='/players/']" wait_for can resolve instantly against the
+    site's static nav link (which also contains '/players/') before the
+    client-rendered card grid has populated, so the very first
+    _read_card_hrefs() on page 1 can legitimately come back empty. The
+    stabilize-retry loop must still retry in that case - a bug in the
+    original "or not previous_page_hrefs" condition treated "no previous
+    page to compare against" (true for page 1, and for any page
+    following a genuinely-empty previous page) as "trust this read
+    immediately", skipping the retry entirely and then propagating the
+    empty previous_page_hrefs forward so every later page did the same,
+    which is exactly the observed 0/0/0/0-then-stop pattern."""
+    monkeypatch.setattr(mod, "MAX_PAGES", 2)
+    monkeypatch.setattr(mod, "PLAYER_LIMIT", 0)
+    monkeypatch.setattr(mod, "IDLE_ROUNDS", 10)
+    monkeypatch.setattr(mod, "PAGE_DELAY", 0)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_MAX_ATTEMPTS", 5)
+    monkeypatch.setattr(mod, "LISTING_STABILIZE_POLL_MS", 0)
+    pages_hrefs = {
+        1: [_card_href(1), _card_href(2)],
+        2: [_card_href(3)],
+    }
+    # Page 1's first 2 reads come back empty (grid not yet rendered); the
+    # 3rd read (within budget) returns the real content.
+    page = _FakeListingPage(pages_hrefs, stale_reads={1: 2})
+
+    urls = await mod.collect_listing_urls(page)
+
+    assert len(urls) == 3
+    assert page.goto_urls == [
+        "https://www.fut.gg/players/new/?page=1",
+        "https://www.fut.gg/players/new/?page=2",
+    ]
+
+
 def test_full_scan_selects_the_full_page_cap(monkeypatch):
     monkeypatch.setenv("FUTGG_LISTING_FULL_SCAN", "true")
     monkeypatch.setenv("FUTGG_LISTING_MAX_PAGES", "5")
