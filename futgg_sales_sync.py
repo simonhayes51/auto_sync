@@ -101,14 +101,29 @@ IDLE_SLEEP = env_float("FUTGG_SALES_IDLE_SLEEP", 30.0, minimum=5.0)
 #: How many cards to pull per selection pass.
 SELECT_LIMIT = env_int("FUTGG_SALES_SELECT_LIMIT", 200, minimum=1)
 
-#: Sales refresh cadence by rating. Far longer than the price cadence:
-#: sales accumulate, so re-reading them often adds duplicates rather than
-#: information. The bulk feed already keeps BIN fresh independently.
+#: Sales refresh cadence by rating.
+#
+# Deliberately much slower than the price cadence, for two reasons.
+#
+# Sales are CUMULATIVE: a sale already captured stays captured, so a
+# refresh only adds what happened since the last read. The interval
+# therefore controls how quickly new sales enter the window, not whether
+# history exists at all. Reading hourly instead of half-hourly costs
+# nothing but latency on the newest few sales.
+#
+# And the time-critical signal has moved. Trend and volatility now come
+# from futgg_bin_history, which the bulk feed refreshes every 5 minutes
+# for all 10,064 cards. Sales are needed for the fair-value ANCHOR
+# (median, trimmed mean, dispersion, liquidity), which moves slowly.
+#
+# Sized against measured capacity: the previous 30/120/360/1440 spread
+# demanded ~133 cards/min sustained, which is what produced 144 HTTP 429s
+# in the first live run. Halving each band brings it to ~67/min.
 SALES_INTERVALS = {
-    "85_plus": env_int("FUTGG_SALES_85_PLUS_INTERVAL_MIN", 30, minimum=5),
-    "80_84": env_int("FUTGG_SALES_80_84_INTERVAL_MIN", 120, minimum=10),
-    "75_79": env_int("FUTGG_SALES_75_79_INTERVAL_MIN", 360, minimum=30),
-    "under_75": env_int("FUTGG_SALES_UNDER_75_INTERVAL_MIN", 1440, minimum=60),
+    "85_plus": env_int("FUTGG_SALES_85_PLUS_INTERVAL_MIN", 60, minimum=5),
+    "80_84": env_int("FUTGG_SALES_80_84_INTERVAL_MIN", 240, minimum=10),
+    "75_79": env_int("FUTGG_SALES_75_79_INTERVAL_MIN", 720, minimum=30),
+    "under_75": env_int("FUTGG_SALES_UNDER_75_INTERVAL_MIN", 2880, minimum=60),
 }
 
 USER_AGENT = (
@@ -304,6 +319,21 @@ ON CONFLICT (source_fingerprint) DO NOTHING
 
 
 async def select_due(conn: asyncpg.Connection) -> list[asyncpg.Record]:
+    """Pick the next cards to read.
+
+    Cards that have NEVER been read come first, regardless of rating.
+
+    That ordering matters more than it looks. Sorting by rating band first
+    starves the tail: the 85+ band alone needs ~55 cards/min at its
+    cadence, so if throughput sits anywhere near that, lower-rated cards
+    never reach the front of the queue and never get a FIRST read at all -
+    they would sit permanently at zero sales, and a card with no sales
+    returns insufficient_data forever no matter how fresh its BIN is.
+
+    Backfill-first guarantees every card gets covered once, after which
+    NULLs are exhausted and the ordering settles into normal
+    band-priority maintenance.
+    """
     return await conn.fetch(
         """
         SELECT source_card_id, rating, next_sales_due_at
@@ -312,6 +342,8 @@ async def select_due(conn: asyncpg.Connection) -> list[asyncpg.Record]:
           AND is_tradeable IS DISTINCT FROM FALSE
           AND (next_sales_due_at IS NULL OR next_sales_due_at <= NOW())
         ORDER BY
+            -- never-read cards first (backfill), best cards within that
+            (next_sales_due_at IS NOT NULL),
             CASE WHEN rating >= 85 THEN 0
                  WHEN rating >= 80 THEN 1
                  WHEN rating >= 75 THEN 2
@@ -324,7 +356,76 @@ async def select_due(conn: asyncpg.Connection) -> list[asyncpg.Record]:
     )
 
 
+async def report_coverage(conn: asyncpg.Connection) -> None:
+    """How much of the catalogue actually has sales yet.
+
+    The single number that says whether the intelligence layer can work:
+    a card with fewer than MIN_SALES_FOR_SIGNAL sales produces no signal
+    at all, however good its price data is.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            count(*) AS total,
+            count(*) FILTER (WHERE s.n > 0) AS any_sales,
+            count(*) FILTER (WHERE s.n >= 5) AS enough_sales,
+            count(*) FILTER (WHERE p.next_sales_due_at IS NULL) AS never_read
+        FROM futgg_players p
+        LEFT JOIN LATERAL (
+            SELECT count(*) AS n FROM futgg_sales_history h
+            WHERE h.source_card_id = p.source_card_id
+              AND h.approximate_sold_at >= now() - interval '14 days'
+        ) s ON TRUE
+        WHERE p.is_active AND p.is_tradeable IS DISTINCT FROM FALSE
+        """
+    )
+    total = int(row["total"] or 0)
+    if not total:
+        return
+    log.info(
+        "sales coverage: %d/%d have any sales (%.1f%%) | %d/%d have >=5 and can "
+        "produce a signal (%.1f%%) | %d never read",
+        row["any_sales"], total, 100.0 * row["any_sales"] / total,
+        row["enough_sales"], total, 100.0 * row["enough_sales"] / total,
+        row["never_read"],
+    )
+
+
 async def ensure_schema(conn: asyncpg.Connection) -> None:
+    # futgg_sales_history is owned by futgg_price_sync.ensure_schema, and
+    # this worker is meant to REPLACE that one - so on any database where
+    # price sync has been retired (or never ran) the table this worker
+    # writes to would not exist. Own it here too; CREATE TABLE IF NOT
+    # EXISTS keeps the two definitions safely idempotent while both
+    # workers coexist during the changeover.
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS futgg_sales_history (
+            id BIGSERIAL PRIMARY KEY,
+            source_card_id BIGINT NOT NULL
+                REFERENCES futgg_players(source_card_id),
+            listed_price INTEGER NOT NULL,
+            sold_price INTEGER NOT NULL,
+            ea_tax INTEGER NOT NULL,
+            net_price INTEGER NOT NULL,
+            approximate_sold_at TIMESTAMPTZ NOT NULL,
+            source_age_text TEXT NOT NULL,
+            source_age_seconds INTEGER NOT NULL,
+            source_row_position SMALLINT NOT NULL,
+            occurrence_index SMALLINT NOT NULL,
+            source_fingerprint TEXT NOT NULL UNIQUE,
+            captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    # Both the snapshot view and the coverage query filter sales by card
+    # and recency; without this they degrade to sequential scans once the
+    # table passes a few million rows.
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS futgg_sales_history_card_sold_idx "
+        "ON futgg_sales_history (source_card_id, approximate_sold_at DESC)"
+    )
+
     # Sales get their own due-at column: the price cadence is now driven
     # by the bulk feed and is far shorter, so sharing next_price_due_at
     # would make the two workers fight over the same schedule.
@@ -449,6 +550,7 @@ async def run_forever() -> None:
 
                 async with pool.acquire() as conn:
                     due = await select_due(conn)
+                    await report_coverage(conn)
                 if not due:
                     await asyncio.sleep(IDLE_SLEEP)
                     continue
