@@ -24,7 +24,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
 from futgg_common import FutggCard, SaleObservation, detect_price_outcome
 import futgg_price_sync as price_sync
-from futgg_price_sync import CircuitBreaker, _is_hot_opportunity
+from futgg_price_sync import CircuitBreaker, is_hot_opportunity
 
 
 def _card(**overrides) -> FutggCard:
@@ -102,22 +102,22 @@ class TestHotOpportunityDetection:
     def test_not_hot_when_too_few_sales(self):
         card = _card(lowest_bin=8000)
         card.recent_sales = [_sale(10000, i) for i in range(4)]  # below HOT_MIN_SALES=5
-        assert _is_hot_opportunity(card) is False
+        assert is_hot_opportunity(card) is False
 
     def test_not_hot_when_bin_close_to_median(self):
         card = _card(lowest_bin=9800)
         card.recent_sales = [_sale(10000, i) for i in range(6)]  # 2% below median
-        assert _is_hot_opportunity(card) is False
+        assert is_hot_opportunity(card) is False
 
     def test_hot_when_bin_well_below_median(self):
         card = _card(lowest_bin=8500)
         card.recent_sales = [_sale(10000, i) for i in range(6)]  # 15% below median
-        assert _is_hot_opportunity(card) is True
+        assert is_hot_opportunity(card) is True
 
     def test_not_hot_when_no_bin(self):
         card = _card(lowest_bin=None)
         card.recent_sales = [_sale(10000, i) for i in range(6)]
-        assert _is_hot_opportunity(card) is False
+        assert is_hot_opportunity(card) is False
 
 
 def run_async(coro_fn):
@@ -139,7 +139,7 @@ class TestRecordSuccessHotFastTrack:
     card must keep its tier's ordinary interval untouched."""
 
     @run_async
-    async def test_hot_card_gets_short_interval_despite_bronze_tier(self):
+    async def test_hot_card_gets_short_interval_despite_low_rating(self):
         import asyncpg
         conn = await asyncpg.connect(TEST_DSN)
         try:
@@ -155,7 +155,10 @@ class TestRecordSuccessHotFastTrack:
             )
             card = _card(source_card_id=1, lowest_bin=8000, price_outcome="success")
             card.recent_sales = [_sale(10000, i) for i in range(6)]  # 20% below median -> hot
-            row = {"price_tier": "bronze"}
+            # Refresh intervals are keyed off RATING, not price_tier, since
+            # the rating-prioritised rewrite. A rating-60 card would normally
+            # wait a full day.
+            row = {"price_tier": "bronze", "rating": 60}
             captured_at = datetime.now(timezone.utc)
 
             _, _, _, is_hot = await price_sync.record_success(conn, row, card, captured_at)
@@ -164,13 +167,13 @@ class TestRecordSuccessHotFastTrack:
             due = await conn.fetchval("SELECT next_price_due_at FROM futgg_players WHERE source_card_id = 1")
             minutes_ahead = (due - captured_at).total_seconds() / 60
             assert minutes_ahead <= price_sync.HOT_INTERVAL_MIN + 0.1
-            # Bronze's normal interval (4320 min) must NOT have been used.
-            assert minutes_ahead < price_sync.INTERVALS["bronze"]
+            # The rating band's normal interval must NOT have been used.
+            assert minutes_ahead < price_sync.RATING_INTERVALS["under_70"]
         finally:
             await conn.close()
 
     @run_async
-    async def test_normal_card_keeps_tier_interval(self):
+    async def test_normal_card_keeps_rating_interval(self):
         import asyncpg
         conn = await asyncpg.connect(TEST_DSN)
         try:
@@ -186,7 +189,7 @@ class TestRecordSuccessHotFastTrack:
             )
             card = _card(source_card_id=2, lowest_bin=9900, price_outcome="success")
             card.recent_sales = [_sale(10000, i) for i in range(6)]  # 1% below median -> not hot
-            row = {"price_tier": "special"}
+            row = {"price_tier": "special", "rating": 91}
             captured_at = datetime.now(timezone.utc)
 
             _, _, _, is_hot = await price_sync.record_success(conn, row, card, captured_at)
@@ -194,6 +197,6 @@ class TestRecordSuccessHotFastTrack:
 
             due = await conn.fetchval("SELECT next_price_due_at FROM futgg_players WHERE source_card_id = 2")
             minutes_ahead = (due - captured_at).total_seconds() / 60
-            assert abs(minutes_ahead - price_sync.INTERVALS["special"]) < 0.1
+            assert abs(minutes_ahead - price_sync.RATING_INTERVALS["85_plus"]) < 0.1
         finally:
             await conn.close()

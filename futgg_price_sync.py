@@ -54,6 +54,7 @@ import os
 import random
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -68,6 +69,7 @@ from playwright.async_api import (
 )
 
 from futgg_common import CircuitBreaker, parse_futgg_card
+from futgg_instrumentation import NullTimers, StageTimers
 from futgg_player_sync import ensure_schema as ensure_player_schema
 from monitoring import alert, heartbeat
 
@@ -293,6 +295,33 @@ USER_AGENT = (
 )
 
 
+# Opt-in one-shot network diagnostic. When true, run_forever() performs a
+# single instrumented page load against FUTGG_DISCOVER_URL and exits
+# WITHOUT touching the price pipeline. When false (the default) the worker
+# behaves exactly as it did before this flag existed - futgg_discover is
+# not even imported.
+DISCOVER_PRICE_NETWORK = env_bool(
+    "FUTGG_DISCOVER_PRICE_NETWORK",
+    False,
+)
+
+DISCOVER_URL = (
+    os.getenv("FUTGG_DISCOVER_URL") or ""
+).strip()
+
+DISCOVER_REPORT_PATH = (
+    os.getenv("FUTGG_DISCOVER_REPORT_PATH") or ""
+).strip()
+
+# Per-stage batch timings. On by default: the collection cost is a float
+# subtraction and a list append per stage, and there is no way to find the
+# next bottleneck without it.
+STAGE_TIMINGS_ENABLED = env_bool(
+    "FUTGG_PRICE_STAGE_TIMINGS",
+    True,
+)
+
+
 EXPLICIT_NO_MARKET_PHRASES = (
     "no active market",
     "no current listings",
@@ -346,6 +375,20 @@ def is_hot_opportunity(card: Any) -> bool:
     ) / median_price
 
     return discount >= HOT_DISCOUNT_THRESHOLD
+
+
+# Shared no-op sink so every instrumented call site can use the same
+# `with timers.track(...)` form without a None check. It must genuinely
+# discard rather than being an unused StageTimers - a real collector held
+# for the process lifetime would accumulate samples from every batch
+# forever, which is precisely the leak instrumentation must not introduce.
+_NULL_TIMERS = NullTimers()
+
+
+def new_timers() -> StageTimers | NullTimers:
+    """A fresh collector per batch, or the discarding sink when timings
+    are disabled."""
+    return StageTimers() if STAGE_TIMINGS_ENABLED else _NULL_TIMERS
 
 
 def new_stats() -> dict[str, int]:
@@ -973,6 +1016,7 @@ async def load_and_parse_card(
     page: Page,
     row: asyncpg.Record,
     stats: dict[str, int],
+    timers: StageTimers | NullTimers | None = None,
 ) -> tuple[Any, datetime]:
     """Load, render, parse and validate one card.
 
@@ -982,16 +1026,22 @@ async def load_and_parse_card(
     """
 
     last_error: Exception | None = None
+    timers = timers or _NULL_TIMERS
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         captured_at = datetime.now(timezone.utc)
+        # Attempts after the first are retries. Timing them separately
+        # keeps the p50/p95 of the normal path honest - folding retry cost
+        # into page_goto would make a healthy first attempt look slow.
+        attempt_started = time.perf_counter()
 
         try:
-            response = await page.goto(
-                row["source_url"],
-                wait_until="domcontentloaded",
-                timeout=TIMEOUT_MS,
-            )
+            with timers.track("page_goto"):
+                response = await page.goto(
+                    row["source_url"],
+                    wait_until="domcontentloaded",
+                    timeout=TIMEOUT_MS,
+                )
 
             http_status = (
                 response.status
@@ -1015,11 +1065,13 @@ async def load_and_parse_card(
                     f"unexpected HTTP {http_status}"
                 )
 
-            await wait_for_base_card(page)
+            with timers.track("base_card_wait"):
+                await wait_for_base_card(page)
 
-            price_section_attached = (
-                await wait_for_price_section(page)
-            )
+            with timers.track("price_section_wait"):
+                price_section_attached = (
+                    await wait_for_price_section(page)
+                )
 
             settle_ms = (
                 RENDER_SETTLE_MS
@@ -1028,23 +1080,33 @@ async def load_and_parse_card(
             )
 
             if settle_ms > 0:
-                await page.wait_for_timeout(
-                    settle_ms
+                with timers.track("render_settle"):
+                    await page.wait_for_timeout(
+                        settle_ms
+                    )
+
+            with timers.track("page_content"):
+                html = await page.content()
+
+            with timers.track("parse_card"):
+                card = parse_futgg_card(
+                    html,
+                    row["source_url"],
+                    captured_at,
                 )
 
-            html = await page.content()
+            with timers.track("validation"):
+                await validate_parsed_card(
+                    page,
+                    card,
+                    price_section_attached,
+                )
 
-            card = parse_futgg_card(
-                html,
-                row["source_url"],
-                captured_at,
-            )
-
-            await validate_parsed_card(
-                page,
-                card,
-                price_section_attached,
-            )
+            if attempt > 1:
+                timers.record(
+                    "retry_attempt_seconds",
+                    time.perf_counter() - attempt_started,
+                )
 
             return card, captured_at
 
@@ -1090,6 +1152,14 @@ async def load_and_parse_card(
                 random.uniform(0.3, 0.8)
             )
 
+            # Cost of the attempt that just failed, including its waits and
+            # the blank-page reset. This is the number that says whether
+            # retries are a meaningful drag on throughput.
+            timers.record(
+                "retry_attempt_seconds",
+                time.perf_counter() - attempt_started,
+            )
+
         except PlaywrightTimeoutError as exc:
             raise NavigationError(
                 f"navigation timeout: {exc}"
@@ -1115,37 +1185,46 @@ async def process_card(
     row: asyncpg.Record,
     stats: dict[str, int],
     breaker: CircuitBreaker,
+    timers: StageTimers | NullTimers | None = None,
 ) -> None:
     attempt_started_at = datetime.now(
         timezone.utc
     )
+    timers = timers or _NULL_TIMERS
+    card_started = time.perf_counter()
 
-    async with pool.acquire() as conn:
-        await mark_attempt_started(
-            conn,
-            row["source_card_id"],
-            attempt_started_at,
-        )
+    # Deliberately outside the try, exactly as before: a failure to record
+    # the attempt is an infrastructure problem, not a card outcome, and
+    # must not be rewritten into a per-card failure row.
+    with timers.track("mark_attempt_started"):
+        async with pool.acquire() as conn:
+            await mark_attempt_started(
+                conn,
+                row["source_card_id"],
+                attempt_started_at,
+            )
 
     try:
         card, captured_at = await load_and_parse_card(
             page,
             row,
             stats,
+            timers,
         )
 
-        async with pool.acquire() as conn:
-            (
-                bin_rows,
-                sales_new,
-                sales_dupe,
-                is_hot,
-            ) = await record_success(
-                conn,
-                row,
-                card,
-                captured_at,
-            )
+        with timers.track("record_success_db"):
+            async with pool.acquire() as conn:
+                (
+                    bin_rows,
+                    sales_new,
+                    sales_dupe,
+                    is_hot,
+                ) = await record_success(
+                    conn,
+                    row,
+                    card,
+                    captured_at,
+                )
 
         breaker.record_success()
 
@@ -1198,13 +1277,14 @@ async def process_card(
 
         stats["cards_failed"] += 1
 
-        async with pool.acquire() as conn:
-            await record_failure(
-                conn,
-                row,
-                failure_status,
-                message,
-            )
+        with timers.track("record_failure_db"):
+            async with pool.acquire() as conn:
+                await record_failure(
+                    conn,
+                    row,
+                    failure_status,
+                    message,
+                )
 
         # Only navigation, block and rate-limit failures influence the
         # global circuit breaker. Individual parser/render misses do not.
@@ -1283,13 +1363,14 @@ async def process_card(
             f"{type(exc).__name__}: {exc}"
         )
 
-        async with pool.acquire() as conn:
-            await record_failure(
-                conn,
-                row,
-                "page_failed",
-                message,
-            )
+        with timers.track("record_failure_db"):
+            async with pool.acquire() as conn:
+                await record_failure(
+                    conn,
+                    row,
+                    "page_failed",
+                    message,
+                )
 
         breaker.record_failure(
             message
@@ -1307,12 +1388,21 @@ async def process_card(
 
     finally:
         if REQUEST_DELAY > 0:
-            await asyncio.sleep(
-                random.uniform(
-                    REQUEST_DELAY * 0.7,
-                    REQUEST_DELAY * 1.3,
+            with timers.track("request_delay"):
+                await asyncio.sleep(
+                    random.uniform(
+                        REQUEST_DELAY * 0.7,
+                        REQUEST_DELAY * 1.3,
+                    )
                 )
-            )
+
+        # Whole-card wall time, recorded on every path so failures are
+        # represented. card_total will exceed the sum of the stages by the
+        # untimed glue between them; a large gap is itself a finding.
+        timers.record(
+            "card_total",
+            time.perf_counter() - card_started,
+        )
 
 
 async def worker_loop(
@@ -1322,6 +1412,7 @@ async def worker_loop(
     queue: asyncio.Queue[asyncpg.Record],
     stats: dict[str, int],
     breaker: CircuitBreaker,
+    timers: StageTimers | NullTimers | None = None,
 ) -> None:
     while True:
         if breaker.tripped:
@@ -1348,6 +1439,7 @@ async def worker_loop(
                 row,
                 stats,
                 breaker,
+                timers,
             )
 
         finally:
@@ -1512,9 +1604,11 @@ async def process_due_batch(
     )
 
     stats = new_stats()
+    timers = new_timers()
 
-    async with pool.acquire() as conn:
-        rows = await fetch_due_cards(conn)
+    with timers.track("db_select_due_cards"):
+        async with pool.acquire() as conn:
+            rows = await fetch_due_cards(conn)
 
     stats["selected"] = len(rows)
 
@@ -1567,6 +1661,7 @@ async def process_due_batch(
                 queue=queue,
                 stats=stats,
                 breaker=breaker,
+                timers=timers,
             )
             for index, page in enumerate(pages)
         ]
@@ -1615,7 +1710,120 @@ async def process_due_batch(
         stats["selected_lower"],
     )
 
+    log_batch_timings(stats, timers, run_seconds)
+
     return stats, breaker
+
+
+def log_batch_timings(
+    stats: dict[str, int],
+    timers: StageTimers | NullTimers,
+    run_seconds: int,
+) -> None:
+    """Emit the per-stage breakdown once per batch.
+
+    Aggregated deliberately: logging a timing per card would produce
+    thousands of lines per batch and cost more than the work being
+    measured. Stages are ordered by total time so whichever one dominates
+    is the first line read.
+    """
+    summary = timers.summary()
+    if not summary:
+        return
+
+    attempted = stats["cards_ok"] + stats["cards_failed"]
+    success_pct = (
+        (stats["cards_ok"] / attempted * 100.0) if attempted else 0.0
+    )
+    ok_per_minute = (stats["cards_ok"] / run_seconds) * 60 if run_seconds else 0.0
+    attempted_per_minute = (attempted / run_seconds) * 60 if run_seconds else 0.0
+
+    # Share of wall time each stage accounts for, per worker. Wall time is
+    # run_seconds * CONCURRENCY because the stages run in parallel across
+    # pages - comparing a stage total against run_seconds alone would
+    # overstate every stage by roughly the concurrency factor.
+    worker_seconds = max(run_seconds * CONCURRENCY, 1)
+
+    log.info("--- stage timings (batch) ---")
+    log.info(
+        (
+            "attempted=%d successful=%d success_pct=%.1f%% "
+            "render_failures=%d parse_failures=%d navigation_failures=%d "
+            "retries=%d successful_per_min=%.1f attempted_per_min=%.1f "
+            "run_seconds=%d concurrency=%d worker_seconds=%d"
+        ),
+        attempted,
+        stats["cards_ok"],
+        success_pct,
+        stats["render_failures"],
+        stats["parse_failures"],
+        stats["navigation_failures"],
+        stats["retries"],
+        ok_per_minute,
+        attempted_per_minute,
+        run_seconds,
+        CONCURRENCY,
+        worker_seconds,
+    )
+
+    for line in timers.format_lines():
+        log.info(line)
+
+    ordered = sorted(
+        summary.items(),
+        key=lambda item: item[1]["total_seconds"],
+        reverse=True,
+    )
+    share_parts = [
+        f"{stage}={s['total_seconds'] / worker_seconds * 100:.1f}%"
+        for stage, s in ordered
+        if stage != "card_total"
+    ]
+    log.info("share_of_worker_time: %s", " ".join(share_parts))
+
+    card_total = summary.get("card_total")
+    if card_total and card_total["count"]:
+        # Only per-card stages reconcile against card_total.
+        # db_select_due_cards runs once per BATCH, and
+        # retry_attempt_seconds re-counts stages already summed
+        # individually - including either would compare quantities that
+        # are not the same kind of thing.
+        excluded = {
+            "card_total",
+            "retry_attempt_seconds",
+            "db_select_due_cards",
+        }
+        accounted = sum(
+            s["total_seconds"]
+            for stage, s in summary.items()
+            if stage not in excluded
+        )
+        total = card_total["total_seconds"]
+        residual = total - accounted
+        pct = (residual / total * 100.0) if total else 0.0
+
+        if residual >= 0:
+            note = "untimed glue between stages"
+        else:
+            # Stage totals exceeding card_total means something was timed
+            # outside the card_total window. Say so plainly rather than
+            # printing a negative "glue" figure that reads like a bug in
+            # the worker instead of a bug in the instrumentation.
+            note = "NEGATIVE: stage totals exceed card_total, check stage nesting"
+
+        log.info(
+            (
+                "card_total avg=%.1fms p95=%.1fms | per_card_accounted=%.1fs "
+                "residual=%.1fs (%.1f%% - %s)"
+            ),
+            card_total["avg_ms"],
+            card_total["p95_ms"],
+            accounted,
+            residual,
+            pct,
+            note,
+        )
+    log.info("--- end stage timings ---")
 
 
 async def acquire_worker_lock(
@@ -1648,7 +1856,44 @@ async def acquire_worker_lock(
         )
 
 
+async def run_discovery_mode() -> None:
+    """One-shot network diagnostic, then exit.
+
+    Takes no worker lock, opens no pool and touches no card state - it must
+    be safe to run alongside the live worker without perturbing it. The
+    import is local so that when the flag is off, futgg_discover is never
+    even loaded.
+    """
+    from futgg_discover import run_discovery
+
+    if not DISCOVER_URL:
+        raise RuntimeError(
+            "FUTGG_DISCOVER_PRICE_NETWORK is enabled but FUTGG_DISCOVER_URL is not set. "
+            "Set it to one full FUT.GG player URL, e.g. "
+            "https://www.fut.gg/players/26-1-239085/"
+        )
+
+    log.info(
+        "DISCOVERY MODE: single instrumented page load, price pipeline untouched."
+    )
+
+    await run_discovery(
+        DISCOVER_URL,
+        headless=HEADLESS,
+        user_agent=USER_AGENT,
+        timeout_ms=TIMEOUT_MS,
+        settle_ms=max(RENDER_SETTLE_MS, 4000),
+        report_path=DISCOVER_REPORT_PATH or None,
+    )
+
+    log.info("DISCOVERY MODE: complete. Worker exiting without processing cards.")
+
+
 async def run_forever() -> None:
+    if DISCOVER_PRICE_NETWORK:
+        await run_discovery_mode()
+        return
+
     lock_conn: asyncpg.Connection | None = None
     pool: asyncpg.Pool | None = None
     playwright: Playwright | None = None
