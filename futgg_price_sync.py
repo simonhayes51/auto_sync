@@ -440,23 +440,11 @@ async def ensure_schema(
 async def fetch_due_cards(
     conn: asyncpg.Connection,
 ) -> list[asyncpg.Record]:
-    """Select high-rated due cards first, then fill spare capacity.
+    """Fill the batch with due 85+ cards first.
 
-    A fixed portion of every batch is reserved for rating-85+ cards.
-
-    If fewer high-rated cards are due than the reserved amount, unused
-    capacity is filled by lower-rated cards.
+    Lower-rated cards are only selected when fewer than BATCH_SIZE
+    high-rated cards are currently due.
     """
-
-    high_reserved = max(
-        1,
-        int(BATCH_SIZE * HIGH_PRIORITY_SHARE),
-    )
-
-    lower_reserved = max(
-        0,
-        BATCH_SIZE - high_reserved,
-    )
 
     high_rows = await conn.fetch(
         """
@@ -482,25 +470,13 @@ async def fetch_due_cards(
             source_card_id ASC
         LIMIT $1
         """,
-        high_reserved,
+        BATCH_SIZE,
     )
 
     remaining_capacity = BATCH_SIZE - len(high_rows)
 
     if remaining_capacity <= 0:
         return list(high_rows)
-
-    # Always permit at least the remaining capacity to be filled by
-    # lower-rated cards when there are not enough high-rated cards due.
-    lower_limit = max(
-        lower_reserved,
-        remaining_capacity,
-    )
-
-    lower_limit = min(
-        lower_limit,
-        remaining_capacity,
-    )
 
     lower_rows = await conn.fetch(
         """
@@ -535,7 +511,7 @@ async def fetch_due_cards(
             source_card_id ASC
         LIMIT $1
         """,
-        lower_limit,
+        remaining_capacity,
     )
 
     return [
