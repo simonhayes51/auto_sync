@@ -55,6 +55,14 @@ GAME_YEAR = os.getenv("FUTGG_GAME_YEAR", "26")
 PLATFORM = os.getenv("FUTGG_BULK_PLATFORM", "ps5")
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
+# Captured verbatim from the discovery run. The browser fetched all three
+# of these successfully, so they are known-good paths - the hashes are
+# content-addressed and will go stale as FUT.GG republishes, which is why
+# each is overridable.
+CONTROL_URL_DEFAULT = "https://r2.fut.gg/26/config-web.v1.e939bf94.json"
+INDEX_URL_DEFAULT = "https://r2.fut.gg/26/player-prices-index.v1.9df1dcb7.json"
+DYN_URL_DEFAULT = "https://r2.fut.gg/26/player-prices-ps5-dyn.v1.7765c504.json"
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -77,6 +85,59 @@ async def fetch_json(session, url: str) -> tuple[Any, int, float]:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status} for {url}")
     return json.loads(raw), len(raw), elapsed
+
+
+async def fetch_via_browser(urls: list[str]) -> dict[str, Any]:
+    """Fetch through a real browser context instead of plain HTTP.
+
+    If r2.fut.gg refuses plain requests (TLS fingerprint, IP reputation,
+    WAF), this is the fallback that still avoids ALL rendering:
+    context.request issues the HTTP call using the browser's own TLS stack
+    and cookie jar, but never creates a page for it, never runs the app's
+    JavaScript and never lays anything out. It is "a browser" only in the
+    sense Cloudflare cares about.
+
+    If this works where plain HTTP does not, the production design is to
+    keep one lightweight Playwright context alive purely as transport and
+    pull the bulk feed through it - still one request for ~27,000 prices,
+    still zero page renders.
+    """
+    from playwright.async_api import async_playwright
+
+    out: dict[str, Any] = {}
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        try:
+            context = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+            # Establish origin + cookies the way a real visit would, so the
+            # asset requests that follow look ordinary.
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    "https://www.fut.gg/", wait_until="domcontentloaded", timeout=45000
+                )
+            except Exception:
+                log.warning("  browser: homepage load failed; continuing anyway")
+            for url in urls:
+                started = time.perf_counter()
+                try:
+                    response = await context.request.get(url, timeout=45000)
+                    elapsed = time.perf_counter() - started
+                    body = await response.body()
+                    if response.status != 200:
+                        log.warning("  browser fetch %s -> HTTP %s", url, response.status)
+                        continue
+                    out[url] = json.loads(body)
+                    log.info(
+                        "  browser fetch OK: %d B in %.2fs  %s", len(body), elapsed, url
+                    )
+                except Exception as exc:
+                    log.warning("  browser fetch failed %s (%s)", url, exc)
+        finally:
+            await browser.close()
+    return out
 
 
 def decode_ids(index: dict[str, Any]) -> list[int]:
@@ -106,65 +167,130 @@ async def main() -> int:
 
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as client:
-        # ---- 1. Manifest -------------------------------------------------
-        # The exact manifest path was never captured (the discovery log
-        # shows the hashed asset URLs but the manifest request itself
-        # scrolled past), so try the plausible names rather than guessing
-        # once and failing.
-        candidates = [
-            os.getenv("FUTGG_MANIFEST_URL", "").strip(),
-            f"{BASE}/{GAME_YEAR}/manifest.json",
-            f"{BASE}/{GAME_YEAR}/index.json",
-            f"{BASE}/{GAME_YEAR}/versions.json",
-            f"{BASE}/manifest.json",
-            f"{BASE}/{GAME_YEAR}/manifest.v1.json",
-        ]
-        manifest = None
-        for url in [c for c in candidates if c]:
+        # ---- 0. CONTROL ---------------------------------------------------
+        # Every guessed manifest path returned 403, which is ambiguous: it
+        # could mean the paths are wrong, or that plain HTTP requests are
+        # refused regardless of path. Fetching a URL the browser is KNOWN
+        # to have loaded successfully separates those two cases, and the
+        # answer decides the whole architecture. Do this before anything
+        # else - without it, every later failure is uninterpretable.
+        control_url = os.getenv("FUTGG_CONTROL_URL", CONTROL_URL_DEFAULT).strip()
+        control_ok = False
+        if control_url:
+            log.info("CONTROL fetch (a URL the browser definitely loaded): %s", control_url)
             try:
-                manifest, size, elapsed = await fetch_json(client, url)
-                log.info("Manifest OK: %s (%d B in %.2fs)", url, size, elapsed)
-                break
+                _, csize, celapsed = await fetch_json(client, control_url)
+                control_ok = True
+                log.info("  CONTROL OK: %d B in %.2fs", csize, celapsed)
+                log.info(
+                    "  => plain HTTP to r2.fut.gg WORKS. Earlier 403s were wrong "
+                    "paths, not blocking."
+                )
             except Exception as exc:
-                log.info("  manifest not at %s (%s)", url, exc)
+                log.warning("  CONTROL FAILED: %s", exc)
+                log.warning(
+                    "  => r2.fut.gg refuses plain HTTP requests from here. The bulk "
+                    "feed is not reachable without browser context (TLS "
+                    "fingerprint, headers or IP reputation). This does NOT rule "
+                    "the approach out - it means the fetch must happen through "
+                    "the existing Playwright context (page.request / "
+                    "context.request), which still skips all rendering."
+                )
 
-        if manifest is None:
-            log.error(
-                "No manifest found. Get the exact URL from the browser: it is the "
-                "r2.fut.gg request whose JSON contains keys like "
-                "'player-prices-index' and 'player-prices-ps5-dyn' (the discovery "
-                "log shows that payload). Then set FUTGG_MANIFEST_URL and re-run."
-            )
-            return 0
-
-        index_hash = manifest.get("player-prices-index")
+        # ---- 1. Locate the price files ------------------------------------
+        # The manifest path was never captured, but the discovery log gives
+        # the exact hashed URLs. Those are enough to validate the encoding
+        # and coverage now; discovering the manifest matters only for
+        # long-term freshness tracking, which is a separate problem.
+        index_url = os.getenv("FUTGG_PRICES_INDEX_URL", "").strip()
+        dyn_url = os.getenv("FUTGG_PRICES_DYN_URL", "").strip()
         dyn_key = f"player-prices-{PLATFORM}-dyn"
-        dyn_hash = manifest.get(dyn_key)
-        published = (manifest.get("_published_at") or {}).get(dyn_key)
 
-        log.info("  player-prices-index=%s  %s=%s", index_hash, dyn_key, dyn_hash)
-        if published:
-            age = time.time() - float(published)
+        manifest_url = os.getenv("FUTGG_MANIFEST_URL", "").strip()
+        if manifest_url and not (index_url and dyn_url):
+            try:
+                manifest, size, elapsed = await fetch_json(client, manifest_url)
+                log.info("Manifest OK: %s (%d B in %.2fs)", manifest_url, size, elapsed)
+                index_hash = manifest.get("player-prices-index")
+                dyn_hash = manifest.get(dyn_key)
+                published = (manifest.get("_published_at") or {}).get(dyn_key)
+                if published:
+                    age = time.time() - float(published)
+                    log.info(
+                        "  %s published %s (%.1f min ago) - THIS CAPS BULK FRESHNESS",
+                        dyn_key,
+                        datetime.fromtimestamp(float(published), timezone.utc).isoformat(),
+                        age / 60.0,
+                    )
+                if index_hash and dyn_hash:
+                    index_url = f"{BASE}/{GAME_YEAR}/player-prices-index.v1.{index_hash}.json"
+                    dyn_url = f"{BASE}/{GAME_YEAR}/{dyn_key}.v1.{dyn_hash}.json"
+            except Exception as exc:
+                log.warning("Manifest fetch failed (%s); falling back to explicit URLs", exc)
+
+        if not index_url or not dyn_url:
+            index_url = index_url or INDEX_URL_DEFAULT
+            dyn_url = dyn_url or DYN_URL_DEFAULT
             log.info(
-                "  %s published %s (%.1f minutes ago)",
-                dyn_key,
-                datetime.fromtimestamp(float(published), timezone.utc).isoformat(),
-                age / 60.0,
+                "Using the hashed URLs captured by discovery. These hashes go stale "
+                "as FUT.GG republishes - override with FUTGG_PRICES_INDEX_URL / "
+                "FUTGG_PRICES_DYN_URL if they 404."
             )
-            log.info("  >>> FEED AGE IS THE KEY NUMBER: it caps how fresh bulk prices can ever be.")
 
-        if not index_hash or not dyn_hash:
-            log.error("Manifest lacks the expected keys; got: %s", list(manifest)[:30])
-            return 0
+        if not control_ok:
+            log.warning(
+                "Proceeding without a working control fetch - the following "
+                "failures are most likely blocking rather than bad paths."
+            )
 
         # ---- 2. Index + prices ------------------------------------------
-        index, isize, ielapsed = await fetch_json(
-            client, f"{BASE}/{GAME_YEAR}/player-prices-index.v1.{index_hash}.json"
-        )
-        dyn, dsize, delapsed = await fetch_json(
-            client, f"{BASE}/{GAME_YEAR}/{dyn_key}.v1.{dyn_hash}.json"
-        )
-        log.info("  index %d B in %.2fs | prices %d B in %.2fs", isize, ielapsed, dsize, delapsed)
+        log.info("index: %s", index_url)
+        log.info("dyn:   %s", dyn_url)
+        index = dyn = None
+        isize = dsize = 0
+        transport = "plain-http"
+        try:
+            index, isize, ielapsed = await fetch_json(client, index_url)
+            dyn, dsize, delapsed = await fetch_json(client, dyn_url)
+            log.info("  index %d B in %.2fs | prices %d B in %.2fs",
+                     isize, ielapsed, dsize, delapsed)
+        except Exception as exc:
+            log.warning("Plain HTTP fetch failed: %s", exc)
+            if control_ok:
+                log.error(
+                    "  Control SUCCEEDED, so this is a stale hash rather than "
+                    "blocking. Re-run discovery for current hashes and set "
+                    "FUTGG_PRICES_INDEX_URL / FUTGG_PRICES_DYN_URL."
+                )
+                return 0
+
+            # Control failed too - so the question is not "is the path
+            # right" but "will anything other than a browser be served".
+            # Answer it now rather than making this a second round trip.
+            log.info("Retrying through a Playwright browser context...")
+            try:
+                fetched = await fetch_via_browser([index_url, dyn_url])
+            except Exception:
+                log.exception("  browser transport unavailable")
+                fetched = {}
+
+            index = fetched.get(index_url)
+            dyn = fetched.get(dyn_url)
+            transport = "browser-context"
+            if index is None or dyn is None:
+                log.error(
+                    "BLOCKED on both transports. The bulk feed is not usable from "
+                    "this host as-is. Remaining options, in order: (1) fetch the "
+                    "feed inside the existing price worker's live browser context, "
+                    "which already holds valid Cloudflare cookies; (2) use the "
+                    "per-card signed endpoint through that same context; "
+                    "(3) stay on rendering. Do not conclude the feed is unusable "
+                    "in production from this result alone - the price worker's "
+                    "context is more established than this probe's cold one."
+                )
+                return 0
+
+        log.info("TRANSPORT THAT WORKED: %s", transport)
         log.info("  index keys=%s  prices keys=%s", list(index)[:12], list(dyn)[:12])
 
         ids = decode_ids(index)
