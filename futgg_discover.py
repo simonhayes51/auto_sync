@@ -226,6 +226,71 @@ class NetworkDiscovery:
             log.warning("timed out draining %d pending body reads", len(self._pending))
 
 
+async def inspect_dom_candidates(page, price_selector: str) -> dict[str, Any]:
+    """Find what the price container is called NOW.
+
+    Added in response to a production outage in which every card failed
+    with `price_section_missing`: the page loaded, `.fc-card` rendered, but
+    `#prices-overview` was absent. That is either a markup rename on
+    FUT.GG's side or a container that only mounts when scrolled into view.
+    Guessing a replacement selector would be speculation, so this reports
+    every element that plausibly holds price data and lets the evidence
+    decide.
+
+    Also probes for bot-interstitial markers, which is the cheapest way to
+    rule out "we are being served a challenge page" as the cause.
+    """
+    script = """
+    (priceSelector) => {
+        const markers = ['price','market','bin','sale','listing','value','coin'];
+        const out = {
+            title: document.title,
+            price_selector_present: !!document.querySelector(priceSelector),
+            fc_card_count: document.querySelectorAll('.fc-card').length,
+            body_text_length: (document.body ? document.body.innerText.length : 0),
+            scroll_height: document.documentElement.scrollHeight,
+            viewport_height: window.innerHeight,
+            candidates: [],
+            challenge_markers: [],
+        };
+        const lowerBody = (document.body ? document.body.innerText : '').toLowerCase();
+        for (const phrase of ['just a moment','checking your browser',
+                              'verify you are human','enable javascript and cookies',
+                              'attention required']) {
+            if (lowerBody.includes(phrase)) out.challenge_markers.push(phrase);
+        }
+        const seen = new Set();
+        for (const el of document.querySelectorAll('[id],[class],[data-testid]')) {
+            const id = el.id || '';
+            const cls = (typeof el.className === 'string' ? el.className : '') || '';
+            const testid = el.getAttribute('data-testid') || '';
+            const hay = (id + ' ' + cls + ' ' + testid).toLowerCase();
+            if (!markers.some(m => hay.includes(m))) continue;
+            const key = el.tagName + '|' + id + '|' + cls.slice(0, 60);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const text = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+            out.candidates.push({
+                tag: el.tagName.toLowerCase(),
+                id: id || null,
+                class: cls.slice(0, 120) || null,
+                testid: testid || null,
+                text_length: text.length,
+                text_preview: text.slice(0, 160),
+                has_digits: /\\d[\\d,.]{2,}/.test(text),
+            });
+            if (out.candidates.length >= 60) break;
+        }
+        return out;
+    }
+    """
+    try:
+        return await page.evaluate(script, price_selector)
+    except Exception:
+        log.exception("discovery: DOM candidate inspection failed")
+        return {}
+
+
 async def inspect_embedded_json(page) -> list[dict[str, Any]]:
     """Look for data baked into the HTML itself.
 
@@ -376,6 +441,9 @@ async def run_discovery(
     # (the captured responses are often exactly what explains the failure)
     # rather than dying with a NameError on the way out.
     html_size = 0
+    price_attached = False
+    dom_before_scroll: dict[str, Any] = {}
+    dom_after_scroll: dict[str, Any] = {}
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -398,8 +466,10 @@ async def run_discovery(
             status = response.status if response is not None else 0
             log.info("discovery: navigation status=%s", status)
 
+            price_attached = False
             try:
                 await page.locator(price_selector).wait_for(state="attached", timeout=timeout_ms)
+                price_attached = True
                 log.info("discovery: %s attached", price_selector)
             except Exception:
                 log.warning("discovery: %s never attached", price_selector)
@@ -407,6 +477,23 @@ async def run_discovery(
             # Let post-hydration requests fire - the whole point is to see
             # what happens AFTER the document arrives.
             await page.wait_for_timeout(settle_ms)
+
+            dom_before_scroll = await inspect_dom_candidates(page, price_selector)
+
+            # Scroll and re-check. If the container only appears after this,
+            # the cause is a lazy/viewport-triggered mount rather than a
+            # markup rename - a completely different fix, and one the
+            # production worker (which never scrolls) would never trigger.
+            dom_after_scroll: dict[str, Any] = {}
+            if not price_attached:
+                try:
+                    await page.evaluate(
+                        "() => window.scrollTo(0, document.body.scrollHeight)"
+                    )
+                    await page.wait_for_timeout(2500)
+                    dom_after_scroll = await inspect_dom_candidates(page, price_selector)
+                except Exception:
+                    log.exception("discovery: scroll probe failed")
 
             discovery.embedded = await inspect_embedded_json(page)
             await discovery.drain()
@@ -421,6 +508,10 @@ async def run_discovery(
         "url": url,
         "rendered_html_bytes": html_size,
         "classification": verdict,
+        "price_selector": price_selector,
+        "price_selector_attached": price_attached,
+        "dom_before_scroll": dom_before_scroll,
+        "dom_after_scroll": dom_after_scroll,
         "embedded_sources": discovery.embedded,
         "responses": discovery.responses,
     }
@@ -436,6 +527,65 @@ async def run_discovery(
             log.exception("discovery: could not write report to %s", report_path)
 
     return report
+
+
+def _log_dom_findings(report: dict[str, Any]) -> None:
+    """Report what the price container is actually called.
+
+    This is the section that resolves a `price_section_missing` outage:
+    either the expected selector is simply gone (markup rename - adopt one
+    of the candidates below), or it appears only after scrolling (lazy
+    mount - the worker never scrolls, so it would never see it), or the
+    page is a bot challenge (challenge_markers non-empty).
+    """
+    before = report.get("dom_before_scroll") or {}
+    after = report.get("dom_after_scroll") or {}
+    if not before:
+        return
+
+    log.info(
+        "DOM: selector=%s attached=%s title=%r fc_card_count=%s body_text=%s chars "
+        "scroll_height=%s viewport=%s",
+        report.get("price_selector"),
+        report.get("price_selector_attached"),
+        before.get("title"),
+        before.get("fc_card_count"),
+        before.get("body_text_length"),
+        before.get("scroll_height"),
+        before.get("viewport_height"),
+    )
+
+    if before.get("challenge_markers"):
+        log.warning(
+            "DOM: BOT-CHALLENGE MARKERS PRESENT %s - the page served is not the "
+            "player page; treat as a block, not a markup change.",
+            before["challenge_markers"],
+        )
+
+    candidates = before.get("candidates") or []
+    log.info("DOM: %d price-shaped candidate elements before scroll", len(candidates))
+    for candidate in candidates[:30]:
+        log.info(
+            "   <%s id=%s class=%s testid=%s> digits=%s len=%s text=%r",
+            candidate.get("tag"), candidate.get("id"), candidate.get("class"),
+            candidate.get("testid"), candidate.get("has_digits"),
+            candidate.get("text_length"), candidate.get("text_preview"),
+        )
+
+    if after:
+        appeared = after.get("price_selector_present") and not before.get(
+            "price_selector_present"
+        )
+        log.info(
+            "DOM after scroll: selector_present=%s candidates=%d",
+            after.get("price_selector_present"), len(after.get("candidates") or []),
+        )
+        if appeared:
+            log.warning(
+                "DOM: selector appeared ONLY AFTER SCROLLING - this is a lazy/"
+                "viewport-triggered mount, not a markup rename. The worker never "
+                "scrolls, which is why every card reports price_section_missing."
+            )
 
 
 def _log_report(report: dict[str, Any]) -> None:
@@ -473,6 +623,9 @@ def _log_report(report: dict[str, Any]) -> None:
             log.info("      post_body=%s", entry["post_body_preview"])
         if entry.get("preview"):
             log.info("      preview=%s", json.dumps(entry["preview"], default=str)[:1200])
+
+    log.info("-" * 72)
+    _log_dom_findings(report)
 
     log.info("-" * 72)
     for embedded in report["embedded_sources"]:
