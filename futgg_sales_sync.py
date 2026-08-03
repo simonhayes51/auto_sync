@@ -118,6 +118,60 @@ USER_AGENT = (
 )
 
 
+class AdaptiveThrottle:
+    """Self-tuning request rate, driven by observed 429s.
+
+    The first live run attempted 200 cards in 15.4s and got 144 HTTP 429s
+    on the data fetch - the transport itself is fast (89ms per batch of
+    eight), so the only real constraint is FUT.GG's rate limit, and its
+    exact threshold is unknown and liable to change.
+
+    Rather than hard-code a guess, back off hard when throttled and ease
+    back in when clean. Backing off on BOTH axes matters: a smaller batch
+    reduces instantaneous concurrency, while a longer delay reduces
+    sustained rate, and 429s can be triggered by either.
+
+    Note what the required throughput actually is: ~3,272 cards at 85+ on
+    a 30-minute cadence is ~109 cards/min, and the long tail adds maybe
+    another 25. So roughly 2.2 cards/sec sustained is enough. The first
+    run was already achieving 3.6/sec of successes - being slower and
+    clean is strictly better than fast and mostly rejected, because
+    rejected requests still cost quota and risk a harder block.
+    """
+
+    def __init__(self, batch_size: int, delay: float) -> None:
+        self.batch_size = batch_size
+        self.delay = delay
+        self.max_batch = batch_size
+        self.min_batch = 1
+        self.min_delay = delay
+        self.max_delay = max(delay * 40, 10.0)
+        self._clean_streak = 0
+
+    def record(self, attempted: int, throttled: int) -> None:
+        if throttled:
+            self._clean_streak = 0
+            # Proportional to how badly we overshot: a batch that was
+            # entirely rejected deserves a harder cut than one that lost a
+            # single request.
+            severity = throttled / max(attempted, 1)
+            self.delay = min(self.max_delay, max(self.delay, 0.25) * (1.0 + 2.0 * severity))
+            if severity > 0.25:
+                self.batch_size = max(self.min_batch, self.batch_size - 1)
+            return
+
+        self._clean_streak += 1
+        # Ease back in slowly, and only after sustained success - the
+        # limiter is likely windowed, so one clean batch proves little.
+        if self._clean_streak >= 5:
+            self._clean_streak = 0
+            self.delay = max(self.min_delay, self.delay * 0.8)
+            self.batch_size = min(self.max_batch, self.batch_size + 1)
+
+    def describe(self) -> str:
+        return f"batch={self.batch_size} delay={self.delay:.2f}s"
+
+
 def sales_interval_minutes(rating: int | None) -> int:
     if rating is None:
         return SALES_INTERVALS["under_75"]
@@ -287,7 +341,7 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     )
 
 
-async def process_batch(page, pool: asyncpg.Pool, rows, stats, timers) -> None:
+async def process_batch(page, pool: asyncpg.Pool, rows, stats, timers, throttle) -> None:
     ids = [int(r["source_card_id"]) for r in rows]
     by_id = {int(r["source_card_id"]): r for r in rows}
     captured_at = datetime.now(timezone.utc)
@@ -301,10 +355,12 @@ async def process_batch(page, pool: asyncpg.Pool, rows, stats, timers) -> None:
         except Exception:
             log.warning("batch fetch failed", exc_info=True)
             stats["batch_errors"] += 1
+            throttle.record(len(ids), len(ids))
             return
 
     to_insert: list[tuple] = []
     updates: list[tuple] = []
+    throttled = 0
     for result in results or []:
         card_id = int(result.get("eaId"))
         row = by_id.get(card_id)
@@ -314,9 +370,14 @@ async def process_batch(page, pool: asyncpg.Pool, rows, stats, timers) -> None:
             stats["failed"] += 1
             stats.setdefault("errors", {})
             stats["errors"][error] = stats["errors"].get(error, 0) + 1
-            # Back off this card briefly rather than retrying immediately;
-            # the common error is throttling, which a retry only worsens.
-            updates.append((card_id, 5, f"error:{error}"))
+            if "429" in error or error == "challenge_required":
+                # Rate-limited, not evaluated. Deliberately leave the
+                # schedule untouched so the card stays due and is retried
+                # once the throttle has adapted - pushing it out would
+                # silently drop cards purely because we asked too fast.
+                throttled += 1
+            else:
+                updates.append((card_id, 5, f"error:{error}"))
             continue
 
         sale_rows = build_sale_rows(card_id, result.get("completedAuctions") or [], captured_at)
@@ -324,6 +385,8 @@ async def process_batch(page, pool: asyncpg.Pool, rows, stats, timers) -> None:
         stats["ok"] += 1
         stats["sales_seen"] += len(sale_rows)
         updates.append((card_id, sales_interval_minutes(rating), "success"))
+
+    throttle.record(len(ids), throttled)
 
     with timers.track("db_write"):
         async with pool.acquire() as conn:
@@ -377,6 +440,8 @@ async def run_forever() -> None:
             await page.goto(anchor, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
             log.info("anchor page loaded: %s", anchor)
 
+            throttle = AdaptiveThrottle(BATCH_SIZE, BATCH_DELAY)
+
             while True:
                 timers = StageTimers()
                 stats = {"ok": 0, "failed": 0, "sales_seen": 0, "batch_errors": 0}
@@ -388,18 +453,26 @@ async def run_forever() -> None:
                     await asyncio.sleep(IDLE_SLEEP)
                     continue
 
-                for offset in range(0, len(due), BATCH_SIZE):
+                offset = 0
+                while offset < len(due):
+                    # Size is read per iteration, so a mid-cycle backoff
+                    # takes effect immediately rather than at the next
+                    # cycle.
+                    size = throttle.batch_size
                     await process_batch(
-                        page, pool, due[offset: offset + BATCH_SIZE], stats, timers
+                        page, pool, due[offset: offset + size], stats, timers, throttle
                     )
-                    if BATCH_DELAY:
-                        await asyncio.sleep(BATCH_DELAY)
+                    offset += size
+                    if throttle.delay:
+                        await asyncio.sleep(throttle.delay)
 
                 elapsed = max(time.perf_counter() - started, 0.001)
                 log.info(
-                    "cycle: cards_ok=%d failed=%d sales=%d in %.1fs (%.0f cards/min) errors=%s",
+                    "cycle: cards_ok=%d failed=%d sales=%d in %.1fs (%.0f cards/min) "
+                    "throttle[%s] errors=%s",
                     stats["ok"], stats["failed"], stats["sales_seen"], elapsed,
-                    (stats["ok"] / elapsed) * 60, stats.get("errors", {}),
+                    (stats["ok"] / elapsed) * 60, throttle.describe(),
+                    stats.get("errors", {}),
                 )
                 for line in timers.format_lines():
                     log.info(line)
