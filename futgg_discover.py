@@ -46,7 +46,7 @@ from typing import Any
 
 from playwright.async_api import async_playwright
 
-from futgg_instrumentation import redact_headers, redact_structure
+from futgg_instrumentation import redact_headers, redact_structure, redact_url
 
 log = logging.getLogger("futgg_discover")
 
@@ -152,7 +152,10 @@ class NetworkDiscovery:
     async def _capture(self, response, request) -> None:
         entry: dict[str, Any] = {
             "method": request.method,
-            "url": response.url,
+            # Redacted at capture: the signed price URL carries its verify
+            # token in the query string, which header/body redaction never
+            # touches.
+            "url": redact_url(response.url),
             "status": response.status,
             "resource_type": getattr(request, "resource_type", None),
         }

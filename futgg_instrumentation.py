@@ -251,10 +251,61 @@ def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# Query parameters whose VALUE is a credential. FUT.GG signs price
+# requests with a short-lived `verify` token obtained from
+# /api/fut/price-access/sign/, and that token travels in the query string -
+# where header and body redaction never sees it.
+_SENSITIVE_QUERY_KEYS = (
+    "verify",
+    "token",
+    "sig",
+    "signature",
+    "key",
+    "auth",
+    "access",
+    "secret",
+    "hash",
+)
+
+
+def redact_url(url: str) -> str:
+    """Redact credential-bearing query parameters, preserving structure.
+
+    The path and parameter NAMES are what make a diagnostic useful ("this
+    endpoint requires a verify token"); the values are what must not be
+    retained. Returns the URL unchanged when it has no query string.
+    """
+    if not url or "?" not in url:
+        return url
+    base, _, query = url.partition("?")
+    parts = []
+    for pair in query.split("&"):
+        name, sep, value = pair.partition("=")
+        if not sep:
+            parts.append(pair)
+            continue
+        if any(marker in name.lower() for marker in _SENSITIVE_QUERY_KEYS) or (
+            _TOKENISH.match(value)
+        ):
+            parts.append(f"{name}=<redacted:{len(value)} chars>")
+        else:
+            parts.append(pair)
+    return f"{base}?{'&'.join(parts)}"
+
+
 def redact_value(value: Any) -> Any:
     if isinstance(value, str):
         if _TOKENISH.match(value):
             return f"<token-like:{len(value)} chars>"
+        # A URL carrying a credential in its query string. Caught before
+        # the length truncation below, which would otherwise keep the
+        # first 77 characters - enough to expose the leading part of a
+        # signed token. FUT.GG's /price-access/sign/ endpoint returns
+        # exactly this shape in its response body.
+        if "?" in value and ("=" in value) and (
+            value.startswith("/") or value.startswith("http")
+        ):
+            return redact_url(value)
         if len(value) > 80:
             return value[:77] + "..."
         return value
