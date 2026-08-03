@@ -26,6 +26,11 @@ metadata_worker: python metadata_worker.py
 futgg_player_worker: python futgg_player_sync.py
 futgg_price_worker: python futgg_price_sync.py
 
+# Bulk price ingest: one page load harvests the whole ~27k-card price
+# feed, bypassing the per-card signing endpoint that rate-limits the
+# scraper. Continuous service. Dry run until FUTGG_BULK_APPLY=true.
+futgg_bulk_price_worker: python futgg_bulk_price_sync.py
+
 # One-shot diagnostics. Run on a SEPARATE service - never the price
 # worker. Each exits after a single run, so pointing the price service at
 # one silently stops price syncing.
