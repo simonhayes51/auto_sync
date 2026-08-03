@@ -257,10 +257,46 @@ async def ingest_once(pool: asyncpg.Pool, page, timers: StageTimers) -> dict[str
     log.info("  of matched, %d have a non-zero price (%.1f%%)",
              priced, 100.0 * priced / len(matched) if matched else 0.0)
     if status_by_id:
-        from collections import Counter
+        from collections import Counter, defaultdict
 
         dist = Counter(status_by_id[int(r["source_card_id"])] for r in matched)
         log.info("  status values across our cards: %s", dist.most_common(8))
+
+        # Cross-tabulate the feed's status against what the SCRAPER most
+        # recently concluded for the same card. The status enum is
+        # undocumented, but if e.g. status 2 lines up with the cards the
+        # scraper reports as price_render_failed or untradeable, that is
+        # the classification it has been failing to infer from missing
+        # markup ~26% of the time - and we can stop scraping those cards
+        # entirely rather than burning ~5s each rediscovering it.
+        with timers.track("status_crosstab"):
+            async with pool.acquire() as conn:
+                outcomes = await conn.fetch(
+                    """
+                    SELECT source_card_id, last_price_status
+                    FROM futgg_players
+                    WHERE is_active AND last_price_status IS NOT NULL
+                    """
+                )
+            crosstab: dict[Any, Counter] = defaultdict(Counter)
+            price_presence: dict[Any, Counter] = defaultdict(Counter)
+            for row in outcomes:
+                card_id = int(row["source_card_id"])
+                status = status_by_id.get(card_id)
+                if status is None:
+                    continue
+                crosstab[status][row["last_price_status"]] += 1
+                price_presence[status]["priced" if by_id.get(card_id) else "zero"] += 1
+
+            log.info("  --- feed status vs scraper outcome ---")
+            for status in sorted(crosstab):
+                log.info(
+                    "    status=%s  prices:%s  scraper:%s",
+                    status,
+                    dict(price_presence[status]),
+                    dict(crosstab[status].most_common(5)),
+                )
+            log.info("  --------------------------------------")
     log.info("=" * 68)
 
     if not matched:

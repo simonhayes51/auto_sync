@@ -31,6 +31,11 @@ futgg_price_worker: python futgg_price_sync.py
 # scraper. Continuous service. Dry run until FUTGG_BULK_APPLY=true.
 futgg_bulk_price_worker: python futgg_bulk_price_sync.py
 
+# Sales history via the signed JSON endpoint. One page load for the whole
+# process lifetime; every card after that is a fetch() from inside it.
+# Replaces the per-card page scraping in futgg_price_sync.
+futgg_sales_worker: python futgg_sales_sync.py
+
 # One-shot diagnostics. Run on a SEPARATE service - never the price
 # worker. Each exits after a single run, so pointing the price service at
 # one silently stops price syncing.
