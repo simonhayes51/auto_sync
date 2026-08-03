@@ -8,6 +8,9 @@ Core behaviour:
 - Successful 85+ cards are refreshed every 10 minutes by default.
 - Lower-rated cards use progressively longer refresh intervals.
 - Browser/context/pages remain alive between batches.
+- Price values are waited for by condition, not a fixed sleep.
+- The browser cache is warmed before the first batch (a cold context
+  previously failed an entire startup batch).
 - Incomplete price renders are retried once.
 - Ambiguous no-market results are rejected as technical failures.
 - price_section_missing is never stored as a valid market outcome.
@@ -16,7 +19,7 @@ Core behaviour:
 - Failed attempts do not overwrite historical BIN or sales data.
 
 Recommended Railway command:
-    python -m scripts.futgg_price_sync
+    python futgg_price_sync.py
 
 Recommended Railway variables:
     PLAYWRIGHT_HEADLESS=true
@@ -29,7 +32,8 @@ Recommended Railway variables:
     FUTGG_PRICE_BATCH_SLEEP_SECONDS=1
     FUTGG_PRICE_BLOCK_BACKOFF_SECONDS=900
 
-    FUTGG_PRICE_SECTION_TIMEOUT_MS=12000
+    FUTGG_PRICE_SECTION_TIMEOUT_MS=3500
+    FUTGG_PRICE_CONTENT_TIMEOUT_MS=2500
     FUTGG_PRICE_RENDER_SETTLE_MS=700
     FUTGG_PRICE_RETRY_SETTLE_MS=2000
     FUTGG_PRICE_MAX_ATTEMPTS=2
@@ -74,7 +78,7 @@ from futgg_player_sync import ensure_schema as ensure_player_schema
 from monitoring import alert, heartbeat
 
 
-SCRIPT_VERSION = "futgg-price-sync-render-validation-v3"
+SCRIPT_VERSION = "futgg-price-sync-render-validation-v4"
 
 
 logging.basicConfig(
@@ -193,10 +197,45 @@ BLOCK_BACKOFF_SECONDS = env_float(
     minimum=60.0,
 )
 
+# Lowered from 12000 on production evidence. A successful card completes
+# EVERYTHING - navigation, waits, settle, content, parse and DB writes - in
+# a measured ~2.0s, so the price section attaches well inside one second on
+# any card that is going to work. The old 12s ceiling only ever applied to
+# cards that were never going to render, and it applied twice (once per
+# attempt): a failed card cost ~27.7s, or fourteen successful cards. At a
+# ~26% failure rate that single constant was the difference between
+# ~55 cards/min and ~112.
 PRICE_SECTION_TIMEOUT_MS = env_int(
     "FUTGG_PRICE_SECTION_TIMEOUT_MS",
-    12000,
+    3500,
     minimum=1000,
+)
+
+# Ceiling on waiting for the price VALUES to populate once the container
+# exists. A card that legitimately has no market keeps an empty container
+# forever, so this is the price of confirming "genuinely no market" - keep
+# it tight.
+PRICE_CONTENT_TIMEOUT_MS = env_int(
+    "FUTGG_PRICE_CONTENT_TIMEOUT_MS",
+    1500,
+    minimum=250,
+)
+
+# Short grace period after the price values appear, to let the Recent
+# Sales table finish rendering.
+#
+# This is NOT belt-and-braces. The sales table lives OUTSIDE
+# #prices-overview (futgg_common._find_recent_sales_table locates it from a
+# "Recent Sales" heading), so a predicate that only inspects the price
+# container can fire while the table is still empty - producing a card
+# recorded with a valid BIN and zero sales. That failure is worse than
+# being slow because it is silently lossy: sales history is what every
+# median, trend and fair value downstream is computed from, and nothing
+# would flag it.
+POST_CONTENT_SETTLE_MS = env_int(
+    "FUTGG_PRICE_POST_CONTENT_SETTLE_MS",
+    250,
+    minimum=0,
 )
 
 RENDER_SETTLE_MS = env_int(
@@ -937,6 +976,50 @@ async def wait_for_base_card(page: Page) -> None:
         ) from exc
 
 
+async def wait_for_price_content(page: Page) -> bool:
+    """Wait until the price section actually holds a number.
+
+    Replaces the blind post-attach settle for the common case. The
+    container attaches before its values populate, which is what the fixed
+    RENDER_SETTLE_MS wait was compensating for - but a fixed wait pays the
+    full cost on every card regardless of whether the data arrived in 50ms
+    or not at all. Measured against production, the settle was ~700ms of a
+    2.0s successful card: roughly a third of the happy path spent waiting
+    for something that had usually already happened.
+
+    Returns True once a digit group is present. A False result is not
+    treated as a market outcome - it just means we fall back to the
+    original settle-then-parse path, so nothing that used to succeed can
+    start failing because of this.
+    """
+    try:
+        await page.wait_for_function(
+            """() => {
+                const el = document.querySelector('#prices-overview');
+                if (!el) return false;
+                const priced = /\\d[\\d,.]{2,}/.test(el.innerText || '');
+                if (!priced) return false;
+                // The sales table renders separately from the price
+                // container. Treat "priced" as ready only once the table
+                // has rows too, so we never parse a card that has its BIN
+                // but has not yet listed a single sale. Cards with no
+                // recent sales at all never satisfy this and fall through
+                // to the timeout, which is correct - there is nothing to
+                // wait for and the parser handles the empty case.
+                return document.querySelectorAll('table tbody tr').length > 0;
+            }""",
+            timeout=PRICE_CONTENT_TIMEOUT_MS,
+        )
+        return True
+
+    except PlaywrightTimeoutError:
+        return False
+
+    except Exception:
+        # Never let a diagnostic-grade optimisation break a card.
+        return False
+
+
 async def wait_for_price_section(page: Page) -> bool:
     """Wait for the price section.
 
@@ -1073,17 +1156,39 @@ async def load_and_parse_card(
                     await wait_for_price_section(page)
                 )
 
-            settle_ms = (
-                RENDER_SETTLE_MS
-                if attempt == 1
-                else RETRY_SETTLE_MS
-            )
+            # Prefer a condition over a fixed sleep: settle only when we
+            # could not positively confirm the values had populated.
+            content_ready = False
 
-            if settle_ms > 0:
-                with timers.track("render_settle"):
-                    await page.wait_for_timeout(
-                        settle_ms
-                    )
+            if price_section_attached:
+                with timers.track("price_content_wait"):
+                    content_ready = await wait_for_price_content(page)
+
+            if content_ready:
+                # Values and sales rows are both present. Only a short
+                # grace period is needed for the table to finish filling,
+                # not the full blind settle.
+                if POST_CONTENT_SETTLE_MS > 0:
+                    with timers.track("post_content_settle"):
+                        await page.wait_for_timeout(
+                            POST_CONTENT_SETTLE_MS
+                        )
+
+            elif not price_section_attached:
+                # The container never appeared. Sleeping for it to "settle"
+                # cannot conjure it, and this is the path that made a failed
+                # card cost fourteen successful ones. Any untradeable /
+                # no-market text is already in the DOM from the initial
+                # render, so the parser below still has everything it needs
+                # to classify - no validation is skipped, only dead waiting.
+                timers.record("settle_skipped_no_section", 0.0)
+
+            else:
+                # Container present but never populated. We already waited
+                # PRICE_CONTENT_TIMEOUT_MS for it, which exceeds the settle
+                # this replaces - adding a settle on top would just pay
+                # twice for the same thing.
+                timers.record("settle_skipped_after_content_timeout", 0.0)
 
             with timers.track("page_content"):
                 html = await page.content()
@@ -1505,6 +1610,77 @@ async def create_browser(
         browser,
         context,
         pages,
+    )
+
+
+async def warm_browser(
+    pool: asyncpg.Pool,
+    pages: list[Page],
+) -> None:
+    """Prime the shared HTTP cache before the first real batch.
+
+    A freshly created BrowserContext has an empty cache, so every page's
+    first navigation downloads the full JS bundle independently. With all
+    workers starting at once that produced a total wipeout on startup:
+    every card in the first batch failed with price_section_missing
+    because cold renders overran even a 12-second wait, while two minutes
+    later the same worker was succeeding on the same cards untouched.
+
+    Warming is sequential-then-parallel on purpose. The first load is what
+    populates the shared cache; firing all eight at once would simply
+    reproduce the cold stampede this exists to avoid.
+
+    Entirely best-effort - a warm-up failure must never stop the worker
+    starting, it only means the first batch is slower.
+    """
+    if not pages:
+        return
+
+    try:
+        async with pool.acquire() as conn:
+            url = await conn.fetchval(
+                """
+                SELECT source_url
+                FROM futgg_players
+                WHERE is_active = TRUE
+                  AND source_url IS NOT NULL
+                  AND is_tradeable IS DISTINCT FROM FALSE
+                ORDER BY rating DESC NULLS LAST
+                LIMIT 1
+                """
+            )
+    except Exception:
+        log.warning("Warm-up: could not select a URL", exc_info=True)
+        return
+
+    if not url:
+        log.info("Warm-up: no candidate URL available, skipping")
+        return
+
+    started = time.perf_counter()
+
+    async def load(page: Page) -> None:
+        try:
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=TIMEOUT_MS,
+            )
+            await wait_for_price_section(page)
+        except Exception:
+            pass
+
+    # First load alone - this is the one that fills the cache.
+    await load(pages[0])
+
+    # The rest now hit a warm cache and should return quickly.
+    if len(pages) > 1:
+        await asyncio.gather(*(load(page) for page in pages[1:]))
+
+    log.info(
+        "Warm-up complete for %d page(s) in %.1fs",
+        len(pages),
+        time.perf_counter() - started,
     )
 
 
@@ -1930,6 +2106,8 @@ async def run_forever() -> None:
             playwright
         )
 
+        await warm_browser(pool, pages)
+
         log.info(
             (
                 "Continuous FUT.GG price worker started: "
@@ -1984,6 +2162,9 @@ async def run_forever() -> None:
                         playwright
                     )
 
+                    # Rebuilt context = empty cache again.
+                    await warm_browser(pool, pages)
+
                     continue
 
                 if stats["selected"] == 0:
@@ -2032,6 +2213,8 @@ async def run_forever() -> None:
                 ) = await create_browser(
                     playwright
                 )
+
+                await warm_browser(pool, pages)
 
     finally:
         await close_browser_resources(
