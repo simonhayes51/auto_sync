@@ -181,6 +181,70 @@ async def fetch_via_browser(urls: list[str]) -> dict[str, Any]:
     return out
 
 
+async def harvest_from_page_load(player_url: str, wanted: list[str]) -> dict[str, Any]:
+    """Let the FUT.GG app fetch the price feed, and read it off the wire.
+
+    Every direct transport is refused, but discovery PROVED these exact
+    files load successfully - as a side effect of the app loading a player
+    page. So rather than trying to impersonate that request ever more
+    convincingly, stop impersonating it: load the page, let the app issue
+    its own request, and capture the response body.
+
+    This is not a workaround, it is the observation that matters
+    commercially. If ONE player-page load yields prices for ~27,000 cards,
+    the production design is one page load per refresh cycle - not 27,000.
+    Even at the current ~2s per page that is the entire catalogue in
+    seconds.
+
+    `wanted` are URL substrings to match, not exact URLs, because the
+    content hashes change whenever FUT.GG republishes.
+    """
+    from playwright.async_api import async_playwright
+
+    captured: dict[str, Any] = {}
+    pending: list[asyncio.Task] = []
+
+    async def read(response, key: str) -> None:
+        try:
+            body = await response.body()
+            captured[key] = json.loads(body)
+            log.info(
+                "  [page-load harvest] captured %s (%d B) from %s",
+                key, len(body), response.url,
+            )
+        except Exception as exc:
+            log.warning("  [page-load harvest] could not read %s (%s)", key, exc)
+
+    def on_response(response) -> None:
+        for key in wanted:
+            if key in response.url and response.status == 200:
+                pending.append(asyncio.ensure_future(read(response, key)))
+                break
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        try:
+            context = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+            page = await context.new_page()
+            page.on("response", on_response)
+            log.info("  [page-load harvest] loading %s", player_url)
+            try:
+                await page.goto(player_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as exc:
+                log.warning("  [page-load harvest] navigation failed (%s)", exc)
+            # The feed is fetched during hydration, after domcontentloaded.
+            await page.wait_for_timeout(6000)
+            if pending:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=30
+                )
+        finally:
+            await browser.close()
+    return captured
+
+
 def decode_ids(index: dict[str, Any]) -> list[int]:
     """Decode the delta-encoded id list.
 
@@ -318,6 +382,49 @@ async def main() -> int:
             index = fetched.get(index_url)
             dyn = fetched.get(dyn_url)
             transport = "browser-context (see per-URL tier above)"
+
+            if index is None or dyn is None:
+                # Final transport: stop impersonating the app's request and
+                # let the app make it. Discovery proved this works.
+                log.info(
+                    "Direct transports refused. Harvesting from a real page load "
+                    "instead - the method discovery already proved works."
+                )
+                player_url = os.getenv("FUTGG_DISCOVER_URL", "").strip()
+                if not player_url and DATABASE_URL:
+                    try:
+                        import asyncpg as _asyncpg
+
+                        _conn = await _asyncpg.connect(DATABASE_URL)
+                        try:
+                            player_url = await _conn.fetchval(
+                                """
+                                SELECT source_url FROM futgg_players
+                                WHERE is_active AND source_url IS NOT NULL
+                                  AND is_tradeable IS DISTINCT FROM FALSE
+                                ORDER BY rating DESC NULLS LAST LIMIT 1
+                                """
+                            )
+                        finally:
+                            await _conn.close()
+                    except Exception:
+                        log.warning("could not select a player URL", exc_info=True)
+                player_url = player_url or "https://www.fut.gg/players/1114-roberto-baggio/26-1114/"
+
+                try:
+                    harvested = await harvest_from_page_load(
+                        player_url,
+                        ["player-prices-index", f"player-prices-{PLATFORM}-dyn"],
+                    )
+                except Exception:
+                    log.exception("  page-load harvest failed")
+                    harvested = {}
+
+                index = index or harvested.get("player-prices-index")
+                dyn = dyn or harvested.get(f"player-prices-{PLATFORM}-dyn")
+                if index is not None and dyn is not None:
+                    transport = "page-load harvest (one page load -> whole feed)"
+
             if index is None or dyn is None:
                 log.error(
                     "BLOCKED on both transports. The bulk feed is not usable from "
