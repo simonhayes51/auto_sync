@@ -1,14 +1,20 @@
 #!/usr/bin/env python
-"""Rating-tiered FUT.GG price and recent-sales sync.
+"""Continuous rating-prioritised FUT.GG price and recent-sales sync.
 
-Reads cards from futgg_players, prioritises high-rated cards whose
-next_price_due_at is due, and stores observations in futgg_bin_history
-and futgg_sales_history.
+This is intended to run as a long-lived Railway worker, not as a cron job.
 
-Metadata discovery remains the responsibility of futgg_player_sync.py.
+Core behaviour:
+- Rating 85+ cards are refreshed every 10 minutes.
+- Lower-rated cards use progressively longer refresh intervals.
+- 85+ cards always receive priority.
+- Lower-rated cards only use spare batch capacity.
+- Chromium, browser context and worker pages remain open between batches.
+- Successful cards are rescheduled from their actual capture time.
+- Cloudflare blocks and rate limits trigger circuit-breaker backoff.
+- Untradeable cards are permanently removed from future price selection.
 
-Suggested Railway Cron:
-    */10 * * * *
+Recommended Railway service:
+    python -m scripts.futgg_price_sync
 
 Default refresh intervals:
     Rating 85+       10 minutes
@@ -18,16 +24,18 @@ Default refresh intervals:
     Rating under 70  1440 minutes
     Unknown rating   1440 minutes
 
-Hot opportunities can be refreshed sooner than their normal interval.
-
-Environment variables:
+Recommended environment variables:
     DATABASE_URL                              required
     PLAYWRIGHT_HEADLESS                       true
     PLAYWRIGHT_TIMEOUT_MS                     45000
 
-    FUTGG_PRICE_BATCH_SIZE                    4000
     FUTGG_PRICE_CONCURRENCY                   15
+    FUTGG_PRICE_BATCH_SIZE                    500
+    FUTGG_PRICE_HIGH_PRIORITY_SHARE           0.90
     FUTGG_PRICE_REQUEST_DELAY                 0.10
+    FUTGG_PRICE_IDLE_SLEEP_SECONDS            5
+    FUTGG_PRICE_BATCH_SLEEP_SECONDS           1
+    FUTGG_PRICE_BLOCK_BACKOFF_SECONDS         900
 
     FUTGG_RATING_85_PLUS_INTERVAL_MIN         10
     FUTGG_RATING_80_84_INTERVAL_MIN           30
@@ -40,7 +48,7 @@ Environment variables:
     FUTGG_HOT_INTERVAL_MIN                    10
     FUTGG_HOT_MIN_SALES                       5
 
-Price outcomes stored in futgg_players.last_price_status:
+Price outcomes:
     success
     untradeable
     no_active_market
@@ -49,12 +57,6 @@ Price outcomes stored in futgg_players.last_price_status:
     parse_failed
     rate_limited
     blocked
-
-A confirmed untradeable card receives:
-    is_tradeable = FALSE
-    next_price_due_at = NULL
-
-It is then excluded from future price-sync runs.
 """
 
 from __future__ import annotations
@@ -69,7 +71,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
-from playwright.async_api import async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
 from futgg_common import CircuitBreaker, parse_futgg_card
 from futgg_player_sync import ensure_schema as ensure_player_schema
@@ -83,88 +91,172 @@ logging.basicConfig(
 log = logging.getLogger("futgg_price_sync")
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None:
+        return default
+
+    return raw.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def env_int(
+    name: str,
+    default: int,
+    minimum: int | None = None,
+) -> int:
+    value = int(os.getenv(name, str(default)))
+
+    if minimum is not None:
+        value = max(minimum, value)
+
+    return value
+
+
+def env_float(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = float(os.getenv(name, str(default)))
+
+    if minimum is not None:
+        value = max(minimum, value)
+
+    if maximum is not None:
+        value = min(maximum, value)
+
+    return value
+
+
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not found")
 
 
-HEADLESS = (
-    os.getenv("PLAYWRIGHT_HEADLESS", "true")
-    .strip()
-    .lower()
-    in {"1", "true", "yes", "on"}
+HEADLESS = env_bool(
+    "PLAYWRIGHT_HEADLESS",
+    True,
 )
 
-TIMEOUT_MS = max(
-    5000,
-    int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "45000")),
+TIMEOUT_MS = env_int(
+    "PLAYWRIGHT_TIMEOUT_MS",
+    45000,
+    minimum=5000,
 )
 
-BATCH_SIZE = max(
-    1,
-    int(os.getenv("FUTGG_PRICE_BATCH_SIZE", "4000")),
+CONCURRENCY = env_int(
+    "FUTGG_PRICE_CONCURRENCY",
+    15,
+    minimum=1,
 )
 
-CONCURRENCY = max(
-    1,
-    int(os.getenv("FUTGG_PRICE_CONCURRENCY", "15")),
+BATCH_SIZE = env_int(
+    "FUTGG_PRICE_BATCH_SIZE",
+    500,
+    minimum=1,
 )
 
-REQUEST_DELAY = max(
-    0.0,
-    float(os.getenv("FUTGG_PRICE_REQUEST_DELAY", "0.10")),
+HIGH_PRIORITY_SHARE = env_float(
+    "FUTGG_PRICE_HIGH_PRIORITY_SHARE",
+    0.90,
+    minimum=0.50,
+    maximum=1.0,
 )
 
-OVERLAP_LOCK_KEY = int(
-    os.getenv("FUTGG_PRICE_LOCK_KEY", "7741022")
+REQUEST_DELAY = env_float(
+    "FUTGG_PRICE_REQUEST_DELAY",
+    0.10,
+    minimum=0.0,
 )
 
-
-CIRCUIT_BREAKER_THRESHOLD = max(
-    1,
-    int(os.getenv("FUTGG_CIRCUIT_BREAKER_THRESHOLD", "8")),
+IDLE_SLEEP_SECONDS = env_float(
+    "FUTGG_PRICE_IDLE_SLEEP_SECONDS",
+    5.0,
+    minimum=1.0,
 )
 
-BLOCKED_STATUS_CODES = {403, 429}
+BATCH_SLEEP_SECONDS = env_float(
+    "FUTGG_PRICE_BATCH_SLEEP_SECONDS",
+    1.0,
+    minimum=0.0,
+)
+
+BLOCK_BACKOFF_SECONDS = env_float(
+    "FUTGG_PRICE_BLOCK_BACKOFF_SECONDS",
+    900.0,
+    minimum=60.0,
+)
+
+OVERLAP_LOCK_KEY = env_int(
+    "FUTGG_PRICE_LOCK_KEY",
+    7741022,
+)
+
+CIRCUIT_BREAKER_THRESHOLD = env_int(
+    "FUTGG_CIRCUIT_BREAKER_THRESHOLD",
+    8,
+    minimum=1,
+)
+
+BLOCKED_STATUS_CODES = {
+    403,
+    429,
+}
 
 
 RATING_INTERVALS = {
-    "85_plus": max(
-        5,
-        int(os.getenv("FUTGG_RATING_85_PLUS_INTERVAL_MIN", "10")),
-    ),
-    "80_84": max(
+    "85_plus": env_int(
+        "FUTGG_RATING_85_PLUS_INTERVAL_MIN",
         10,
-        int(os.getenv("FUTGG_RATING_80_84_INTERVAL_MIN", "30")),
+        minimum=5,
     ),
-    "75_79": max(
+    "80_84": env_int(
+        "FUTGG_RATING_80_84_INTERVAL_MIN",
         30,
-        int(os.getenv("FUTGG_RATING_75_79_INTERVAL_MIN", "120")),
+        minimum=10,
     ),
-    "70_74": max(
-        60,
-        int(os.getenv("FUTGG_RATING_70_74_INTERVAL_MIN", "360")),
+    "75_79": env_int(
+        "FUTGG_RATING_75_79_INTERVAL_MIN",
+        120,
+        minimum=30,
     ),
-    "under_70": max(
-        60,
-        int(os.getenv("FUTGG_RATING_UNDER_70_INTERVAL_MIN", "1440")),
+    "70_74": env_int(
+        "FUTGG_RATING_70_74_INTERVAL_MIN",
+        360,
+        minimum=60,
+    ),
+    "under_70": env_int(
+        "FUTGG_RATING_UNDER_70_INTERVAL_MIN",
+        1440,
+        minimum=60,
     ),
 }
 
 
-HOT_DISCOUNT_THRESHOLD = max(
-    0.0,
-    float(os.getenv("FUTGG_HOT_DISCOUNT_THRESHOLD", "0.12")),
+HOT_DISCOUNT_THRESHOLD = env_float(
+    "FUTGG_HOT_DISCOUNT_THRESHOLD",
+    0.12,
+    minimum=0.0,
 )
 
-HOT_INTERVAL_MIN = max(
+HOT_INTERVAL_MIN = env_int(
+    "FUTGG_HOT_INTERVAL_MIN",
+    10,
+    minimum=5,
+)
+
+HOT_MIN_SALES = env_int(
+    "FUTGG_HOT_MIN_SALES",
     5,
-    int(os.getenv("FUTGG_HOT_INTERVAL_MIN", "10")),
-)
-
-HOT_MIN_SALES = max(
-    1,
-    int(os.getenv("FUTGG_HOT_MIN_SALES", "5")),
+    minimum=1,
 )
 
 
@@ -175,9 +267,9 @@ USER_AGENT = (
 )
 
 
-def price_interval_minutes(rating: int | None) -> int:
-    """Return the standard price-refresh interval for a card rating."""
-
+def price_interval_minutes(
+    rating: int | None,
+) -> int:
     if rating is None:
         return RATING_INTERVALS["under_70"]
 
@@ -196,41 +288,54 @@ def price_interval_minutes(rating: int | None) -> int:
     return RATING_INTERVALS["under_70"]
 
 
-def _is_hot_opportunity(card: Any) -> bool:
-    """Return True when the live BIN is materially below recent sales.
-
-    This uses the current scrape's own recent-sales data, avoiding an
-    additional request.
-    """
-
+def is_hot_opportunity(card: Any) -> bool:
     if card.lowest_bin is None:
         return False
 
-    if len(card.recent_sales) < HOT_MIN_SALES:
-        return False
-
-    valid_prices = [
-        sale.sold_price
+    valid_sales = [
+        int(sale.sold_price)
         for sale in card.recent_sales
-        if sale.sold_price is not None and sale.sold_price > 0
+        if sale.sold_price is not None
+        and int(sale.sold_price) > 0
     ]
 
-    if len(valid_prices) < HOT_MIN_SALES:
+    if len(valid_sales) < HOT_MIN_SALES:
         return False
 
-    median = statistics.median(valid_prices)
+    median_price = statistics.median(valid_sales)
 
-    if median <= 0:
+    if median_price <= 0:
         return False
 
-    discount = (median - card.lowest_bin) / median
+    discount = (
+        median_price - card.lowest_bin
+    ) / median_price
 
     return discount >= HOT_DISCOUNT_THRESHOLD
 
 
-async def ensure_schema(conn: asyncpg.Connection) -> None:
-    """Ensure the player and price-history schemas exist."""
+def new_stats() -> dict[str, int]:
+    return {
+        "selected": 0,
+        "selected_85_plus": 0,
+        "selected_lower": 0,
+        "cards_ok": 0,
+        "cards_failed": 0,
+        "bin_rows": 0,
+        "sales_new": 0,
+        "sales_dupe": 0,
+        "no_market_data": 0,
+        "untradeable": 0,
+        "hot_opportunities": 0,
+        "blocked": 0,
+        "parse_failures": 0,
+        "navigation_failures": 0,
+    }
 
+
+async def ensure_schema(
+    conn: asyncpg.Connection,
+) -> None:
     await ensure_player_schema(conn)
 
     await conn.execute(
@@ -253,7 +358,8 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
 
     await conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS futgg_bin_history_card_captured_idx
+        CREATE INDEX IF NOT EXISTS
+        futgg_bin_history_card_captured_idx
         ON futgg_bin_history (
             source_card_id,
             captured_at DESC
@@ -289,7 +395,8 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
 
     await conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS futgg_sales_history_card_sold_idx
+        CREATE INDEX IF NOT EXISTS
+        futgg_sales_history_card_sold_idx
         ON futgg_sales_history (
             source_card_id,
             approximate_sold_at DESC
@@ -299,13 +406,32 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
 
     await conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS futgg_players_rating_price_due_idx
+        CREATE INDEX IF NOT EXISTS
+        futgg_players_high_rating_due_idx
         ON futgg_players (
-            rating DESC,
             next_price_due_at,
             price_updated_at
         )
-        WHERE is_active
+        WHERE is_active = TRUE
+          AND rating >= 85
+          AND is_tradeable IS DISTINCT FROM FALSE
+        """
+    )
+
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        futgg_players_lower_rating_due_idx
+        ON futgg_players (
+            next_price_due_at,
+            rating DESC,
+            price_updated_at
+        )
+        WHERE is_active = TRUE
+          AND (
+              rating < 85
+              OR rating IS NULL
+          )
           AND is_tradeable IS DISTINCT FROM FALSE
         """
     )
@@ -314,9 +440,25 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
 async def fetch_due_cards(
     conn: asyncpg.Connection,
 ) -> list[asyncpg.Record]:
-    """Return due cards, with high-rated cards always selected first."""
+    """Select high-rated due cards first, then fill spare capacity.
 
-    return await conn.fetch(
+    A fixed portion of every batch is reserved for rating-85+ cards.
+
+    If fewer high-rated cards are due than the reserved amount, unused
+    capacity is filled by lower-rated cards.
+    """
+
+    high_reserved = max(
+        1,
+        int(BATCH_SIZE * HIGH_PRIORITY_SHARE),
+    )
+
+    lower_reserved = max(
+        0,
+        BATCH_SIZE - high_reserved,
+    )
+
+    high_rows = await conn.fetch(
         """
         SELECT
             source_card_id,
@@ -327,6 +469,54 @@ async def fetch_due_cards(
             price_updated_at
         FROM futgg_players
         WHERE is_active = TRUE
+          AND rating >= 85
+          AND is_tradeable IS DISTINCT FROM FALSE
+          AND (
+              next_price_due_at IS NULL
+              OR next_price_due_at <= NOW()
+          )
+        ORDER BY
+            next_price_due_at ASC NULLS FIRST,
+            price_updated_at ASC NULLS FIRST,
+            rating DESC,
+            source_card_id ASC
+        LIMIT $1
+        """,
+        high_reserved,
+    )
+
+    remaining_capacity = BATCH_SIZE - len(high_rows)
+
+    if remaining_capacity <= 0:
+        return list(high_rows)
+
+    # Always permit at least the remaining capacity to be filled by
+    # lower-rated cards when there are not enough high-rated cards due.
+    lower_limit = max(
+        lower_reserved,
+        remaining_capacity,
+    )
+
+    lower_limit = min(
+        lower_limit,
+        remaining_capacity,
+    )
+
+    lower_rows = await conn.fetch(
+        """
+        SELECT
+            source_card_id,
+            source_url,
+            price_tier,
+            rating,
+            next_price_due_at,
+            price_updated_at
+        FROM futgg_players
+        WHERE is_active = TRUE
+          AND (
+              rating < 85
+              OR rating IS NULL
+          )
           AND is_tradeable IS DISTINCT FROM FALSE
           AND (
               next_price_due_at IS NULL
@@ -334,11 +524,10 @@ async def fetch_due_cards(
           )
         ORDER BY
             CASE
-                WHEN rating >= 85 THEN 0
-                WHEN rating >= 80 THEN 1
-                WHEN rating >= 75 THEN 2
-                WHEN rating >= 70 THEN 3
-                ELSE 4
+                WHEN rating >= 80 THEN 0
+                WHEN rating >= 75 THEN 1
+                WHEN rating >= 70 THEN 2
+                ELSE 3
             END,
             next_price_due_at ASC NULLS FIRST,
             price_updated_at ASC NULLS FIRST,
@@ -346,8 +535,13 @@ async def fetch_due_cards(
             source_card_id ASC
         LIMIT $1
         """,
-        BATCH_SIZE,
+        lower_limit,
     )
+
+    return [
+        *high_rows,
+        *lower_rows,
+    ]
 
 
 async def record_success(
@@ -355,10 +549,7 @@ async def record_success(
     row: asyncpg.Record,
     card: Any,
     captured_at: datetime,
-    cycle_started_at: datetime,
 ) -> tuple[int, int, int, bool]:
-    """Store a successful page parse and schedule the next refresh."""
-
     bin_rows = 0
     sales_new = 0
     sales_dupe = 0
@@ -374,7 +565,14 @@ async def record_success(
                 source_age_text,
                 captured_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6
+            )
             """,
             card.source_card_id,
             card.lowest_bin,
@@ -389,7 +587,12 @@ async def record_success(
     for sale in card.recent_sales:
         sold_price = sale.sold_price
 
-        if sold_price is None or sold_price <= 0:
+        if sold_price is None:
+            continue
+
+        sold_price = int(sold_price)
+
+        if sold_price <= 0:
             continue
 
         tax = int(sold_price * 0.05)
@@ -412,10 +615,21 @@ async def record_success(
                 captured_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                $12
             )
-            ON CONFLICT (source_fingerprint) DO NOTHING
+            ON CONFLICT (source_fingerprint)
+            DO NOTHING
             """,
             card.source_card_id,
             sold_price,
@@ -431,7 +645,9 @@ async def record_success(
             captured_at,
         )
 
-        inserted = int(result.rsplit(" ", 1)[-1])
+        inserted = int(
+            result.rsplit(" ", 1)[-1]
+        )
 
         if inserted:
             sales_new += 1
@@ -457,38 +673,44 @@ async def record_success(
             status,
         )
 
-        return bin_rows, sales_new, sales_dupe, False
+        return (
+            bin_rows,
+            sales_new,
+            sales_dupe,
+            False,
+        )
 
-    interval = price_interval_minutes(row["rating"])
+    interval_minutes = price_interval_minutes(
+        row["rating"]
+    )
 
     if status in {
         "no_active_market",
         "price_section_missing",
     }:
-        interval = min(interval * 3, 4320)
+        # Empty-market cards do not need to consume the same capacity as
+        # cards which currently have an active and useful market.
+        interval_minutes = min(
+            interval_minutes * 3,
+            4320,
+        )
 
     is_hot = (
         status == "success"
-        and _is_hot_opportunity(card)
+        and is_hot_opportunity(card)
     )
 
     if is_hot:
-        interval = min(interval, HOT_INTERVAL_MIN)
+        interval_minutes = min(
+            interval_minutes,
+            HOT_INTERVAL_MIN,
+        )
 
-    # Anchor the next due time to the beginning of the entire run.
-    #
-    # Example:
-    # The cron begins at 10:00 and takes six minutes.
-    # A rating-85 card completed at 10:06 is still next due at 10:10,
-    # rather than 10:16.
-    next_due_at = cycle_started_at + timedelta(minutes=interval)
-
-    # Do not leave a card immediately overdue if an unusually slow run
-    # already passed the intended next-due time.
-    minimum_next_due = captured_at + timedelta(minutes=1)
-
-    if next_due_at < minimum_next_due:
-        next_due_at = minimum_next_due
+    # Rolling schedule: every card becomes due relative to the moment its
+    # latest price observation was captured.
+    next_due_at = captured_at + timedelta(
+        minutes=interval_minutes
+    )
 
     await conn.execute(
         """
@@ -497,7 +719,10 @@ async def record_success(
             price_updated_at = $2,
             next_price_due_at = $3,
             last_price_status = $4,
-            is_tradeable = COALESCE($5, is_tradeable),
+            is_tradeable = COALESCE(
+                $5,
+                is_tradeable
+            ),
             last_seen_at = NOW()
         WHERE source_card_id = $1
         """,
@@ -508,53 +733,253 @@ async def record_success(
         True if status == "success" else None,
     )
 
-    return bin_rows, sales_new, sales_dupe, is_hot
+    return (
+        bin_rows,
+        sales_new,
+        sales_dupe,
+        is_hot,
+    )
 
 
 async def record_failure(
     conn: asyncpg.Connection,
     row: asyncpg.Record,
-    status: str = "page_failed",
+    status: str,
 ) -> None:
-    """Record a failure and assign an appropriate retry time."""
+    normal_interval = price_interval_minutes(
+        row["rating"]
+    )
 
-    normal_interval = price_interval_minutes(row["rating"])
-
-    if status in {"blocked", "rate_limited"}:
-        retry_interval = 15
+    if status in {
+        "blocked",
+        "rate_limited",
+    }:
+        retry_minutes = 15
     else:
-        retry_interval = min(normal_interval, 5)
+        retry_minutes = min(
+            normal_interval,
+            5,
+        )
 
     await conn.execute(
         """
         UPDATE futgg_players
         SET
             next_price_due_at =
-                NOW() + ($2 * INTERVAL '1 minute'),
+                NOW()
+                + ($2 * INTERVAL '1 minute'),
             last_price_status = $3
         WHERE source_card_id = $1
         """,
         row["source_card_id"],
-        retry_interval,
+        retry_minutes,
         status[:200],
     )
 
 
-async def worker_loop(
+async def process_card(
     worker_id: int,
-    page: Any,
+    page: Page,
     pool: asyncpg.Pool,
-    queue: asyncio.Queue,
+    row: asyncpg.Record,
     stats: dict[str, int],
     breaker: CircuitBreaker,
-    cycle_started_at: datetime,
 ) -> None:
-    """Process due cards until the queue is empty or the breaker trips."""
+    captured_at = datetime.now(timezone.utc)
 
+    try:
+        response = await page.goto(
+            row["source_url"],
+            wait_until="domcontentloaded",
+            timeout=TIMEOUT_MS,
+        )
+
+        http_status = (
+            response.status
+            if response is not None
+            else 0
+        )
+
+        if http_status in BLOCKED_STATUS_CODES:
+            stats["blocked"] += 1
+            stats["cards_failed"] += 1
+
+            failure_status = (
+                "rate_limited"
+                if http_status == 429
+                else "blocked"
+            )
+
+            async with pool.acquire() as conn:
+                await record_failure(
+                    conn,
+                    row,
+                    failure_status,
+                )
+
+            breaker.record_failure(
+                f"HTTP {http_status}"
+            )
+
+            log.warning(
+                (
+                    "worker=%d card=%s rating=%s "
+                    "HTTP=%d status=%s"
+                ),
+                worker_id,
+                row["source_card_id"],
+                row["rating"],
+                http_status,
+                failure_status,
+            )
+
+            return
+
+        if http_status != 200:
+            raise RuntimeError(
+                f"HTTP {http_status}"
+            )
+
+        await page.locator(
+            ".fc-card"
+        ).first.wait_for(
+            state="attached",
+            timeout=15000,
+        )
+
+        try:
+            await page.locator(
+                "#prices-overview"
+            ).wait_for(
+                state="attached",
+                timeout=12000,
+            )
+        except Exception:
+            # parse_futgg_card determines whether the price section is
+            # absent because the card is untradeable, has no market, or
+            # the section failed to render.
+            pass
+
+        await page.wait_for_timeout(700)
+
+        card = parse_futgg_card(
+            await page.content(),
+            row["source_url"],
+            captured_at,
+        )
+
+        async with pool.acquire() as conn:
+            (
+                bin_rows,
+                sales_new,
+                sales_dupe,
+                is_hot,
+            ) = await record_success(
+                conn,
+                row,
+                card,
+                captured_at,
+            )
+
+        breaker.record_success()
+
+        stats["cards_ok"] += 1
+        stats["bin_rows"] += bin_rows
+        stats["sales_new"] += sales_new
+        stats["sales_dupe"] += sales_dupe
+
+        if card.price_outcome == "untradeable":
+            stats["untradeable"] += 1
+
+        elif card.price_outcome in {
+            "no_active_market",
+            "price_section_missing",
+        }:
+            stats["no_market_data"] += 1
+
+        if is_hot:
+            stats["hot_opportunities"] += 1
+
+        log.info(
+            (
+                "worker=%d card=%s rating=%s tier=%s "
+                "outcome=%s bin=%s sales=%d "
+                "sales_new=%d hot=%s"
+            ),
+            worker_id,
+            row["source_card_id"],
+            row["rating"],
+            row["price_tier"],
+            card.price_outcome,
+            card.lowest_bin,
+            len(card.recent_sales),
+            sales_new,
+            is_hot,
+        )
+
+    except Exception as exc:
+        stats["cards_failed"] += 1
+
+        is_parse_failure = isinstance(
+            exc,
+            (
+                ValueError,
+                KeyError,
+                TypeError,
+            ),
+        )
+
+        if is_parse_failure:
+            stats["parse_failures"] += 1
+            failure_status = "parse_failed"
+        else:
+            stats["navigation_failures"] += 1
+            failure_status = "page_failed"
+
+        log.warning(
+            "worker=%d card=%s rating=%s failed: %s",
+            worker_id,
+            row["source_card_id"],
+            row["rating"],
+            exc,
+        )
+
+        breaker.record_failure(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        async with pool.acquire() as conn:
+            await record_failure(
+                conn,
+                row,
+                failure_status,
+            )
+
+    finally:
+        if REQUEST_DELAY > 0:
+            await asyncio.sleep(
+                random.uniform(
+                    REQUEST_DELAY * 0.7,
+                    REQUEST_DELAY * 1.3,
+                )
+            )
+
+
+async def worker_loop(
+    worker_id: int,
+    page: Page,
+    pool: asyncpg.Pool,
+    queue: asyncio.Queue[asyncpg.Record],
+    stats: dict[str, int],
+    breaker: CircuitBreaker,
+) -> None:
     while True:
         if breaker.tripped:
             log.warning(
-                "worker=%d stopping: circuit breaker tripped (%s)",
+                (
+                    "worker=%d stopping batch: "
+                    "circuit breaker tripped (%s)"
+                ),
                 worker_id,
                 breaker.trip_reason,
             )
@@ -565,421 +990,420 @@ async def worker_loop(
         except asyncio.QueueEmpty:
             return
 
-        captured_at = datetime.now(timezone.utc)
-
         try:
-            response = await page.goto(
-                row["source_url"],
-                wait_until="domcontentloaded",
-                timeout=TIMEOUT_MS,
-            )
-
-            http_status = response.status if response else 0
-
-            if http_status in BLOCKED_STATUS_CODES:
-                stats["blocked"] += 1
-                stats["cards_failed"] += 1
-
-                failure_status = (
-                    "rate_limited"
-                    if http_status == 429
-                    else "blocked"
-                )
-
-                async with pool.acquire() as conn:
-                    await record_failure(
-                        conn,
-                        row,
-                        status=failure_status,
-                    )
-
-                breaker.record_failure(
-                    f"HTTP {http_status}"
-                )
-
-                log.warning(
-                    "worker=%d card=%s HTTP %d status=%s",
-                    worker_id,
-                    row["source_card_id"],
-                    http_status,
-                    failure_status,
-                )
-
-                continue
-
-            if http_status != 200:
-                raise RuntimeError(
-                    f"HTTP {http_status}"
-                )
-
-            await page.locator(".fc-card").first.wait_for(
-                state="attached",
-                timeout=15000,
-            )
-
-            try:
-                await page.locator("#prices-overview").wait_for(
-                    state="attached",
-                    timeout=12000,
-                )
-            except Exception:
-                # The parser decides whether this means untradeable,
-                # no market data, or a missing section.
-                pass
-
-            await page.wait_for_timeout(700)
-
-            card = parse_futgg_card(
-                await page.content(),
-                row["source_url"],
-                captured_at,
-            )
-
-            async with pool.acquire() as conn:
-                (
-                    bin_rows,
-                    sales_new,
-                    sales_dupe,
-                    is_hot,
-                ) = await record_success(
-                    conn,
-                    row,
-                    card,
-                    captured_at,
-                    cycle_started_at,
-                )
-
-            breaker.record_success()
-
-            stats["cards_ok"] += 1
-            stats["bin_rows"] += bin_rows
-            stats["sales_new"] += sales_new
-            stats["sales_dupe"] += sales_dupe
-
-            if card.price_outcome == "untradeable":
-                stats["untradeable"] += 1
-
-            elif card.price_outcome in {
-                "no_active_market",
-                "price_section_missing",
-            }:
-                stats["no_market_data"] += 1
-
-            if is_hot:
-                stats["hot_opportunities"] += 1
-
-            log.info(
-                (
-                    "worker=%d card=%s rating=%s tier=%s "
-                    "outcome=%s bin=%s sales=%d new=%d hot=%s"
-                ),
+            await process_card(
                 worker_id,
-                row["source_card_id"],
-                row["rating"],
-                row["price_tier"],
-                card.price_outcome,
-                card.lowest_bin,
-                len(card.recent_sales),
-                sales_new,
-                is_hot,
+                page,
+                pool,
+                row,
+                stats,
+                breaker,
             )
-
-        except Exception as exc:
-            stats["cards_failed"] += 1
-
-            is_parse_failure = isinstance(
-                exc,
-                (ValueError, KeyError),
-            )
-
-            if is_parse_failure:
-                stats["parse_failures"] += 1
-                failure_status = "parse_failed"
-            else:
-                stats["navigation_failures"] += 1
-                failure_status = "page_failed"
-
-            log.warning(
-                "worker=%d card=%s failed: %s",
-                worker_id,
-                row["source_card_id"],
-                exc,
-            )
-
-            breaker.record_failure(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            async with pool.acquire() as conn:
-                await record_failure(
-                    conn,
-                    row,
-                    status=failure_status,
-                )
-
         finally:
             queue.task_done()
 
-        if REQUEST_DELAY:
-            await asyncio.sleep(
-                random.uniform(
-                    REQUEST_DELAY * 0.7,
-                    REQUEST_DELAY * 1.3,
-                )
-            )
 
+async def block_unneeded_resources(route: Any) -> None:
+    """Block assets not required for HTML price parsing."""
 
-async def crawl_once() -> None:
-    """Run one due-card price-sync cycle."""
+    resource_type = route.request.resource_type
 
-    cycle_started_at = datetime.now(timezone.utc)
-
-    lock_conn = await asyncpg.connect(DATABASE_URL)
-
-    got_lock = await lock_conn.fetchval(
-        "SELECT pg_try_advisory_lock($1)",
-        OVERLAP_LOCK_KEY,
-    )
-
-    if not got_lock:
-        log.info(
-            "Previous FUT.GG price sync still running; skipping"
-        )
-        await lock_conn.close()
+    if resource_type in {
+        "image",
+        "media",
+        "font",
+    }:
+        await route.abort()
         return
 
-    pool: asyncpg.Pool | None = None
-    playwright = None
-    browser = None
-    context = None
+    await route.continue_()
 
-    stats: dict[str, int] = {
-        "selected": 0,
-        "cards_ok": 0,
-        "cards_failed": 0,
-        "bin_rows": 0,
-        "sales_new": 0,
-        "sales_dupe": 0,
-        "no_market_data": 0,
-        "untradeable": 0,
-        "hot_opportunities": 0,
-        "blocked": 0,
-        "parse_failures": 0,
-        "navigation_failures": 0,
-    }
+
+async def create_browser(
+    playwright: Playwright,
+) -> tuple[Browser, BrowserContext, list[Page]]:
+    browser = await playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+        ],
+    )
+
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        locale="en-GB",
+        viewport={
+            "width": 1440,
+            "height": 1000,
+        },
+    )
+
+    await context.route(
+        "**/*",
+        block_unneeded_resources,
+    )
+
+    pages = [
+        await context.new_page()
+        for _ in range(CONCURRENCY)
+    ]
+
+    return (
+        browser,
+        context,
+        pages,
+    )
+
+
+async def close_browser_resources(
+    browser: Browser | None,
+    context: BrowserContext | None,
+    pages: list[Page],
+) -> None:
+    for page in pages:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if context is not None:
+        try:
+            await context.close()
+        except Exception:
+            pass
+
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+async def write_heartbeat(
+    pool: asyncpg.Pool,
+    stats: dict[str, int],
+    run_seconds: int,
+    breaker: CircuitBreaker,
+) -> None:
+    selected = stats["selected"]
+    cards_ok = stats["cards_ok"]
+    cards_failed = stats["cards_failed"]
+
+    ok = (
+        not breaker.tripped
+        and (
+            selected == 0
+            or cards_ok > 0
+        )
+        and cards_failed < max(
+            selected,
+            1,
+        )
+    )
+
+    cards_per_minute = 0.0
+
+    if run_seconds > 0:
+        cards_per_minute = (
+            cards_ok / run_seconds
+        ) * 60
+
+    detail_parts = [
+        *[
+            f"{key}={value}"
+            for key, value in stats.items()
+        ],
+        f"run_seconds={run_seconds}",
+        f"cards_per_minute={cards_per_minute:.1f}",
+        f"concurrency={CONCURRENCY}",
+        f"batch_size={BATCH_SIZE}",
+    ]
+
+    async with pool.acquire() as conn:
+        await heartbeat(
+            conn,
+            "futgg_price_sync",
+            ok=ok,
+            detail=" ".join(detail_parts),
+        )
+
+    if not ok:
+        await alert(
+            (
+                "futgg_price_sync unhealthy: "
+                f"{stats} "
+                f"run_seconds={run_seconds} "
+                f"breaker={breaker.trip_reason}"
+            )
+        )
+
+
+async def process_due_batch(
+    pool: asyncpg.Pool,
+    pages: list[Page],
+) -> tuple[dict[str, int], CircuitBreaker]:
+    batch_started_at = datetime.now(timezone.utc)
+    stats = new_stats()
+
+    async with pool.acquire() as conn:
+        rows = await fetch_due_cards(conn)
+
+    stats["selected"] = len(rows)
+
+    for row in rows:
+        rating = row["rating"]
+
+        if rating is not None and rating >= 85:
+            stats["selected_85_plus"] += 1
+        else:
+            stats["selected_lower"] += 1
+
+    if not rows:
+        return (
+            stats,
+            CircuitBreaker(
+                CIRCUIT_BREAKER_THRESHOLD
+            ),
+        )
+
+    log.info(
+        (
+            "Selected=%d high=%d lower=%d "
+            "intervals=%s concurrency=%d "
+            "batch_size=%d request_delay=%.2f"
+        ),
+        stats["selected"],
+        stats["selected_85_plus"],
+        stats["selected_lower"],
+        RATING_INTERVALS,
+        CONCURRENCY,
+        BATCH_SIZE,
+        REQUEST_DELAY,
+    )
+
+    queue: asyncio.Queue[asyncpg.Record] = (
+        asyncio.Queue()
+    )
+
+    for row in rows:
+        queue.put_nowait(row)
 
     breaker = CircuitBreaker(
         CIRCUIT_BREAKER_THRESHOLD
     )
 
+    await asyncio.gather(
+        *[
+            worker_loop(
+                worker_id=index + 1,
+                page=page,
+                pool=pool,
+                queue=queue,
+                stats=stats,
+                breaker=breaker,
+            )
+            for index, page in enumerate(pages)
+        ]
+    )
+
+    run_seconds = max(
+        1,
+        int(
+            (
+                datetime.now(timezone.utc)
+                - batch_started_at
+            ).total_seconds()
+        ),
+    )
+
+    await write_heartbeat(
+        pool,
+        stats,
+        run_seconds,
+        breaker,
+    )
+
+    cards_per_minute = (
+        stats["cards_ok"] / run_seconds
+    ) * 60
+
+    log.info(
+        (
+            "Batch complete in %d seconds: "
+            "cards_ok=%d cards_failed=%d "
+            "cards_per_minute=%.1f "
+            "selected_high=%d selected_lower=%d"
+        ),
+        run_seconds,
+        stats["cards_ok"],
+        stats["cards_failed"],
+        cards_per_minute,
+        stats["selected_85_plus"],
+        stats["selected_lower"],
+    )
+
+    return (
+        stats,
+        breaker,
+    )
+
+
+async def run_forever() -> None:
+    lock_conn: asyncpg.Connection | None = None
+    pool: asyncpg.Pool | None = None
+    playwright: Playwright | None = None
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    pages: list[Page] = []
+
     try:
+        lock_conn = await asyncpg.connect(
+            DATABASE_URL
+        )
+
+        got_lock = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)",
+            OVERLAP_LOCK_KEY,
+        )
+
+        if not got_lock:
+            log.error(
+                (
+                    "Another FUT.GG price worker "
+                    "already owns advisory lock %d"
+                ),
+                OVERLAP_LOCK_KEY,
+            )
+            return
+
         pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
-            max_size=CONCURRENCY + 3,
+            max_size=CONCURRENCY + 4,
+            command_timeout=60,
         )
 
         async with pool.acquire() as conn:
             await ensure_schema(conn)
-            rows = await fetch_due_cards(conn)
-
-        stats["selected"] = len(rows)
-
-        rating_counts = {
-            "85_plus": 0,
-            "80_84": 0,
-            "75_79": 0,
-            "70_74": 0,
-            "under_70_or_unknown": 0,
-        }
-
-        for row in rows:
-            rating = row["rating"]
-
-            if rating is not None and rating >= 85:
-                rating_counts["85_plus"] += 1
-            elif rating is not None and rating >= 80:
-                rating_counts["80_84"] += 1
-            elif rating is not None and rating >= 75:
-                rating_counts["75_79"] += 1
-            elif rating is not None and rating >= 70:
-                rating_counts["70_74"] += 1
-            else:
-                rating_counts["under_70_or_unknown"] += 1
-
-        log.info(
-            (
-                "Selected=%d rating_counts=%s intervals=%s "
-                "concurrency=%d batch_size=%d request_delay=%.2f"
-            ),
-            len(rows),
-            rating_counts,
-            RATING_INTERVALS,
-            CONCURRENCY,
-            BATCH_SIZE,
-            REQUEST_DELAY,
-        )
-
-        if not rows:
-            async with pool.acquire() as conn:
-                await heartbeat(
-                    conn,
-                    "futgg_price_sync",
-                    ok=True,
-                    detail=(
-                        "selected=0 cards_ok=0 "
-                        "message=no_due_cards"
-                    ),
-                )
-
-            log.info("No due cards")
-            return
 
         playwright = await async_playwright().start()
 
-        browser = await playwright.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-renderer-backgrounding",
-            ],
-        )
-
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            locale="en-GB",
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-        )
-
-        # Prices do not need images, fonts, video or other heavy assets.
-        # Blocking these reduces bandwidth and page-rendering overhead.
-        async def block_unneeded_resources(route: Any) -> None:
-            resource_type = route.request.resource_type
-
-            if resource_type in {
-                "image",
-                "media",
-                "font",
-            }:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await context.route(
-            "**/*",
-            block_unneeded_resources,
-        )
-
-        queue: asyncio.Queue = asyncio.Queue()
-
-        for row in rows:
-            queue.put_nowait(row)
-
-        pages = [
-            await context.new_page()
-            for _ in range(CONCURRENCY)
-        ]
-
-        try:
-            await asyncio.gather(
-                *(
-                    worker_loop(
-                        index + 1,
-                        page,
-                        pool,
-                        queue,
-                        stats,
-                        breaker,
-                        cycle_started_at,
-                    )
-                    for index, page in enumerate(pages)
-                )
-            )
-
-        finally:
-            for page in pages:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-
-        if breaker.tripped:
-            log.warning(
-                (
-                    "Circuit breaker tripped: %s. "
-                    "Remaining queued cards were not processed."
-                ),
-                breaker.trip_reason,
-            )
-
-        completed = (
-            stats["cards_ok"]
-            + stats["cards_failed"]
-        )
-
-        ok = (
-            stats["cards_ok"] > 0
-            and completed > 0
-            and stats["cards_failed"] < stats["selected"]
-            and not breaker.tripped
-        )
-
-        run_seconds = int(
-            (
-                datetime.now(timezone.utc)
-                - cycle_started_at
-            ).total_seconds()
-        )
-
-        heartbeat_detail = " ".join(
-            f"{key}={value}"
-            for key, value in stats.items()
-        )
-
-        heartbeat_detail += (
-            f" run_seconds={run_seconds}"
-            f" concurrency={CONCURRENCY}"
-            f" batch_size={BATCH_SIZE}"
-        )
-
-        async with pool.acquire() as conn:
-            await heartbeat(
-                conn,
-                "futgg_price_sync",
-                ok=ok,
-                detail=heartbeat_detail,
-            )
-
-        if not ok:
-            await alert(
-                f"futgg_price_sync unhealthy: "
-                f"{stats} run_seconds={run_seconds}"
-            )
+        (
+            browser,
+            context,
+            pages,
+        ) = await create_browser(playwright)
 
         log.info(
-            "Run complete in %d seconds: %s",
-            run_seconds,
-            stats,
+            (
+                "Continuous FUT.GG price worker started: "
+                "concurrency=%d batch_size=%d "
+                "high_priority_share=%.2f intervals=%s"
+            ),
+            CONCURRENCY,
+            BATCH_SIZE,
+            HIGH_PRIORITY_SHARE,
+            RATING_INTERVALS,
         )
 
-    finally:
-        if context is not None:
+        while True:
             try:
-                await context.close()
-            except Exception:
-                pass
+                stats, breaker = await process_due_batch(
+                    pool,
+                    pages,
+                )
 
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+                if breaker.tripped:
+                    log.warning(
+                        (
+                            "Circuit breaker tripped: %s. "
+                            "Backing off for %.0f seconds."
+                        ),
+                        breaker.trip_reason,
+                        BLOCK_BACKOFF_SECONDS,
+                    )
+
+                    await close_browser_resources(
+                        browser,
+                        context,
+                        pages,
+                    )
+
+                    browser = None
+                    context = None
+                    pages = []
+
+                    await asyncio.sleep(
+                        BLOCK_BACKOFF_SECONDS
+                    )
+
+                    (
+                        browser,
+                        context,
+                        pages,
+                    ) = await create_browser(
+                        playwright
+                    )
+
+                    continue
+
+                if stats["selected"] == 0:
+                    await asyncio.sleep(
+                        IDLE_SLEEP_SECONDS
+                    )
+                else:
+                    await asyncio.sleep(
+                        BATCH_SLEEP_SECONDS
+                    )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                log.exception(
+                    "Price batch failed: %s",
+                    exc,
+                )
+
+                try:
+                    await alert(
+                        f"futgg_price_sync batch crashed: {exc}"
+                    )
+                except Exception:
+                    log.exception(
+                        "Unable to send price-sync alert"
+                    )
+
+                await close_browser_resources(
+                    browser,
+                    context,
+                    pages,
+                )
+
+                browser = None
+                context = None
+                pages = []
+
+                await asyncio.sleep(30)
+
+                (
+                    browser,
+                    context,
+                    pages,
+                ) = await create_browser(
+                    playwright
+                )
+
+    finally:
+        await close_browser_resources(
+            browser,
+            context,
+            pages,
+        )
 
         if playwright is not None:
             try:
@@ -990,18 +1414,26 @@ async def crawl_once() -> None:
         if pool is not None:
             await pool.close()
 
-        try:
-            await lock_conn.execute(
-                "SELECT pg_advisory_unlock($1)",
-                OVERLAP_LOCK_KEY,
-            )
-        finally:
+        if lock_conn is not None:
+            try:
+                await lock_conn.execute(
+                    "SELECT pg_advisory_unlock($1)",
+                    OVERLAP_LOCK_KEY,
+                )
+            except Exception:
+                pass
+
             await lock_conn.close()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(crawl_once())
+        asyncio.run(run_forever())
+
+    except KeyboardInterrupt:
+        log.info(
+            "FUT.GG price worker stopped"
+        )
 
     except Exception as exc:
         log.exception(
