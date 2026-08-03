@@ -35,11 +35,18 @@ Responses are therefore matched by URL substring, never by exact URL.
 
 SAFETY
 ------
-Dry run by default (FUTGG_BULK_APPLY=false). The first run reports
-coverage against our own catalogue and writes nothing, because the one
-thing still unverified is whether the feed is keyed on card eaId (usable
-directly) or base-player eaId (needs an id map). Writing before knowing
-that would corrupt every price in the database.
+Writes are guarded by the data, not by a flag. Every cycle checks the
+feed against our own catalogue and refuses to write when:
+
+  * no id overlaps source_card_id at all - meaning the feed is keyed on
+    base-player eaId rather than card eaId, and needs a mapping first
+  * coverage falls below FUTGG_BULK_MIN_COVERAGE_PCT - meaning the feed
+    or the id space changed, and writing would blank good prices
+  * ids and prices do not align - meaning the encoding changed
+
+Those checks run on live data every cycle, which a one-off manual
+approval does not. FUTGG_BULK_APPLY=false forces a read-only cycle if you
+want to inspect coverage without writing.
 """
 
 from __future__ import annotations
@@ -82,8 +89,15 @@ def env_int(name: str, default: int, minimum: int | None = None) -> int:
     return max(minimum, value) if minimum is not None else value
 
 
-#: Write to the database. Off by default - see SAFETY above.
-APPLY = env_bool("FUTGG_BULK_APPLY", False)
+#: Write to the database.
+#
+# On by default. The dry-run flag was originally the safety mechanism, but
+# it is not the one that matters: the coverage checks below already refuse
+# to write when the feed does not line up with our catalogue (zero id
+# overlap, or coverage under the floor). Those run on live data every
+# cycle, whereas a manual flag just delays the first useful write by a
+# deploy. Set FUTGG_BULK_APPLY=false to force a read-only cycle.
+APPLY = env_bool("FUTGG_BULK_APPLY", True)
 PLATFORM = os.getenv("FUTGG_BULK_PLATFORM", "ps5")
 GAME_YEAR = os.getenv("FUTGG_GAME_YEAR", "26")
 INTERVAL_SECONDS = env_int("FUTGG_BULK_INTERVAL_SECONDS", 300, minimum=60)
@@ -267,8 +281,8 @@ async def ingest_once(pool: asyncpg.Pool, page, timers: StageTimers) -> dict[str
 
     if not APPLY:
         log.warning(
-            "DRY RUN (FUTGG_BULK_APPLY is not true) - nothing written. "
-            "Coverage above is the number that decides whether to enable it."
+            "READ-ONLY (FUTGG_BULK_APPLY=false) - coverage checks passed but "
+            "nothing written."
         )
         for row in matched[:10]:
             card_id = int(row["source_card_id"])
@@ -319,7 +333,7 @@ async def run_forever() -> None:
         SCRIPT_VERSION, PLATFORM, INTERVAL_SECONDS, APPLY, PLAYER_URL,
     )
     if not APPLY:
-        log.warning("DRY RUN MODE - set FUTGG_BULK_APPLY=true once coverage looks right.")
+        log.warning("READ-ONLY MODE - coverage will be reported, nothing written.")
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
