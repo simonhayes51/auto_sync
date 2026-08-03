@@ -101,3 +101,55 @@ class TestIntervals:
 
     def test_none_rating_is_slowest(self):
         assert sales_interval_minutes(None) == sales_interval_minutes(50)
+
+
+from futgg_sales_sync import AdaptiveThrottle  # noqa: E402
+
+
+class TestAdaptiveThrottle:
+    def test_backs_off_on_throttling(self):
+        t = AdaptiveThrottle(batch_size=8, delay=0.5)
+        t.record(attempted=8, throttled=8)
+        assert t.delay > 0.5
+        assert t.batch_size < 8
+
+    def test_backoff_scales_with_severity(self):
+        light = AdaptiveThrottle(8, 0.5); light.record(8, 1)
+        heavy = AdaptiveThrottle(8, 0.5); heavy.record(8, 8)
+        assert heavy.delay > light.delay
+
+    def test_light_throttling_does_not_shrink_batch(self):
+        t = AdaptiveThrottle(8, 0.5)
+        t.record(attempted=8, throttled=1)   # 12.5% - under the 25% bar
+        assert t.batch_size == 8
+        assert t.delay > 0.5                  # but still slows down
+
+    def test_recovers_only_after_sustained_success(self):
+        t = AdaptiveThrottle(8, 0.5)
+        t.record(8, 8)
+        slowed, shrunk = t.delay, t.batch_size
+        for _ in range(4):
+            t.record(8, 0)
+        assert t.delay == slowed and t.batch_size == shrunk  # not yet
+        t.record(8, 0)                                        # fifth
+        assert t.delay < slowed and t.batch_size > shrunk
+
+    def test_never_exceeds_starting_limits(self):
+        t = AdaptiveThrottle(8, 0.5)
+        for _ in range(200):
+            t.record(8, 0)
+        assert t.batch_size <= 8
+        assert t.delay >= 0.5
+
+    def test_delay_is_bounded_under_relentless_throttling(self):
+        t = AdaptiveThrottle(8, 0.5)
+        for _ in range(500):
+            t.record(8, 8)
+        assert t.delay <= t.max_delay
+        assert t.batch_size >= 1        # never stalls completely
+
+    def test_zero_delay_start_still_backs_off(self):
+        # A configured delay of 0 must not multiply to stay at 0.
+        t = AdaptiveThrottle(8, 0.0)
+        t.record(8, 8)
+        assert t.delay > 0
