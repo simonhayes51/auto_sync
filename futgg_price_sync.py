@@ -1,62 +1,49 @@
 #!/usr/bin/env python
 """Continuous rating-prioritised FUT.GG price and recent-sales sync.
 
-This is intended to run as a long-lived Railway worker, not as a cron job.
+Designed to run as a permanent Railway worker, not as a cron job.
 
 Core behaviour:
-- Rating 85+ cards are refreshed every 10 minutes.
+- Rating 85+ cards are always selected before lower-rated cards.
+- Successful 85+ cards are refreshed every 10 minutes by default.
 - Lower-rated cards use progressively longer refresh intervals.
-- 85+ cards always receive priority.
-- Lower-rated cards only use spare batch capacity.
-- Chromium, browser context and worker pages remain open between batches.
-- Successful cards are rescheduled from their actual capture time.
-- Cloudflare blocks and rate limits trigger circuit-breaker backoff.
-- Untradeable cards are permanently removed from future price selection.
+- Browser/context/pages remain alive between batches.
+- Incomplete price renders are retried once.
+- Ambiguous no-market results are rejected as technical failures.
+- price_section_missing is never stored as a valid market outcome.
+- Cloudflare 403/429 responses trigger a circuit-breaker backoff.
+- Confirmed untradeable cards are removed from future price selection.
+- Failed attempts do not overwrite historical BIN or sales data.
 
-Recommended Railway service:
+Recommended Railway command:
     python -m scripts.futgg_price_sync
 
-Default refresh intervals:
-    Rating 85+       10 minutes
-    Rating 80–84     30 minutes
-    Rating 75–79     120 minutes
-    Rating 70–74     360 minutes
-    Rating under 70  1440 minutes
-    Unknown rating   1440 minutes
+Recommended Railway variables:
+    PLAYWRIGHT_HEADLESS=true
+    PLAYWRIGHT_TIMEOUT_MS=45000
 
-Recommended environment variables:
-    DATABASE_URL                              required
-    PLAYWRIGHT_HEADLESS                       true
-    PLAYWRIGHT_TIMEOUT_MS                     45000
+    FUTGG_PRICE_CONCURRENCY=8
+    FUTGG_PRICE_BATCH_SIZE=250
+    FUTGG_PRICE_REQUEST_DELAY=0.20
+    FUTGG_PRICE_IDLE_SLEEP_SECONDS=5
+    FUTGG_PRICE_BATCH_SLEEP_SECONDS=1
+    FUTGG_PRICE_BLOCK_BACKOFF_SECONDS=900
 
-    FUTGG_PRICE_CONCURRENCY                   15
-    FUTGG_PRICE_BATCH_SIZE                    500
-    FUTGG_PRICE_HIGH_PRIORITY_SHARE           0.90
-    FUTGG_PRICE_REQUEST_DELAY                 0.10
-    FUTGG_PRICE_IDLE_SLEEP_SECONDS            5
-    FUTGG_PRICE_BATCH_SLEEP_SECONDS           1
-    FUTGG_PRICE_BLOCK_BACKOFF_SECONDS         900
+    FUTGG_PRICE_SECTION_TIMEOUT_MS=12000
+    FUTGG_PRICE_RENDER_SETTLE_MS=700
+    FUTGG_PRICE_RETRY_SETTLE_MS=2000
+    FUTGG_PRICE_MAX_ATTEMPTS=2
 
-    FUTGG_RATING_85_PLUS_INTERVAL_MIN         10
-    FUTGG_RATING_80_84_INTERVAL_MIN           30
-    FUTGG_RATING_75_79_INTERVAL_MIN           120
-    FUTGG_RATING_70_74_INTERVAL_MIN           360
-    FUTGG_RATING_UNDER_70_INTERVAL_MIN        1440
+    FUTGG_RATING_85_PLUS_INTERVAL_MIN=10
+    FUTGG_RATING_80_84_INTERVAL_MIN=30
+    FUTGG_RATING_75_79_INTERVAL_MIN=120
+    FUTGG_RATING_70_74_INTERVAL_MIN=360
+    FUTGG_RATING_UNDER_70_INTERVAL_MIN=1440
 
-    FUTGG_CIRCUIT_BREAKER_THRESHOLD           8
-    FUTGG_HOT_DISCOUNT_THRESHOLD              0.12
-    FUTGG_HOT_INTERVAL_MIN                    10
-    FUTGG_HOT_MIN_SALES                       5
-
-Price outcomes:
-    success
-    untradeable
-    no_active_market
-    price_section_missing
-    page_failed
-    parse_failed
-    rate_limited
-    blocked
+    FUTGG_CIRCUIT_BREAKER_THRESHOLD=8
+    FUTGG_HOT_DISCOUNT_THRESHOLD=0.12
+    FUTGG_HOT_INTERVAL_MIN=10
+    FUTGG_HOT_MIN_SALES=5
 """
 
 from __future__ import annotations
@@ -76,6 +63,7 @@ from playwright.async_api import (
     BrowserContext,
     Page,
     Playwright,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
@@ -84,11 +72,26 @@ from futgg_player_sync import ensure_schema as ensure_player_schema
 from monitoring import alert, heartbeat
 
 
+SCRIPT_VERSION = "futgg-price-sync-render-validation-v3"
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("futgg_price_sync")
+
+
+class PriceRenderError(RuntimeError):
+    """The page loaded, but usable price data did not render."""
+
+
+class PriceParseError(RuntimeError):
+    """The rendered price content could not be parsed safely."""
+
+
+class NavigationError(RuntimeError):
+    """The player page could not be loaded successfully."""
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -154,26 +157,19 @@ TIMEOUT_MS = env_int(
 
 CONCURRENCY = env_int(
     "FUTGG_PRICE_CONCURRENCY",
-    15,
+    8,
     minimum=1,
 )
 
 BATCH_SIZE = env_int(
     "FUTGG_PRICE_BATCH_SIZE",
-    500,
+    250,
     minimum=1,
-)
-
-HIGH_PRIORITY_SHARE = env_float(
-    "FUTGG_PRICE_HIGH_PRIORITY_SHARE",
-    0.90,
-    minimum=0.50,
-    maximum=1.0,
 )
 
 REQUEST_DELAY = env_float(
     "FUTGG_PRICE_REQUEST_DELAY",
-    0.10,
+    0.20,
     minimum=0.0,
 )
 
@@ -195,9 +191,39 @@ BLOCK_BACKOFF_SECONDS = env_float(
     minimum=60.0,
 )
 
+PRICE_SECTION_TIMEOUT_MS = env_int(
+    "FUTGG_PRICE_SECTION_TIMEOUT_MS",
+    12000,
+    minimum=1000,
+)
+
+RENDER_SETTLE_MS = env_int(
+    "FUTGG_PRICE_RENDER_SETTLE_MS",
+    700,
+    minimum=0,
+)
+
+RETRY_SETTLE_MS = env_int(
+    "FUTGG_PRICE_RETRY_SETTLE_MS",
+    2000,
+    minimum=0,
+)
+
+MAX_ATTEMPTS = env_int(
+    "FUTGG_PRICE_MAX_ATTEMPTS",
+    2,
+    minimum=1,
+)
+
 OVERLAP_LOCK_KEY = env_int(
     "FUTGG_PRICE_LOCK_KEY",
     7741022,
+)
+
+LOCK_RETRY_SECONDS = env_float(
+    "FUTGG_PRICE_LOCK_RETRY_SECONDS",
+    15.0,
+    minimum=1.0,
 )
 
 CIRCUIT_BREAKER_THRESHOLD = env_int(
@@ -267,9 +293,17 @@ USER_AGENT = (
 )
 
 
-def price_interval_minutes(
-    rating: int | None,
-) -> int:
+EXPLICIT_NO_MARKET_PHRASES = (
+    "no active market",
+    "no current listings",
+    "no listings available",
+    "no market data available",
+    "there are no active listings",
+    "no recent sales",
+)
+
+
+def price_interval_minutes(rating: int | None) -> int:
     if rating is None:
         return RATING_INTERVALS["under_70"]
 
@@ -324,12 +358,15 @@ def new_stats() -> dict[str, int]:
         "bin_rows": 0,
         "sales_new": 0,
         "sales_dupe": 0,
-        "no_market_data": 0,
+        "confirmed_no_market": 0,
         "untradeable": 0,
         "hot_opportunities": 0,
         "blocked": 0,
+        "rate_limited": 0,
         "parse_failures": 0,
+        "render_failures": 0,
         "navigation_failures": 0,
+        "retries": 0,
     }
 
 
@@ -337,6 +374,20 @@ async def ensure_schema(
     conn: asyncpg.Connection,
 ) -> None:
     await ensure_player_schema(conn)
+
+    await conn.execute(
+        """
+        ALTER TABLE futgg_players
+        ADD COLUMN IF NOT EXISTS last_price_attempt_at TIMESTAMPTZ
+        """
+    )
+
+    await conn.execute(
+        """
+        ALTER TABLE futgg_players
+        ADD COLUMN IF NOT EXISTS last_price_error TEXT
+        """
+    )
 
     await conn.execute(
         """
@@ -440,9 +491,9 @@ async def ensure_schema(
 async def fetch_due_cards(
     conn: asyncpg.Connection,
 ) -> list[asyncpg.Record]:
-    """Fill the batch with due 85+ cards first.
+    """Fill each batch with due 85+ cards first.
 
-    Lower-rated cards are only selected when fewer than BATCH_SIZE
+    Lower-rated cards are selected only when fewer than BATCH_SIZE
     high-rated cards are currently due.
     """
 
@@ -454,7 +505,8 @@ async def fetch_due_cards(
             price_tier,
             rating,
             next_price_due_at,
-            price_updated_at
+            price_updated_at,
+            last_price_status
         FROM futgg_players
         WHERE is_active = TRUE
           AND rating >= 85
@@ -486,7 +538,8 @@ async def fetch_due_cards(
             price_tier,
             rating,
             next_price_due_at,
-            price_updated_at
+            price_updated_at,
+            last_price_status
         FROM futgg_players
         WHERE is_active = TRUE
           AND (
@@ -520,6 +573,24 @@ async def fetch_due_cards(
     ]
 
 
+async def mark_attempt_started(
+    conn: asyncpg.Connection,
+    source_card_id: int,
+    attempted_at: datetime,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE futgg_players
+        SET
+            last_price_attempt_at = $2,
+            last_price_error = NULL
+        WHERE source_card_id = $1
+        """,
+        source_card_id,
+        attempted_at,
+    )
+
+
 async def record_success(
     conn: asyncpg.Connection,
     row: asyncpg.Record,
@@ -529,6 +600,11 @@ async def record_success(
     bin_rows = 0
     sales_new = 0
     sales_dupe = 0
+
+    if card.price_outcome == "price_section_missing":
+        raise PriceParseError(
+            "price_section_missing cannot be recorded as a valid outcome"
+        )
 
     if card.lowest_bin is not None:
         await conn.execute(
@@ -638,8 +714,10 @@ async def record_success(
             UPDATE futgg_players
             SET
                 price_updated_at = $2,
+                last_price_attempt_at = $2,
                 next_price_due_at = NULL,
                 last_price_status = $3,
+                last_price_error = NULL,
                 is_tradeable = FALSE,
                 last_seen_at = NOW()
             WHERE source_card_id = $1
@@ -660,12 +738,9 @@ async def record_success(
         row["rating"]
     )
 
-    if status in {
-        "no_active_market",
-        "price_section_missing",
-    }:
-        # Empty-market cards do not need to consume the same capacity as
-        # cards which currently have an active and useful market.
+    if status == "no_active_market":
+        # This status only reaches record_success when explicit text on
+        # the rendered page confirms there is genuinely no market.
         interval_minutes = min(
             interval_minutes * 3,
             4320,
@@ -682,8 +757,6 @@ async def record_success(
             HOT_INTERVAL_MIN,
         )
 
-    # Rolling schedule: every card becomes due relative to the moment its
-    # latest price observation was captured.
     next_due_at = captured_at + timedelta(
         minutes=interval_minutes
     )
@@ -693,8 +766,10 @@ async def record_success(
         UPDATE futgg_players
         SET
             price_updated_at = $2,
+            last_price_attempt_at = $2,
             next_price_due_at = $3,
             last_price_status = $4,
+            last_price_error = NULL,
             is_tradeable = COALESCE(
                 $5,
                 is_tradeable
@@ -721,6 +796,7 @@ async def record_failure(
     conn: asyncpg.Connection,
     row: asyncpg.Record,
     status: str,
+    error_message: str,
 ) -> None:
     normal_interval = price_interval_minutes(
         row["rating"]
@@ -731,6 +807,13 @@ async def record_failure(
         "rate_limited",
     }:
         retry_minutes = 15
+
+    elif status == "price_render_failed":
+        retry_minutes = min(
+            normal_interval,
+            2,
+        )
+
     else:
         retry_minutes = min(
             normal_interval,
@@ -741,15 +824,287 @@ async def record_failure(
         """
         UPDATE futgg_players
         SET
+            last_price_attempt_at = NOW(),
             next_price_due_at =
                 NOW()
                 + ($2 * INTERVAL '1 minute'),
-            last_price_status = $3
+            last_price_status = $3,
+            last_price_error = $4
         WHERE source_card_id = $1
         """,
         row["source_card_id"],
         retry_minutes,
-        status[:200],
+        status,
+        error_message[:1000],
+    )
+
+
+async def safe_body_text(page: Page) -> str:
+    try:
+        return (
+            await page.locator("body")
+            .inner_text(timeout=5000)
+        )
+    except Exception:
+        return ""
+
+
+async def safe_price_section_text(page: Page) -> str:
+    try:
+        section = page.locator(
+            "#prices-overview"
+        )
+
+        if await section.count() == 0:
+            return ""
+
+        return await section.inner_text(
+            timeout=5000
+        )
+
+    except Exception:
+        return ""
+
+
+def contains_explicit_no_market_text(
+    text: str,
+) -> bool:
+    normalised = " ".join(
+        text.lower().split()
+    )
+
+    return any(
+        phrase in normalised
+        for phrase in EXPLICIT_NO_MARKET_PHRASES
+    )
+
+
+async def wait_for_base_card(page: Page) -> None:
+    try:
+        await page.locator(
+            ".fc-card"
+        ).first.wait_for(
+            state="attached",
+            timeout=15000,
+        )
+
+    except PlaywrightTimeoutError as exc:
+        raise PriceRenderError(
+            "player card did not render"
+        ) from exc
+
+
+async def wait_for_price_section(page: Page) -> bool:
+    """Wait for the price section.
+
+    Returns True when the section attaches. A False result is not
+    immediately treated as a market outcome because untradeable cards
+    may legitimately have a different page structure.
+    """
+
+    try:
+        await page.locator(
+            "#prices-overview"
+        ).wait_for(
+            state="attached",
+            timeout=PRICE_SECTION_TIMEOUT_MS,
+        )
+
+        return True
+
+    except PlaywrightTimeoutError:
+        return False
+
+
+async def validate_parsed_card(
+    page: Page,
+    card: Any,
+    price_section_attached: bool,
+) -> None:
+    outcome = card.price_outcome
+
+    if outcome == "success":
+        if (
+            card.lowest_bin is None
+            and not card.recent_sales
+        ):
+            raise PriceParseError(
+                "success outcome contained no BIN and no sales"
+            )
+
+        return
+
+    if outcome == "untradeable":
+        return
+
+    if outcome == "price_section_missing":
+        raise PriceRenderError(
+            "parser reported price_section_missing"
+        )
+
+    if outcome == "no_active_market":
+        section_text = await safe_price_section_text(
+            page
+        )
+
+        body_text = await safe_body_text(
+            page
+        )
+
+        combined_text = (
+            f"{section_text}\n{body_text}"
+        )
+
+        if not contains_explicit_no_market_text(
+            combined_text
+        ):
+            raise PriceRenderError(
+                "ambiguous no_active_market without explicit page text"
+            )
+
+        return
+
+    raise PriceParseError(
+        f"unknown price outcome: {outcome!r}"
+    )
+
+
+async def load_and_parse_card(
+    page: Page,
+    row: asyncpg.Record,
+    stats: dict[str, int],
+) -> tuple[Any, datetime]:
+    """Load, render, parse and validate one card.
+
+    Incomplete price renders receive one or more attempts according to
+    FUTGG_PRICE_MAX_ATTEMPTS. Ambiguous market states never reach the
+    database as successful outcomes.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        captured_at = datetime.now(timezone.utc)
+
+        try:
+            response = await page.goto(
+                row["source_url"],
+                wait_until="domcontentloaded",
+                timeout=TIMEOUT_MS,
+            )
+
+            http_status = (
+                response.status
+                if response is not None
+                else 0
+            )
+
+            if http_status in BLOCKED_STATUS_CODES:
+                failure_status = (
+                    "rate_limited"
+                    if http_status == 429
+                    else "blocked"
+                )
+
+                raise NavigationError(
+                    f"{failure_status}: HTTP {http_status}"
+                )
+
+            if http_status != 200:
+                raise NavigationError(
+                    f"unexpected HTTP {http_status}"
+                )
+
+            await wait_for_base_card(page)
+
+            price_section_attached = (
+                await wait_for_price_section(page)
+            )
+
+            settle_ms = (
+                RENDER_SETTLE_MS
+                if attempt == 1
+                else RETRY_SETTLE_MS
+            )
+
+            if settle_ms > 0:
+                await page.wait_for_timeout(
+                    settle_ms
+                )
+
+            html = await page.content()
+
+            card = parse_futgg_card(
+                html,
+                row["source_url"],
+                captured_at,
+            )
+
+            await validate_parsed_card(
+                page,
+                card,
+                price_section_attached,
+            )
+
+            return card, captured_at
+
+        except NavigationError:
+            raise
+
+        except (
+            PriceRenderError,
+            PriceParseError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ) as exc:
+            last_error = exc
+
+            if attempt >= MAX_ATTEMPTS:
+                break
+
+            stats["retries"] += 1
+
+            log.warning(
+                (
+                    "card=%s rating=%s attempt=%d/%d "
+                    "incomplete=%s; retrying"
+                ),
+                row["source_card_id"],
+                row["rating"],
+                attempt,
+                MAX_ATTEMPTS,
+                exc,
+            )
+
+            try:
+                await page.goto(
+                    "about:blank",
+                    wait_until="commit",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(
+                random.uniform(0.3, 0.8)
+            )
+
+        except PlaywrightTimeoutError as exc:
+            raise NavigationError(
+                f"navigation timeout: {exc}"
+            ) from exc
+
+        except Exception as exc:
+            raise NavigationError(
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    if isinstance(last_error, PriceParseError):
+        raise last_error
+
+    raise PriceRenderError(
+        str(last_error or "price data did not render")
     )
 
 
@@ -761,87 +1116,22 @@ async def process_card(
     stats: dict[str, int],
     breaker: CircuitBreaker,
 ) -> None:
-    captured_at = datetime.now(timezone.utc)
+    attempt_started_at = datetime.now(
+        timezone.utc
+    )
+
+    async with pool.acquire() as conn:
+        await mark_attempt_started(
+            conn,
+            row["source_card_id"],
+            attempt_started_at,
+        )
 
     try:
-        response = await page.goto(
-            row["source_url"],
-            wait_until="domcontentloaded",
-            timeout=TIMEOUT_MS,
-        )
-
-        http_status = (
-            response.status
-            if response is not None
-            else 0
-        )
-
-        if http_status in BLOCKED_STATUS_CODES:
-            stats["blocked"] += 1
-            stats["cards_failed"] += 1
-
-            failure_status = (
-                "rate_limited"
-                if http_status == 429
-                else "blocked"
-            )
-
-            async with pool.acquire() as conn:
-                await record_failure(
-                    conn,
-                    row,
-                    failure_status,
-                )
-
-            breaker.record_failure(
-                f"HTTP {http_status}"
-            )
-
-            log.warning(
-                (
-                    "worker=%d card=%s rating=%s "
-                    "HTTP=%d status=%s"
-                ),
-                worker_id,
-                row["source_card_id"],
-                row["rating"],
-                http_status,
-                failure_status,
-            )
-
-            return
-
-        if http_status != 200:
-            raise RuntimeError(
-                f"HTTP {http_status}"
-            )
-
-        await page.locator(
-            ".fc-card"
-        ).first.wait_for(
-            state="attached",
-            timeout=15000,
-        )
-
-        try:
-            await page.locator(
-                "#prices-overview"
-            ).wait_for(
-                state="attached",
-                timeout=12000,
-            )
-        except Exception:
-            # parse_futgg_card determines whether the price section is
-            # absent because the card is untradeable, has no market, or
-            # the section failed to render.
-            pass
-
-        await page.wait_for_timeout(700)
-
-        card = parse_futgg_card(
-            await page.content(),
-            row["source_url"],
-            captured_at,
+        card, captured_at = await load_and_parse_card(
+            page,
+            row,
+            stats,
         )
 
         async with pool.acquire() as conn:
@@ -867,11 +1157,8 @@ async def process_card(
         if card.price_outcome == "untradeable":
             stats["untradeable"] += 1
 
-        elif card.price_outcome in {
-            "no_active_market",
-            "price_section_missing",
-        }:
-            stats["no_market_data"] += 1
+        elif card.price_outcome == "no_active_market":
+            stats["confirmed_no_market"] += 1
 
         if is_hot:
             stats["hot_opportunities"] += 1
@@ -893,34 +1180,106 @@ async def process_card(
             is_hot,
         )
 
-    except Exception as exc:
+    except NavigationError as exc:
+        message = str(exc)
+
+        if "rate_limited" in message:
+            failure_status = "rate_limited"
+            stats["rate_limited"] += 1
+            stats["blocked"] += 1
+
+        elif "blocked" in message:
+            failure_status = "blocked"
+            stats["blocked"] += 1
+
+        else:
+            failure_status = "page_failed"
+            stats["navigation_failures"] += 1
+
         stats["cards_failed"] += 1
 
-        is_parse_failure = isinstance(
-            exc,
-            (
-                ValueError,
-                KeyError,
-                TypeError,
-            ),
+        async with pool.acquire() as conn:
+            await record_failure(
+                conn,
+                row,
+                failure_status,
+                message,
+            )
+
+        # Only navigation, block and rate-limit failures influence the
+        # global circuit breaker. Individual parser/render misses do not.
+        breaker.record_failure(
+            message
         )
 
-        if is_parse_failure:
-            stats["parse_failures"] += 1
-            failure_status = "parse_failed"
-        else:
-            stats["navigation_failures"] += 1
-            failure_status = "page_failed"
+        log.warning(
+            (
+                "worker=%d card=%s rating=%s "
+                "navigation_failed status=%s error=%s"
+            ),
+            worker_id,
+            row["source_card_id"],
+            row["rating"],
+            failure_status,
+            message,
+        )
+
+    except PriceRenderError as exc:
+        stats["cards_failed"] += 1
+        stats["render_failures"] += 1
+
+        async with pool.acquire() as conn:
+            await record_failure(
+                conn,
+                row,
+                "price_render_failed",
+                str(exc),
+            )
 
         log.warning(
-            "worker=%d card=%s rating=%s failed: %s",
+            (
+                "worker=%d card=%s rating=%s "
+                "render_failed error=%s"
+            ),
             worker_id,
             row["source_card_id"],
             row["rating"],
             exc,
         )
 
-        breaker.record_failure(
+    except (
+        PriceParseError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as exc:
+        stats["cards_failed"] += 1
+        stats["parse_failures"] += 1
+
+        async with pool.acquire() as conn:
+            await record_failure(
+                conn,
+                row,
+                "parse_failed",
+                str(exc),
+            )
+
+        log.warning(
+            (
+                "worker=%d card=%s rating=%s "
+                "parse_failed error=%s"
+            ),
+            worker_id,
+            row["source_card_id"],
+            row["rating"],
+            exc,
+        )
+
+    except Exception as exc:
+        stats["cards_failed"] += 1
+        stats["navigation_failures"] += 1
+
+        message = (
             f"{type(exc).__name__}: {exc}"
         )
 
@@ -928,8 +1287,23 @@ async def process_card(
             await record_failure(
                 conn,
                 row,
-                failure_status,
+                "page_failed",
+                message,
             )
+
+        breaker.record_failure(
+            message
+        )
+
+        log.exception(
+            (
+                "worker=%d card=%s rating=%s "
+                "unexpected failure"
+            ),
+            worker_id,
+            row["source_card_id"],
+            row["rating"],
+        )
 
     finally:
         if REQUEST_DELAY > 0:
@@ -975,12 +1349,15 @@ async def worker_loop(
                 stats,
                 breaker,
             )
+
         finally:
             queue.task_done()
 
 
-async def block_unneeded_resources(route: Any) -> None:
-    """Block assets not required for HTML price parsing."""
+async def block_unneeded_resources(
+    route: Any,
+) -> None:
+    """Block heavy assets that are not needed for price parsing."""
 
     resource_type = route.request.resource_type
 
@@ -997,7 +1374,11 @@ async def block_unneeded_resources(route: Any) -> None:
 
 async def create_browser(
     playwright: Playwright,
-) -> tuple[Browser, BrowserContext, list[Page]]:
+) -> tuple[
+    Browser,
+    BrowserContext,
+    list[Page],
+]:
     browser = await playwright.chromium.launch(
         headless=HEADLESS,
         args=[
@@ -1097,6 +1478,7 @@ async def write_heartbeat(
         f"cards_per_minute={cards_per_minute:.1f}",
         f"concurrency={CONCURRENCY}",
         f"batch_size={BATCH_SIZE}",
+        f"script_version={SCRIPT_VERSION}",
     ]
 
     async with pool.acquire() as conn:
@@ -1121,8 +1503,14 @@ async def write_heartbeat(
 async def process_due_batch(
     pool: asyncpg.Pool,
     pages: list[Page],
-) -> tuple[dict[str, int], CircuitBreaker]:
-    batch_started_at = datetime.now(timezone.utc)
+) -> tuple[
+    dict[str, int],
+    CircuitBreaker,
+]:
+    batch_started_at = datetime.now(
+        timezone.utc
+    )
+
     stats = new_stats()
 
     async with pool.acquire() as conn:
@@ -1133,18 +1521,20 @@ async def process_due_batch(
     for row in rows:
         rating = row["rating"]
 
-        if rating is not None and rating >= 85:
+        if (
+            rating is not None
+            and rating >= 85
+        ):
             stats["selected_85_plus"] += 1
         else:
             stats["selected_lower"] += 1
 
+    breaker = CircuitBreaker(
+        CIRCUIT_BREAKER_THRESHOLD
+    )
+
     if not rows:
-        return (
-            stats,
-            CircuitBreaker(
-                CIRCUIT_BREAKER_THRESHOLD
-            ),
-        )
+        return stats, breaker
 
     log.info(
         (
@@ -1167,10 +1557,6 @@ async def process_due_batch(
 
     for row in rows:
         queue.put_nowait(row)
-
-    breaker = CircuitBreaker(
-        CIRCUIT_BREAKER_THRESHOLD
-    )
 
     await asyncio.gather(
         *[
@@ -1204,28 +1590,62 @@ async def process_due_batch(
     )
 
     cards_per_minute = (
-        stats["cards_ok"] / run_seconds
+        stats["cards_ok"]
+        / run_seconds
     ) * 60
 
     log.info(
         (
             "Batch complete in %d seconds: "
             "cards_ok=%d cards_failed=%d "
+            "render_failures=%d parse_failures=%d "
+            "navigation_failures=%d retries=%d "
             "cards_per_minute=%.1f "
             "selected_high=%d selected_lower=%d"
         ),
         run_seconds,
         stats["cards_ok"],
         stats["cards_failed"],
+        stats["render_failures"],
+        stats["parse_failures"],
+        stats["navigation_failures"],
+        stats["retries"],
         cards_per_minute,
         stats["selected_85_plus"],
         stats["selected_lower"],
     )
 
-    return (
-        stats,
-        breaker,
-    )
+    return stats, breaker
+
+
+async def acquire_worker_lock(
+    lock_conn: asyncpg.Connection,
+) -> None:
+    while True:
+        got_lock = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)",
+            OVERLAP_LOCK_KEY,
+        )
+
+        if got_lock:
+            log.info(
+                "Acquired advisory lock %d",
+                OVERLAP_LOCK_KEY,
+            )
+            return
+
+        log.warning(
+            (
+                "Another FUT.GG price worker owns "
+                "advisory lock %d; retrying in %.0f seconds"
+            ),
+            OVERLAP_LOCK_KEY,
+            LOCK_RETRY_SECONDS,
+        )
+
+        await asyncio.sleep(
+            LOCK_RETRY_SECONDS
+        )
 
 
 async def run_forever() -> None:
@@ -1241,20 +1661,9 @@ async def run_forever() -> None:
             DATABASE_URL
         )
 
-        got_lock = await lock_conn.fetchval(
-            "SELECT pg_try_advisory_lock($1)",
-            OVERLAP_LOCK_KEY,
+        await acquire_worker_lock(
+            lock_conn
         )
-
-        if not got_lock:
-            log.error(
-                (
-                    "Another FUT.GG price worker "
-                    "already owns advisory lock %d"
-                ),
-                OVERLAP_LOCK_KEY,
-            )
-            return
 
         pool = await asyncpg.create_pool(
             DATABASE_URL,
@@ -1272,17 +1681,22 @@ async def run_forever() -> None:
             browser,
             context,
             pages,
-        ) = await create_browser(playwright)
+        ) = await create_browser(
+            playwright
+        )
 
         log.info(
             (
                 "Continuous FUT.GG price worker started: "
-                "concurrency=%d batch_size=%d "
-                "high_priority_share=%.2f intervals=%s"
+                "version=%s concurrency=%d batch_size=%d "
+                "request_delay=%.2f max_attempts=%d "
+                "intervals=%s"
             ),
+            SCRIPT_VERSION,
             CONCURRENCY,
             BATCH_SIZE,
-            HIGH_PRIORITY_SHARE,
+            REQUEST_DELAY,
+            MAX_ATTEMPTS,
             RATING_INTERVALS,
         )
 
