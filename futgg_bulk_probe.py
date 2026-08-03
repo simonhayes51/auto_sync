@@ -121,20 +121,61 @@ async def fetch_via_browser(urls: list[str]) -> dict[str, Any]:
             except Exception:
                 log.warning("  browser: homepage load failed; continuing anyway")
             for url in urls:
+                # Tier 2a: context.request WITH the origin/referer headers.
+                # Omitting them was a real defect in the first version of
+                # this fallback: every successful r2.fut.gg request in the
+                # discovery log carries origin=https://www.fut.gg, and R2
+                # buckets are routinely configured to 403 anything without
+                # it (hotlink protection). A bare context.request sends
+                # neither, so that attempt tested the wrong hypothesis.
                 started = time.perf_counter()
                 try:
-                    response = await context.request.get(url, timeout=45000)
-                    elapsed = time.perf_counter() - started
+                    response = await context.request.get(
+                        url, headers=HEADERS, timeout=45000
+                    )
                     body = await response.body()
-                    if response.status != 200:
-                        log.warning("  browser fetch %s -> HTTP %s", url, response.status)
+                    if response.status == 200:
+                        out[url] = json.loads(body)
+                        log.info(
+                            "  [context.request + origin] OK: %d B in %.2fs  %s",
+                            len(body), time.perf_counter() - started, url,
+                        )
                         continue
-                    out[url] = json.loads(body)
-                    log.info(
-                        "  browser fetch OK: %d B in %.2fs  %s", len(body), elapsed, url
+                    log.warning(
+                        "  [context.request + origin] HTTP %s  %s", response.status, url
                     )
                 except Exception as exc:
-                    log.warning("  browser fetch failed %s (%s)", url, exc)
+                    log.warning("  [context.request + origin] failed %s (%s)", url, exc)
+
+                # Tier 2b: fetch() from inside the page. This is literally
+                # what the FUT.GG app does - same document origin, browser
+                # supplies sec-fetch-*, cookies and TLS. If anything short
+                # of rendering the player page can retrieve this file, it
+                # is this.
+                started = time.perf_counter()
+                try:
+                    result = await page.evaluate(
+                        """async (u) => {
+                            try {
+                                const r = await fetch(u, { credentials: 'include' });
+                                if (!r.ok) return { status: r.status };
+                                return { status: 200, text: await r.text() };
+                            } catch (e) {
+                                return { error: String(e) };
+                            }
+                        }""",
+                        url,
+                    )
+                    if result.get("status") == 200 and result.get("text"):
+                        out[url] = json.loads(result["text"])
+                        log.info(
+                            "  [in-page fetch()] OK: %d B in %.2fs  %s",
+                            len(result["text"]), time.perf_counter() - started, url,
+                        )
+                        continue
+                    log.warning("  [in-page fetch()] %s  %s", result, url)
+                except Exception as exc:
+                    log.warning("  [in-page fetch()] failed %s (%s)", url, exc)
         finally:
             await browser.close()
     return out
@@ -276,7 +317,7 @@ async def main() -> int:
 
             index = fetched.get(index_url)
             dyn = fetched.get(dyn_url)
-            transport = "browser-context"
+            transport = "browser-context (see per-URL tier above)"
             if index is None or dyn is None:
                 log.error(
                     "BLOCKED on both transports. The bulk feed is not usable from "
@@ -284,9 +325,11 @@ async def main() -> int:
                     "feed inside the existing price worker's live browser context, "
                     "which already holds valid Cloudflare cookies; (2) use the "
                     "per-card signed endpoint through that same context; "
-                    "(3) stay on rendering. Do not conclude the feed is unusable "
-                    "in production from this result alone - the price worker's "
-                    "context is more established than this probe's cold one."
+                    "(3) stay on rendering. Note this probe now tries three "
+                    "transports - plain HTTP, context.request with origin, and "
+                    "fetch() from inside a real fut.gg page. The last is exactly "
+                    "what the app itself does, so if even that is refused, the "
+                    "file is genuinely gated to the player page's own session."
                 )
                 return 0
 
