@@ -29,6 +29,9 @@ Environment variables:
   FUTGG_SILVER_INTERVAL_MIN       2880
   FUTGG_BRONZE_INTERVAL_MIN       4320
   FUTGG_CIRCUIT_BREAKER_THRESHOLD 5 (consecutive 403/429/failed navigations before this run stops)
+  FUTGG_HOT_DISCOUNT_THRESHOLD    0.12 (12% below this scrape's own sales median triggers fast-track re-pricing)
+  FUTGG_HOT_INTERVAL_MIN          10 (next_price_due_at for a hot card, regardless of tier)
+  FUTGG_HOT_MIN_SALES             5 (minimum recent sales required to evaluate hot-opportunity status)
 
 Price outcomes (futgg_players.last_price_status): success, untradeable,
 no_active_market, price_section_missing, page_failed, parse_failed,
@@ -42,6 +45,7 @@ import asyncio
 import logging
 import os
 import random
+import statistics
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -83,6 +87,33 @@ INTERVALS = {
     "silver": max(60, int(os.getenv("FUTGG_SILVER_INTERVAL_MIN", "2880"))),
     "bronze": max(60, int(os.getenv("FUTGG_BRONZE_INTERVAL_MIN", "4320"))),
 }
+
+# "Hot opportunity" fast-track: a card whose live BIN is trading well below
+# its own just-scraped recent-sales median is exactly the kind of card the
+# app is about to recommend as a buy - and exactly the kind of card where an
+# hour-old (or longer, for lower tiers) price makes that recommendation
+# impossible to actually act on, since a real discount like this rarely
+# survives the tier's normal re-price interval. Detected inline from data
+# already in hand (no extra request), and re-queues the card for re-pricing
+# much sooner than its tier would otherwise allow - shrinking, never
+# extending, the normal interval.
+HOT_DISCOUNT_THRESHOLD = max(0.0, float(os.getenv("FUTGG_HOT_DISCOUNT_THRESHOLD", "0.12")))
+HOT_INTERVAL_MIN = max(5, int(os.getenv("FUTGG_HOT_INTERVAL_MIN", "10")))
+HOT_MIN_SALES = max(1, int(os.getenv("FUTGG_HOT_MIN_SALES", "5")))
+
+
+def _is_hot_opportunity(card) -> bool:
+    """True when lowest_bin sits at least HOT_DISCOUNT_THRESHOLD below the
+    median of this same scrape's recent sales - a real, current discount
+    worth re-checking often while it likely still exists, not a stale
+    snapshot from however long the card's normal tier interval is."""
+    if card.lowest_bin is None or len(card.recent_sales) < HOT_MIN_SALES:
+        return False
+    median = statistics.median(sale.sold_price for sale in card.recent_sales)
+    if median <= 0:
+        return False
+    discount = (median - card.lowest_bin) / median
+    return discount >= HOT_DISCOUNT_THRESHOLD
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -155,7 +186,7 @@ async def record_success(
     row: asyncpg.Record,
     card,
     captured_at: datetime,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, bool]:
     bin_rows = sales_new = sales_dupe = 0
 
     if card.lowest_bin is not None:
@@ -225,7 +256,7 @@ async def record_success(
             """,
             card.source_card_id, captured_at, status,
         )
-        return bin_rows, sales_new, sales_dupe
+        return bin_rows, sales_new, sales_dupe, False
 
     # Back off cards that repeatedly have no market data instead of
     # retrying at the normal tier cadence - a card with no price for
@@ -235,6 +266,10 @@ async def record_success(
         interval = min(INTERVALS.get(row["price_tier"], INTERVALS["bronze"]) * 3, 4320 * 3)
     else:
         interval = INTERVALS.get(row["price_tier"], INTERVALS["bronze"])
+
+    is_hot = status == "success" and _is_hot_opportunity(card)
+    if is_hot:
+        interval = min(interval, HOT_INTERVAL_MIN)
 
     await conn.execute(
         """
@@ -252,7 +287,7 @@ async def record_success(
         status,
         True if status == "success" else None,
     )
-    return bin_rows, sales_new, sales_dupe
+    return bin_rows, sales_new, sales_dupe, is_hot
 
 
 async def record_failure(conn: asyncpg.Connection, row: asyncpg.Record, reason: str, status: str = "page_failed") -> None:
@@ -316,7 +351,7 @@ async def worker_loop(
 
             card = parse_futgg_card(await page.content(), row["source_url"], captured_at)
             async with pool.acquire() as conn:
-                bin_rows, sales_new, sales_dupe = await record_success(conn, row, card, captured_at)
+                bin_rows, sales_new, sales_dupe, is_hot = await record_success(conn, row, card, captured_at)
 
             breaker.record_success()
             stats["cards_ok"] += 1
@@ -327,10 +362,12 @@ async def worker_loop(
                 stats["untradeable"] += 1
             elif card.price_outcome in ("no_active_market", "price_section_missing"):
                 stats["no_market_data"] += 1
+            if is_hot:
+                stats["hot_opportunities"] += 1
             log.info(
-                "worker=%d card=%s tier=%s outcome=%s bin=%s sales=%d new=%d",
+                "worker=%d card=%s tier=%s outcome=%s bin=%s sales=%d new=%d hot=%s",
                 worker_id, row["source_card_id"], row["price_tier"],
-                card.price_outcome, card.lowest_bin, len(card.recent_sales), sales_new,
+                card.price_outcome, card.lowest_bin, len(card.recent_sales), sales_new, is_hot,
             )
         except Exception as exc:
             stats["cards_failed"] += 1
@@ -366,6 +403,7 @@ async def crawl_once() -> None:
         "sales_dupe": 0,
         "no_market_data": 0,
         "untradeable": 0,
+        "hot_opportunities": 0,
         "blocked": 0,
         "parse_failures": 0,
         "navigation_failures": 0,
