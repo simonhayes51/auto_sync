@@ -28,6 +28,12 @@ This probe answers, with evidence and without changing anything:
   * how fresh is it (_published_at vs now)
   * do its prices agree with what the scraper most recently stored
 
+Uses aiohttp (already a pinned dependency) - this probe deliberately adds
+no new package, since it is meant to be runnable on the existing image.
+
+NEVER exits non-zero. It is run as a Railway service command, and a
+non-zero exit there is a restart loop, not an error report.
+
 Run:  python futgg_bulk_probe.py
 """
 
@@ -63,12 +69,14 @@ HEADERS = {
 }
 
 
-async def fetch_json(client, url: str) -> tuple[Any, int, float]:
+async def fetch_json(session, url: str) -> tuple[Any, int, float]:
     started = time.perf_counter()
-    response = await client.get(url, headers=HEADERS, timeout=30.0)
-    elapsed = time.perf_counter() - started
-    response.raise_for_status()
-    return response.json(), len(response.content), elapsed
+    async with session.get(url, headers=HEADERS) as response:
+        raw = await response.read()
+        elapsed = time.perf_counter() - started
+        if response.status != 200:
+            raise RuntimeError(f"HTTP {response.status} for {url}")
+    return json.loads(raw), len(raw), elapsed
 
 
 def decode_ids(index: dict[str, Any]) -> list[int]:
@@ -94,26 +102,40 @@ def decode_ids(index: dict[str, Any]) -> list[int]:
 
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        import httpx
-    except ImportError:
-        log.error("httpx is required: pip install httpx")
-        return 1
+    import aiohttp
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as client:
         # ---- 1. Manifest -------------------------------------------------
-        manifest_url = f"{BASE}/{GAME_YEAR}/manifest.json"
-        log.info("Fetching manifest: %s", manifest_url)
-        try:
-            manifest, size, elapsed = await fetch_json(client, manifest_url)
-        except Exception as exc:
+        # The exact manifest path was never captured (the discovery log
+        # shows the hashed asset URLs but the manifest request itself
+        # scrolled past), so try the plausible names rather than guessing
+        # once and failing.
+        candidates = [
+            os.getenv("FUTGG_MANIFEST_URL", "").strip(),
+            f"{BASE}/{GAME_YEAR}/manifest.json",
+            f"{BASE}/{GAME_YEAR}/index.json",
+            f"{BASE}/{GAME_YEAR}/versions.json",
+            f"{BASE}/manifest.json",
+            f"{BASE}/{GAME_YEAR}/manifest.v1.json",
+        ]
+        manifest = None
+        for url in [c for c in candidates if c]:
+            try:
+                manifest, size, elapsed = await fetch_json(client, url)
+                log.info("Manifest OK: %s (%d B in %.2fs)", url, size, elapsed)
+                break
+            except Exception as exc:
+                log.info("  manifest not at %s (%s)", url, exc)
+
+        if manifest is None:
             log.error(
-                "Manifest fetch failed (%s). The manifest path is a guess - "
-                "check the discovery log for the exact r2.fut.gg URL the page "
-                "requested and set FUTGG_R2_BASE / adjust this path.", exc,
+                "No manifest found. Get the exact URL from the browser: it is the "
+                "r2.fut.gg request whose JSON contains keys like "
+                "'player-prices-index' and 'player-prices-ps5-dyn' (the discovery "
+                "log shows that payload). Then set FUTGG_MANIFEST_URL and re-run."
             )
-            return 1
-        log.info("  manifest %d B in %.2fs", size, elapsed)
+            return 0
 
         index_hash = manifest.get("player-prices-index")
         dyn_key = f"player-prices-{PLATFORM}-dyn"
@@ -133,7 +155,7 @@ async def main() -> int:
 
         if not index_hash or not dyn_hash:
             log.error("Manifest lacks the expected keys; got: %s", list(manifest)[:30])
-            return 1
+            return 0
 
         # ---- 2. Index + prices ------------------------------------------
         index, isize, ielapsed = await fetch_json(
@@ -158,7 +180,7 @@ async def main() -> int:
                 "Do not build on this until the encoding is understood. "
                 "index sample keys=%s", list(index)[:12],
             )
-            return 1
+            return 0
 
         by_id = dict(zip(ids, prices))
         log.info("  id range %d .. %d", min(ids), max(ids))
@@ -207,7 +229,7 @@ async def main() -> int:
                 "source_card_id (likely base player eaId, not card eaId). The "
                 "bulk path needs an id mapping before it is usable."
             )
-            return 1
+            return 0
 
         # ---- 4. Do the numbers agree with what we scraped? ---------------
         comparable = [
@@ -250,4 +272,14 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    # Always exit 0. This is run as a Railway service command, where a
+    # non-zero exit is a restart loop rather than an error report - the
+    # same mistake that took the price worker down earlier. An unexpected
+    # exception is logged in full and the process still exits cleanly.
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        log.exception("bulk probe failed")
+    sys.exit(0)
