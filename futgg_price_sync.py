@@ -2032,41 +2032,140 @@ async def acquire_worker_lock(
         )
 
 
+async def select_discovery_url() -> str | None:
+    """Pick a URL to diagnose when FUTGG_DISCOVER_URL is not supplied.
+
+    Prefers a card that is ACTUALLY FAILING, because that is invariably
+    what the diagnostic is being run to explain - a healthy card tells you
+    nothing about why a quarter of the batch reports
+    price_section_missing. Falls back to any active tradeable card so the
+    flag still does something useful on a healthy database.
+
+    Uses one short-lived connection: no pool, no advisory lock, no writes.
+    """
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+    except Exception:
+        log.warning("DISCOVERY MODE: could not connect to select a URL", exc_info=True)
+        return None
+
+    # Only columns created by futgg_player_sync.ensure_schema are used.
+    # last_price_attempt_at looked like the natural ordering key but is
+    # added by THIS module's ensure_schema, so it is absent on a database
+    # where the price worker has not yet run - exactly the situation in
+    # which someone reaches for the diagnostic.
+    failing_sql = """
+        SELECT source_url
+        FROM futgg_players
+        WHERE is_active = TRUE
+          AND source_url IS NOT NULL
+          AND last_price_status IN (
+              'price_render_failed',
+              'parse_failed'
+          )
+        ORDER BY source_card_id
+        LIMIT 1
+    """
+    any_card_sql = """
+        SELECT source_url
+        FROM futgg_players
+        WHERE is_active = TRUE
+          AND source_url IS NOT NULL
+          AND is_tradeable IS DISTINCT FROM FALSE
+        ORDER BY rating DESC NULLS LAST
+        LIMIT 1
+    """
+
+    try:
+        # Each query is attempted independently so a schema surprise in the
+        # preferred one still leaves the fallback usable.
+        try:
+            url = await conn.fetchval(failing_sql)
+            if url:
+                log.info("DISCOVERY MODE: auto-selected a recently FAILING card.")
+                return url
+        except Exception:
+            log.warning(
+                "DISCOVERY MODE: failing-card lookup unavailable, trying any card",
+                exc_info=True,
+            )
+
+        url = await conn.fetchval(any_card_sql)
+        if url:
+            log.info("DISCOVERY MODE: no failing card on record; using a healthy card.")
+        return url
+    except Exception:
+        log.warning("DISCOVERY MODE: URL selection failed", exc_info=True)
+        return None
+    finally:
+        await conn.close()
+
+
 async def run_discovery_mode() -> None:
     """One-shot network diagnostic, then exit.
 
-    Takes no worker lock, opens no pool and touches no card state - it must
-    be safe to run alongside the live worker without perturbing it. The
-    import is local so that when the flag is off, futgg_discover is never
-    even loaded.
+    Takes no worker lock and touches no card state - safe to run alongside
+    the live worker. The import is local so that when the flag is off,
+    futgg_discover is never even loaded.
+
+    NEVER raises. This runs as a Railway worker, which restarts on a
+    non-zero exit, so raising on a configuration problem produced a crash
+    loop that hammered the logs about once a second - and, because the
+    flag was set on the live price service, silently took the price
+    pipeline down with it. A misconfiguration must degrade to a clear
+    message and a clean exit, not an outage.
     """
-    from futgg_discover import run_discovery
-
-    if not DISCOVER_URL:
-        raise RuntimeError(
-            "FUTGG_DISCOVER_PRICE_NETWORK is enabled but FUTGG_DISCOVER_URL is not set. "
-            "Set it to one full FUT.GG player URL, e.g. "
-            "https://www.fut.gg/players/26-1-239085/"
-        )
-
     log.info(
         "DISCOVERY MODE: single instrumented page load, price pipeline untouched."
     )
 
-    await run_discovery(
-        DISCOVER_URL,
-        headless=HEADLESS,
-        user_agent=USER_AGENT,
-        timeout_ms=TIMEOUT_MS,
-        settle_ms=max(RENDER_SETTLE_MS, 4000),
-        report_path=DISCOVER_REPORT_PATH or None,
-    )
+    url = DISCOVER_URL or await select_discovery_url()
 
-    log.info("DISCOVERY MODE: complete. Worker exiting without processing cards.")
+    if not url:
+        log.error(
+            "DISCOVERY MODE: no URL to diagnose. Set FUTGG_DISCOVER_URL to a full "
+            "FUT.GG player URL, e.g. https://www.fut.gg/players/26-1-239085/ - or "
+            "leave it unset and one will be chosen from futgg_players. Exiting "
+            "cleanly WITHOUT processing cards. If you meant to run the price "
+            "worker, unset FUTGG_DISCOVER_PRICE_NETWORK on this service."
+        )
+        return
+
+    try:
+        from futgg_discover import run_discovery
+
+        await run_discovery(
+            url,
+            headless=HEADLESS,
+            user_agent=USER_AGENT,
+            timeout_ms=TIMEOUT_MS,
+            settle_ms=max(RENDER_SETTLE_MS, 4000),
+            report_path=DISCOVER_REPORT_PATH or None,
+        )
+    except Exception:
+        log.exception("DISCOVERY MODE: diagnostic failed")
+
+    log.info(
+        "DISCOVERY MODE: complete. Exiting without processing cards. "
+        "Unset FUTGG_DISCOVER_PRICE_NETWORK to resume normal price syncing."
+    )
 
 
 async def run_forever() -> None:
     if DISCOVER_PRICE_NETWORK:
+        # Deliberately shouty. This flag stops the price pipeline entirely,
+        # and when it was set on the live worker the only symptom was an
+        # absence of card logs among a wall of tracebacks.
+        log.warning("=" * 72)
+        log.warning(
+            "FUTGG_DISCOVER_PRICE_NETWORK=true - PRICE SYNCING IS DISABLED "
+            "on this service."
+        )
+        log.warning(
+            "This process will run ONE diagnostic page load and exit. "
+            "Unset the flag to resume normal syncing."
+        )
+        log.warning("=" * 72)
         await run_discovery_mode()
         return
 
