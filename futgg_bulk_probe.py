@@ -208,9 +208,14 @@ async def harvest_from_page_load(player_url: str, wanted: list[str]) -> dict[str
         try:
             body = await response.body()
             captured[key] = json.loads(body)
+            captured[key + "__url"] = response.url
             log.info(
                 "  [page-load harvest] captured %s (%d B) from %s",
                 key, len(body), response.url,
+            )
+            log.info(
+                "  >>> NOTE the hash: it changes on every republish, which is why "
+                "direct fetches of a previously-captured URL can 403."
             )
         except Exception as exc:
             log.warning("  [page-load harvest] could not read %s (%s)", key, exc)
@@ -462,9 +467,39 @@ async def main() -> int:
         log.info("  id range %d .. %d", min(ids), max(ids))
         log.info("  sample: %s", list(by_id.items())[:5])
 
+        # The parallel `s` array is unexplained. Its value distribution is
+        # the cheapest way to guess its meaning - a handful of distinct
+        # small integers implies a status enum (extinct / SBC / objective /
+        # untradeable), which is exactly the classification the scraper
+        # currently infers from missing markup and gets wrong 26% of the
+        # time.
+        if statuses:
+            from collections import Counter
+
+            distribution = Counter(statuses)
+            log.info(
+                "  status array: %d distinct values, most common: %s",
+                len(distribution), distribution.most_common(8),
+            )
+            zero_price = sum(1 for p in prices if not p)
+            log.info(
+                "  prices that are zero/None: %d (%.1f%%) - candidates for "
+                "extinct/untradeable",
+                zero_price, 100.0 * zero_price / len(prices),
+            )
+
         # ---- 3. Cross-check against our own catalogue --------------------
         if not DATABASE_URL:
-            log.warning("DATABASE_URL unset - skipping coverage/accuracy check")
+            log.warning("=" * 72)
+            log.warning(
+                "DATABASE_URL is not set, so the COVERAGE CHECK WAS SKIPPED - and "
+                "that check is the entire remaining question. The feed decodes "
+                "cleanly, but until we know how many of OUR source_card_ids appear "
+                "in it, we do not know whether it is keyed on card eaId (usable "
+                "directly) or base-player eaId (needs an id map first)."
+            )
+            log.warning("Re-run with DATABASE_URL set on this service.")
+            log.warning("=" * 72)
             return 0
 
         import asyncpg
