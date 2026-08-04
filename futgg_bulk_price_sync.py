@@ -333,6 +333,28 @@ async def ingest_once(pool: asyncpg.Pool, page, timers: StageTimers) -> dict[str
         for r in matched
         if by_id.get(int(r["source_card_id"]))
     ]
+
+    # Cards the feed matched but priced at zero: it has told us they have
+    # no active market right now. That is an OBSERVATION, and until now it
+    # was discarded - the card simply fell out of `records`, got no
+    # bin_history row, and had its last_price_status left untouched.
+    #
+    # The consequence was a silent lie. last_price_status is sticky, so a
+    # card that stopped having a market kept advertising however it was
+    # last priced, and its BIN aged indefinitely while this worker ran
+    # every few minutes. Measured on the special tier: 98 cards still
+    # labelled 'bulk_feed' with a median BIN age of 2.9 hours, plus 97
+    # more carrying stale scraper statuses for the same reason - all of
+    # them cards the feed currently reports at zero.
+    #
+    # Recording it makes "we checked and there is no market" distinct from
+    # "we have not checked", which is the distinction every freshness
+    # number downstream was missing.
+    no_market_ids = [
+        int(r["source_card_id"])
+        for r in matched
+        if not by_id.get(int(r["source_card_id"]))
+    ]
     with timers.track("write"):
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -354,8 +376,36 @@ async def ingest_once(pool: asyncpg.Pool, page, timers: StageTimers) -> dict[str
                     """,
                     [r[0] for r in records], now,
                 )
-    log.info("WROTE %d prices in one COPY", len(records))
-    return {"ok": True, "coverage_pct": coverage_pct, "applied": True, "written": len(records)}
+                if no_market_ids:
+                    # Deliberately NOT writing a bin_history row here.
+                    # lowest_bin is INTEGER NOT NULL, and inventing a 0
+                    # would be worse than saying nothing - it would read
+                    # as a real price of zero to every consumer. The
+                    # observation lands on futgg_players instead, and
+                    # current_bin keeps showing the last real price until
+                    # the snapshot learns to suppress it (see below).
+                    #
+                    # price_updated_at is safe to bump: the engine's
+                    # price-age gate reads bin_captured_at, not this
+                    # column, so a no-market card cannot be made to look
+                    # freshly priced by it.
+                    await conn.execute(
+                        """
+                        UPDATE futgg_players p
+                        SET price_updated_at = $2,
+                            last_price_status = 'bulk_no_market'
+                        WHERE p.source_card_id = ANY($1::bigint[])
+                        """,
+                        no_market_ids, now,
+                    )
+    log.info(
+        "WROTE %d prices in one COPY; %d matched cards have no active market",
+        len(records), len(no_market_ids),
+    )
+    return {
+        "ok": True, "coverage_pct": coverage_pct, "applied": True,
+        "written": len(records), "no_market": len(no_market_ids),
+    }
 
 
 async def run_forever() -> None:
